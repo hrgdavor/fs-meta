@@ -1,0 +1,21 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # build.zig refuses any compiler but 0.17 on purpose: that version moved the whole std.Io surface, so a
+      # different minor does not build this code. The gitignore dependency is fetched from its tag, so this job
+      # needs no sibling checkout.
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.0
+
+      - name: Test
+        run: zig build test --summary all

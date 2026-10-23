@@ -3,14 +3,14 @@
     .version = "0.1.0",
     .fingerprint = 0xb28fe6ac387cc966,
     .dependencies = .{
-        // Sibling project: the .gitignore matcher and the directory chain (vibe-coded basis).
-        .gitignore = .{
-        .url = "https://github.com/hrgdavor/gitignore/archive/refs/heads/main.tar.gz",
-        .hash = "gitignore-0.1.0--BNkLvhbAQCYXocFwOwutSHDG2N6baVwPDXbEu_ChyoE",
-    },
+        // The .gitignore matcher and the directory chain, pinned to their published tag (github.com/hrgdavor/gitignore).
         .nightwatch = .{
             .url = "https://github.com/neurocyte/nightwatch/archive/refs/heads/master.tar.gz",
             .hash = "nightwatch-1.0.0-uXzeH1ALAwAr6LLM0H1Z0aBO_a5gpxQ1YsXpdlh3Xv6U",
+        },
+        .gitignore = .{
+            .url = "https://github.com/hrgdavor/gitignore/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "gitignore-0.1.0--BNkLmZcAQCzCUi8ZlrHCuFioXuA6ywPE33gqCNmN1ZN",
         },
     },
     .paths = .{""},
