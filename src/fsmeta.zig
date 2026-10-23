@@ -528,12 +528,14 @@ fn runReconcile(
         error.BatchTooOld => {
             const message = try std.fmt.allocPrint(arena, "batch-too-old: batches start at {d}, so generation {d} cannot be reconciled from\n", .{ first, from });
             try write(io, message);
-            return;
+            // A refusal is a failure: a consumer that reads exit 0 would treat "rescan" as "nothing changed".
+            std.process.exit(1);
         },
         error.BatchGap => {
             const message = try std.fmt.allocPrint(arena, "batch-gap: no batch {d}; the archive holds {d}..{d}\n", .{ to, first, last });
             try write(io, message);
-            return;
+            // A refusal is a failure: a consumer that reads exit 0 would treat "rescan" as "nothing changed".
+            std.process.exit(1);
         },
     };
 
@@ -544,7 +546,8 @@ fn runReconcile(
         var batch_dir = batches_dir.openDir(io, dir_name, .{ .iterate = true }) catch {
             const message = try std.fmt.allocPrint(arena, "batch-gap: no batch {d}\n", .{n});
             try write(io, message);
-            return;
+            // A refusal is a failure: a consumer that reads exit 0 would treat "rescan" as "nothing changed".
+            std.process.exit(1);
         };
         defer batch_dir.close(io);
 

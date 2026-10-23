@@ -6,7 +6,7 @@
   "description": "The Bun/Node reader for the fs-meta trio: files.meta, files.txt and files.json.",
   "comment": "The port needs the wyhash JavaScript implementation only under Node: under Bun the native Bun.hash.wyhash is the same std.hash.Wyhash the engine calls and is used instead, so the dependency is a fallback rather than a second algorithm. It is fetched from the project's own repository, which is the same posture the Java port takes with the published artifact.",
   "scripts": {
-    "test": "bun test js",
+    "test": "bun test js test",
     "conformance": "bun js/conformance.mjs"
   },
   "dependencies": {}

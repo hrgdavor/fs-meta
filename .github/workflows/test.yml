@@ -19,3 +19,11 @@ jobs:
 
       - name: Test
         run: zig build test --summary all
+
+      - uses: oven-sh/setup-bun@v2
+
+      # The integration tests drive the built CLI: hex batch ids, the reconcile range, and the optional baseline.
+      - name: Batch history, end to end
+        run: |
+          zig build -Doptimize=ReleaseFast
+          bun test test
