@@ -1,4 +1,11 @@
-// SPDX-License-Identifier: LicenseRef-GPL-3.0-with-Commons-Clause
+// The .gitignore matcher used by this project's walker.
+//
+// This file is a COPY of `gitignore/js/gitignore.mjs` at gitignore v0.2.0, the version build.zig.zon pins for the Zig
+// side, so the matcher is the same code in both languages. Do not edit it here: a change belongs in the gitignore project
+// (where 34 conformance vectors gate it), and then both this file and conformance/gitignore-vectors.json are refreshed
+// together. test/gitignore-port.test.mjs runs those vectors against this copy, so a stale local edit fails a test
+// instead of silently disagreeing with the published matcher.
+//// SPDX-License-Identifier: LicenseRef-GPL-3.0-with-Commons-Clause
 // Copyright (c) 2026 Davor Hrg
 //
 // `.gitignore` semantics, for the walk `fsmeta scan` performs. The Java port (`GitIgnoreFile`,
@@ -26,6 +33,8 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** The file name a walk reads per directory. */
+import { compileSegments, segmentsMatch } from './glob.mjs';
+
 export const GITIGNORE_FILE_NAME = '.gitignore';
 
 /**
@@ -88,9 +97,12 @@ function escapeRegExp(character) {
 }
 
 function translateCharacterClass(glob, open) {
-  const close = glob.indexOf(']', open + 1);
+    // A `]` immediately after the opener is a member, not the terminator: `[]]x` holds `]` then `x`.
+    const from = glob[open + 1] === ']' ? open + 2 : open + 1;
+    const close = glob.indexOf(']', from);
   if (close < 0) {
-    return { regex: '\\[', close: open };    // an unterminated class is a literal '[', like git
+      // git's wildmatch aborts the whole pattern, so the class matches nothing and the rest is not read.
+      return { regex: '(?!)', close: glob.length - 1 };
   }
   const body = glob.slice(open + 1, close);
   let translated = '[';
@@ -146,7 +158,13 @@ function parseRule(rawLine) {
     // Both anchors are required: Java's `Matcher.matches()` anchors the whole pattern, while JavaScript's
     // `RegExp.test` searches — and a missing `^` lets an anchored pattern match a path *suffix*. That one
     // difference is what the ignore vector `anchored-pattern` caught between the two ports.
-    pattern: new RegExp(`^${anchored ? '' : '(?:.*/)?'}${translateGlob(line)}$`),
+    //
+    // Only a pattern with a `**` segment needs the DP: that is the construct that makes a regex back-track
+    // exponentially. Everything else is faster as one compiled regex, so it keeps one.
+    pattern: line.split('/').includes('**')
+      ? null
+      : new RegExp(`^${anchored ? '' : '(?:.*/)?'}${translateGlob(line)}$`),
+    segments: line.split('/').includes('**') ? compileSegments(line, anchored, translateGlob) : null,
   };
 }
 
@@ -179,7 +197,8 @@ export function parseGitignore(relativeDirectory, text) {
     directory = directory.slice(0, -1);
   }
   const rules = [];
-  for (const line of text.split('\n')) {
+  // A CRLF checkout must parse like an LF one: the carriage return is not part of the pattern.
+  for (const line of text.replace(/\r\n/g, '\n').split('\n')) {
     const rule = parseRule(line);
     if (rule !== null) {
       rules.push(rule);
@@ -214,22 +233,37 @@ export function parseGitignore(relativeDirectory, text) {
   };
 }
 
-function matches(rule, path, isDirectory) {
-  if (!rule.directoryOnly) {
-    return rule.pattern.test(path);
-  }
-  if (isDirectory && rule.pattern.test(path)) {
-    return true;
-  }
-  // A file inside an excluded directory counts as excluded, so a directory-only pattern matches any
-  // ancestor too. The walk prunes before it gets here; a caller testing a path on its own gets the same
-  // answer either way.
-  let slash = path.indexOf('/');
-  while (slash >= 0) {
-    if (rule.pattern.test(path.slice(0, slash))) {
+function matches(rule, path, isDirectory, text = null) {
+  if (rule.segments === null) {
+    // No `**`: the compiled regex is both correct and faster (see the A/B in conformance/findings-js.md).
+    if (!rule.directoryOnly) {
+      return rule.pattern.test(path);
+    }
+    if (isDirectory && rule.pattern.test(path)) {
       return true;
     }
-    slash = path.indexOf('/', slash + 1);
+    for (let slash = path.indexOf('/'); slash >= 0; slash = path.indexOf('/', slash + 1)) {
+      if (rule.pattern.test(path.slice(0, slash))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Split once per decision, not once per rule: `text` arrives from the caller that already has it.
+  const segments = text ?? path.split('/');
+  if (!rule.directoryOnly) {
+    return segmentsMatch(rule.segments, segments);
+  }
+  if (isDirectory && segmentsMatch(rule.segments, segments)) {
+    return true;
+  }
+  // A file inside an excluded directory counts as excluded, so a directory-only pattern matches any ancestor too.
+  // The walk prunes before it gets here; a caller testing a path on its own gets the same answer either way.
+  for (let count = segments.length - 1; count >= 1; count -= 1) {
+    if (segmentsMatch(rule.segments, segments, count)) {
+      return true;
+    }
   }
   return false;
 }
@@ -273,6 +307,23 @@ export class GitIgnoreRules {
   }
 
   decide(relativePath, isDirectory) {
+    const direct = this.decideDirect(relativePath, isDirectory);
+    if (direct === true) {
+      return true;
+    }
+    // An excluded directory is never entered, so a rule for a file inside it cannot re-include that file: ask the
+    // ancestors, deepest first. A parent that a later rule re-includes answers false and is skipped.
+    const segments = relativePath.split('/');
+    for (let count = segments.length - 1; count >= 1; count -= 1) {
+      if (this.decideDirect(segments.slice(0, count).join('/'), true) === true) {
+        return true;
+      }
+    }
+    return direct;
+  }
+
+  /** What the rules say about this exact path, ignoring its ancestors. */
+  decideDirect(relativePath, isDirectory) {
     for (let index = this.#stack.length - 1; index >= 0; index--) {
       const decision = this.#stack[index].decide(relativePath, isDirectory);
       if (decision !== undefined) {
