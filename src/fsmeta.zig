@@ -69,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var hash_mode = scan.HashMode.text;
     var since: ?[]const u8 = null;
     var json_output = false;
+    var baseline_root: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--no-gitignore")) {
             respect_gitignore = false;
@@ -92,6 +93,8 @@ pub fn main(init: std.process.Init) !void {
             since = args.next() orelse return fail(io, gpa, "--since needs a value");
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
+        } else if (std.mem.eql(u8, arg, "--baseline")) {
+            baseline_root = args.next() orelse return fail(io, gpa, "--baseline needs a root directory");
         } else if (arg.len > 0 and arg[0] == '-') {
             return fail(io, gpa, "unknown option");
         } else if (root == null) {
@@ -153,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "reconcile")) {
         const from_arg = second orelse return fail(io, gpa, "reconcile needs a from generation");
-        return runReconcile(io, arena, gpa, target, from_arg, third, json_output);
+        return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output);
     }
     if (std.mem.eql(u8, command, "merge")) {
         const start_arg = second orelse return fail(io, gpa, "merge needs a start batch number");
@@ -491,6 +494,7 @@ fn runReconcile(
     root: []const u8,
     from_arg: []const u8,
     to_arg: ?[]const u8,
+    baseline_root: ?[]const u8,
     json: bool,
 ) !void {
     const from = std.fmt.parseInt(usize, from_arg, 10) catch return fail(io, gpa, "from must be a number");
@@ -555,7 +559,17 @@ fn runReconcile(
         try events.appendSlice(arena, batch_events);
     }
 
-    const changes = try reconcile.collapse(arena, events.items, null);
+    // The baseline is the consumer's own state at `from`, given as a trio: without it a name that changed and changed
+    // back still reports `changed`, which is the event history rather than the difference.
+    var store = BaselineStore{};
+    defer store.deinit();
+    var baseline: ?reconcile.Baseline = null;
+    if (baseline_root) |baseline_path| {
+        try store.load(arena, io, baseline_path);
+        baseline = .{ .context = &store, .lookup = BaselineStore.lookup };
+    }
+
+    const changes = try reconcile.collapse(arena, events.items, baseline);
     defer arena.free(changes);
 
     if (json) {
@@ -603,3 +617,58 @@ test "a batch range is refused rather than silently shortened" {
     // The range reaches a batch the archive does not have.
     try std.testing.expectError(error.BatchGap, checkRange(1, 3, 1, 4));
 }
+
+
+/// The state a consumer recorded at `from`, keyed by the same root-relative name a batch uses.
+const BaselineStore = struct {
+    allocator: std.mem.Allocator = undefined,
+    by_name: std.StringHashMapUnmanaged(reconcile.Identity) = .{},
+
+    fn deinit(self: *BaselineStore) void {
+        self.by_name.deinit(self.allocator);
+    }
+
+    /// Loads `<root>/.fs-meta` and rebuilds each name's identity exactly as `batch.toEvents` does: the flags word with the
+    /// change bits cleared, so a file is REGULAR_FILE or SYMLINK (plus CONTENT_KNOWN when the hash is known and HASH_LF when
+    /// the file is stored with LF), and a directory is IS_DIR.
+    fn load(self: *BaselineStore, arena: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+        self.allocator = arena;
+        var cache = try loadCache(arena, io, root);
+        defer cache.deinit();
+
+        var files = cache.files.iterator();
+        while (files.next()) |entry| {
+            const state = entry.value_ptr.*;
+            var flags: u32 = switch (state.kind) {
+                .regular_file => format.flags.regular_file,
+                .symlink => format.flags.symlink,
+                .dir => format.flags.is_dir,
+            };
+            if (state.content_hash != null) flags |= format.flags.content_known;
+            if (state.hash_lf) flags |= format.flags.hash_lf;
+            try self.by_name.put(arena, entry.key_ptr.*, .{
+                .contentHash = state.content_hash orelse 0,
+                .sizeBytes = state.size_bytes,
+                .flags = flags,
+            });
+        }
+
+        var dirs = cache.dirs.iterator();
+        while (dirs.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (name.len == 0) continue; // the root itself is not a name a batch carries
+            const stored = try std.fmt.allocPrint(arena, "{s}/", .{name});
+            try self.by_name.put(arena, stored, .{
+                .contentHash = 0,
+                .sizeBytes = 0,
+                .flags = format.flags.is_dir,
+            });
+        }
+    }
+
+    fn lookup(context: *anyopaque, name_hash: u64, name: []const u8) ?reconcile.Identity {
+        _ = name_hash; // the map is by name: the hash only orders the trio
+        const self: *BaselineStore = @ptrCast(@alignCast(context));
+        return self.by_name.get(name);
+    }
+};

@@ -1,6 +1,6 @@
 # The baseline option for `fsmeta reconcile`
 
-Status: **specified, not implemented.** Written after implementing `reconcile` (`94e503b`), because the facts below were
+Status: **implemented** (`BaselineStore` in `src/fsmeta.zig`), verified by hand on a change-and-change-back tree: without a baseline `reconcile` reports `changed a.txt`, with the baseline it reports `0 names`. The integration test described at the end is still to be added. Written after implementing `reconcile` (`94e503b`), because the facts below were
 established by reading the code and would otherwise have to be rediscovered — and because the last three edits near this
 path each broke the build, so the design is worth agreeing before it is written.
 
