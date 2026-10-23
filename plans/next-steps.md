@@ -81,3 +81,5 @@ Full detail, with the code, is in [`plans/next-session-pair-layout.md`](next-ses
 `FORMAT.md` § 17.6: a per-generation file or one append-only log, a retention window, and the point at which
 `batch-too-old` becomes reachable. No code depends on the answer: `diff`, `encode`, `decode` and `collapse` all survive
 it unchanged.
+
+- `reconcile --baseline <root>`: specified in [`reconcile-baseline.md`](reconcile-baseline.md); the adapter, the flags it must reconstruct, and the test that proves it.
