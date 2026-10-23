@@ -48,8 +48,8 @@ subject failed, 2 usage), so a pipeline does not care which one answers.
 zig-out/bin/fsmeta.exe scan <root>                    # walk the tree, write .fs-meta/
 zig-out/bin/fsmeta.exe verify <root>                   # is the trio usable?
 zig-out/bin/fsmeta.exe refresh <root>                  # rescan and publish a new generation
-zig-out/bin/fsmeta.exe glob <root> <pattern> [--since <ts>] [--json]
-zig-out/bin/fsmeta.exe changed <root> --since <ts> [--glob <pattern>] [--json]
+zig-out/bin/fsmeta.exe glob <root> <pattern> [--since <ts>] [--json]   # git wildmatch; no '/' = basename at any depth
+zig-out/bin/fsmeta.exe changed <root> <since> [--json]
 zig-out/bin/fsmeta.exe reconcile <root> <from> [to] [--json] [--baseline <root>]
 
 # the Bun port (no build step)

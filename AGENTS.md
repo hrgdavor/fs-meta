@@ -13,6 +13,10 @@ possible. Do not add a writer to a port to make a test pass.
 
 ## 2. Format invariants that must not drift
 
+- **One wildcard implementation.** Every wildcard is git's `wildmatch` semantics via the `gitignore` project
+  (DEC-051); fs-meta has no glob dialect of its own. A new pattern syntax anywhere — the `glob` query, the
+  `.gitignore` chain, a future socket request — is a format change, not a local convenience, and it goes
+  through that matcher. Do not add a second matcher "for compatibility".
 - **A trio contains no absolute path.** Names are workspace-relative, and the root a tool is given is a **locator**:
   it may be absolute or relative, it is resolved once at the boundary into a directory handle, and it is never
   interpolated into a stored byte. Publishing one tree from an absolute root and from a relative root must be

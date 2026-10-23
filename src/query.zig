@@ -3,19 +3,32 @@
 
 //! Query the loaded cache: glob-search entries by name and filter by mtime.
 //!
-//! This is the read-side API the CLI and socket share. It takes a `*const Cache` (the engine's
+//! This is the read-side API the CLI uses. It takes a `*const Cache` (the engine's
 //! in-memory state, FORMAT.md § 7) and returns matching entries with their full 64-byte metadata.
 //!
-//! ## The glob
+//! ## Query patterns (the `glob` command)
 //!
-//! The pattern syntax follows gitignore's rules (which this project already applies in `gitignore.zig`):
+//! A query pattern is a **git wildmatch pattern**, matched by the same `gitignore` dependency's
+//! `globMatch` that the `.gitignore` chain uses. There is no second dialect (DEC-051): every wildcard in
+//! this project is that matcher, so the query and the ignore chain cannot disagree.
 //!
-//! - `*` — any sequence of characters except `/`
-//! - `**` — any sequence of characters including `/` (crosses directory boundaries)
-//! - `?` — exactly one character
-//! - `[abc]` — one character from the set
-//! - `[!abc]` — one character not in the set
-//! - literal characters match themselves
+//! The anchoring rule is gitignore's own:
+//!
+//! - A pattern **without a `/`** names a basename and matches it at any depth: `*.txt` matches `a.txt`
+//!   and `src/a.txt`.
+//! - A pattern **with a `/`** — a leading one included — is relative to the query root and is matched
+//!   against the whole name path: `src/*.txt` matches `src/a.txt` but not `other/src/a.txt`. A leading
+//!   `/` is accepted and is not part of the pattern.
+//!
+//! Matching is case-sensitive on every platform, as git's is.
+//!
+//! `*` never crosses `/`; `**` follows git's three cases (a leading `**/`, a trailing `/**` and
+//! `a/**/b`); `?` is one character; `[...]`, `[!...]` and `[^...]` are character classes with ranges;
+//! `\` escapes. A consecutive run of asterisks that is not a whole segment is just asterisks.
+//!
+//! A query is a **pattern**, not a `.gitignore` line: it has no polarity (`!` is literal), no comment
+//! syntax (`#` is literal), no trailing-space trimming and no directory-only notion. A query selects
+//! names, and a name never ends in `/` (FORMAT.md § 3), so a pattern ending in `/` names nothing.
 //!
 //! The match is against the **relative path** as the cache keys it: `/`-separated, no trailing slash,
 //! no `.` components. A directory's name has no trailing slash (the slash is the layout's, not the
@@ -35,6 +48,7 @@
 //! supplies the reference time.
 
 const std = @import("std");
+const gitignore = @import("gitignore.zig");
 const format = @import("format.zig");
 const cache_mod = @import("cache.zig");
 
@@ -44,139 +58,42 @@ pub const Cache = cache_mod.Cache;
 // Glob
 // ──────────────────────────────────────────────
 
-/// One compiled pattern element.
-const Token = struct {
-    /// 0=literal, 1=star, 2=starstar, 3=question, 4=char_class, 5=starstar_slash
-    tag: u8,
-    literal: u8 = 0,
-    chars: ?[]const u8 = null,
-    negated: bool = false,
-};
-
-/// A compiled glob pattern. Owns its tokens and any character-class slices.
+/// A query pattern: one git wildmatch pattern plus gitignore's anchoring decision.
+///
+/// This is deliberately **not** a compiler. `gitignore.globMatch` is the matcher (the dependency's segment
+/// dynamic program, and the one implementation every wildcard in this project uses); this type only applies
+/// gitignore's anchoring rule and owns the pattern bytes.
 pub const Glob = struct {
-    tokens: []Token,
+    pattern: []u8,
+    /// A `/` at the start or in the middle: match the whole name path, not just its basename.
+    anchored: bool,
+
+    /// Compile a query pattern. The only failure is allocation: an unterminated `[`, an empty pattern and a
+    /// trailing `/` are all patterns wildmatch itself has an answer for (respectively: matches nothing, the
+    /// empty name, and no name at all), so they are not compile errors.
+    pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) !Glob {
+        const anchored = (pattern.len > 0 and pattern[0] == '/') or
+            std.mem.indexOfScalar(u8, pattern, '/') != null;
+        const body = if (pattern.len > 0 and pattern[0] == '/') pattern[1..] else pattern;
+        return .{ .pattern = try allocator.dupe(u8, body), .anchored = anchored };
+    }
 
     pub fn deinit(self: *Glob, allocator: std.mem.Allocator) void {
-        for (self.tokens) |token| {
-            if (token.tag == 4) {
-                if (token.chars) |chars| {
-                    allocator.free(chars);
-                }
-            }
-        }
-        allocator.free(self.tokens);
+        allocator.free(self.pattern);
+        self.* = undefined;
     }
 
-    /// Compile a glob pattern into a token list.
-    pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) !Glob {
-        var tokens: std.ArrayListUnmanaged(Token) = .empty;
-        errdefer tokens.deinit(allocator);
-
-        var i: usize = 0;
-        while (i < pattern.len) : (i += 1) {
-            const c = pattern[i];
-            switch (c) {
-                '*' => {
-                    if (i + 1 < pattern.len and pattern[i + 1] == '*') {
-                        if (i + 2 < pattern.len and pattern[i + 2] == '/') {
-                            // `**/` matches zero or more path segments (gitignore: `**/foo` matches `foo` at any depth)
-                            try tokens.append(allocator, .{ .tag = 5 });
-                            i += 2; // consume `**/`
-                        } else {
-                            try tokens.append(allocator, .{ .tag = 2 });
-                            i += 1; // consume the second `*`
-                        }
-                    } else {
-                        try tokens.append(allocator, .{ .tag = 1 });
-                    }
-                },
-                '?' => {
-                    try tokens.append(allocator, .{ .tag = 3 });
-                },
-                '[' => {
-                    var j: usize = i + 1;
-                    var negated = false;
-                    if (j < pattern.len and pattern[j] == '!') {
-                        negated = true;
-                        j += 1;
-                    }
-                    var chars: std.ArrayListUnmanaged(u8) = .empty;
-                    defer chars.deinit(allocator);
-                    while (j < pattern.len and pattern[j] != ']') : (j += 1) {
-                        try chars.append(allocator, pattern[j]);
-                    }
-                    if (j < pattern.len) { // found `]`
-                        const chars_slice = try chars.toOwnedSlice(allocator);
-                        try tokens.append(allocator, .{ .tag = 4, .chars = chars_slice, .negated = negated });
-                        i = j; // the loop's `i += 1` advances past `]`
-                    }
-                },
-                else => {
-                    try tokens.append(allocator, .{ .tag = 0, .literal = c });
-                },
-            }
-        }
-
-        return .{ .tokens = try tokens.toOwnedSlice(allocator) };
-    }
-
-    /// Match a relative path against this pattern.
+    /// Match a name path against this pattern, with gitignore's anchoring rule.
     pub fn matches(self: *const Glob, name: []const u8) bool {
-        return matchFrom(self.tokens, 0, name, 0);
+        const text = if (self.anchored) name else baseName(name);
+        return gitignore.globMatch(self.pattern, text);
     }
 };
 
-fn matchFrom(tokens: []const Token, ti: usize, name: []const u8, ni: usize) bool {
-    if (ti == tokens.len) return ni == name.len;
-    switch (tokens[ti].tag) {
-        0 => { // literal
-            if (ni < name.len and name[ni] == tokens[ti].literal) return matchFrom(tokens, ti + 1, name, ni + 1);
-            return false;
-        },
-        1 => { // star: any sequence of non-slash characters
-            if (matchFrom(tokens, ti + 1, name, ni)) return true;
-            var i = ni;
-            while (i < name.len and name[i] != '/') : (i += 1) {
-                if (matchFrom(tokens, ti + 1, name, i + 1)) return true;
-            }
-            return false;
-        },
-        2 => { // starstar: any sequence including `/`
-            var i = ni;
-            while (i <= name.len) : (i += 1) {
-                if (matchFrom(tokens, ti + 1, name, i)) return true;
-            }
-            return false;
-        },
-        3 => { // question: exactly one character
-            if (ni < name.len) return matchFrom(tokens, ti + 1, name, ni + 1);
-            return false;
-        },
-        4 => { // char_class
-            if (ni < name.len) {
-                const ch = name[ni];
-                const chars = tokens[ti].chars.?;
-                const in_set = std.mem.indexOfScalar(u8, chars, ch) != null;
-                const matches = if (tokens[ti].negated) !in_set else in_set;
-                if (matches) return matchFrom(tokens, ti + 1, name, ni + 1);
-            }
-            return false;
-        },
-        5 => { // starstar_slash: matches "" or "any/any/.../any/" (zero or more path segments)
-            // Try matching the rest at the current position (matched empty).
-            if (matchFrom(tokens, ti + 1, name, ni)) return true;
-            // Try matching up to and including each '/'.
-            var i = ni;
-            while (i < name.len) : (i += 1) {
-                if (name[i] == '/') {
-                    if (matchFrom(tokens, ti + 1, name, i + 1)) return true;
-                }
-            }
-            return false;
-        },
-        else => unreachable,
-    }
+/// The final segment of a `/`-separated path.
+fn baseName(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    return path[slash + 1 ..];
 }
 
 // ──────────────────────────────────────────────
@@ -498,12 +415,15 @@ test "glob: literal matches exactly" {
     try testing.expect(!g.matches("src/main.zig/"));
 }
 
-test "glob: star does not cross a slash" {
+test "glob: a pattern without a slash matches a basename at any depth" {
     var g = try Glob.compile(testing.allocator, "*.zig");
     defer g.deinit(testing.allocator);
     try testing.expect(g.matches("a.zig"));
     try testing.expect(g.matches("main.zig"));
-    try testing.expect(!g.matches("src/a.zig"));
+    // gitignore's anchoring rule, not the old full-path rule: no `/` means the basename, at any depth.
+    try testing.expect(g.matches("src/a.zig"));
+    try testing.expect(g.matches("src/deep/a.zig"));
+    try testing.expect(!g.matches("src/a.txt"));
 }
 
 test "glob: starstar crosses slashes" {
@@ -550,12 +470,14 @@ test "glob: star matches zero characters" {
     try testing.expect(g.matches("abbc"));
 }
 
-test "glob: starstar matches zero characters" {
+test "glob: consecutive asterisks inside a segment are just asterisks" {
     var g = try Glob.compile(testing.allocator, "a**c");
     defer g.deinit(testing.allocator);
     try testing.expect(g.matches("ac"));
     try testing.expect(g.matches("abc"));
-    try testing.expect(g.matches("a/b/c"));
+    try testing.expect(g.matches("abbc"));
+    // `**` is special only as a whole segment (git's rule): a run inside a segment cannot cross a `/`.
+    try testing.expect(!g.matches("a/b/c"));
 }
 
 test "glob: src prefix matches the directory and everything under it" {
@@ -584,6 +506,59 @@ test "glob: a slash in the pattern is literal" {
     try testing.expect(!g.matches("src/deep/a.zig"));
 }
 
+test "glob: character classes have ranges, a caret negation and escapes" {
+    var range = try Glob.compile(testing.allocator, "file[0-9].txt");
+    defer range.deinit(testing.allocator);
+    try testing.expect(range.matches("file7.txt"));
+    try testing.expect(!range.matches("filex.txt"));
+
+    var caret = try Glob.compile(testing.allocator, "[^a].txt");
+    defer caret.deinit(testing.allocator);
+    try testing.expect(caret.matches("b.txt"));
+    try testing.expect(!caret.matches("a.txt"));
+
+    var escape = try Glob.compile(testing.allocator, "a\\*b");
+    defer escape.deinit(testing.allocator);
+    try testing.expect(escape.matches("a*b"));
+    try testing.expect(!escape.matches("axb"));
+}
+
+test "glob: an unterminated class matches nothing (git's wildmatch aborts it)" {
+    var g = try Glob.compile(testing.allocator, "[abc");
+    defer g.deinit(testing.allocator);
+    try testing.expect(!g.matches("[abc"));
+    try testing.expect(!g.matches("a"));
+}
+
+test "glob: a query has no polarity and no comment syntax" {
+    // A query is a wildmatch pattern, not a `.gitignore` line: `!` and `#` are ordinary characters.
+    var bang = try Glob.compile(testing.allocator, "!keep.log");
+    defer bang.deinit(testing.allocator);
+    try testing.expect(bang.matches("!keep.log"));
+    try testing.expect(!bang.matches("keep.log"));
+
+    var hash = try Glob.compile(testing.allocator, "#notes.txt");
+    defer hash.deinit(testing.allocator);
+    try testing.expect(hash.matches("#notes.txt"));
+    try testing.expect(!hash.matches("notes.txt"));
+}
+
+test "glob: a leading slash anchors the same way a middle slash does" {
+    var g = try Glob.compile(testing.allocator, "/build");
+    defer g.deinit(testing.allocator);
+    try testing.expect(g.matches("build"));
+    try testing.expect(!g.matches("src/build"));
+}
+
+test "glob: a trailing slash names no name" {
+    // Directory-only is a `.gitignore` notion and a query has no file kind. A name never ends in `/`
+    // (FORMAT.md § 3), so the pattern as written cannot match one; say so rather than guessing a kind.
+    var g = try Glob.compile(testing.allocator, "src/");
+    defer g.deinit(testing.allocator);
+    try testing.expect(!g.matches("src"));
+    try testing.expect(!g.matches("a/src"));
+}
+
 test "query: no filter returns everything, name-ordered" {
     var cache = makeTestCache();
     defer cache.deinit();
@@ -609,9 +584,11 @@ test "query: glob filter" {
     const results = try run(testing.allocator, q);
     defer testing.allocator.free(results);
 
-    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expectEqual(@as(usize, 3), results.len);
     try testing.expectEqualStrings("a.txt", results[0].name);
     try testing.expectEqualStrings("b.txt", results[1].name);
+    // No `/` in the pattern, so gitignore's rule reaches the basename at any depth.
+    try testing.expectEqualStrings("src/c.txt", results[2].name);
 }
 
 test "query: mtime filter" {
@@ -639,8 +616,9 @@ test "query: glob and mtime together" {
     const results = try run(testing.allocator, q);
     defer testing.allocator.free(results);
 
-    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expectEqual(@as(usize, 2), results.len);
     try testing.expectEqualStrings("b.txt", results[0].name);
+    try testing.expectEqualStrings("src/c.txt", results[1].name);
 }
 
 test "query: directories are included" {
@@ -732,6 +710,127 @@ test "parseSince: unparseable returns null" {
     try testing.expect(parseSince("not a date", 0) == null);
     try testing.expect(parseSince("", 0) == null);
     try testing.expect(parseSince("2026-13-01", 0) == null); // month 13
+}
+
+// ──────────────────────────────────────────────
+// Conformance: the shared gitignore vectors, through the query path
+// ──────────────────────────────────────────────
+
+// The vectors the `gitignore` project gates its matcher with, vendored into this repository so this test
+// cannot drift from the matcher the `.gitignore` chain uses. Read from the checkout, not copied: one file
+// is the definition for every port.
+const gitignore_vectors_path = "conformance/gitignore-vectors.json";
+
+// Every shared vector that a query pattern can express, matched through `Glob` — the same query path the
+// `glob` command uses.
+//
+// A query is one wildmatch pattern at the query root. The cases that do **not** apply are the ignore-rule
+// notions a query deliberately has none of: precedence across rule files or pattern lines (4 vectors), a
+// comment line (1), a negation (0 single-line vectors; the 2 negation vectors are multi-line and are already
+// skipped as precedence), directory-only patterns (3 — a query has no file kind), trailing-space trimming
+// (1) and CRLF line-ending trimming (1). That leaves 24 of the 34 vectors as pure pattern-versus-name cases.
+test "conformance: every gitignore vector a query pattern can express" {
+    const vectors_text = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        gitignore_vectors_path,
+        testing.allocator,
+        std.Io.Limit.limited(1 << 20),
+    );
+    defer testing.allocator.free(vectors_text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, vectors_text, .{});
+    defer parsed.deinit();
+
+    const vectors = parsed.value.object.get("cases").?.array.items;
+    var applied: usize = 0;
+    var skipped: usize = 0;
+
+    for (vectors) |vector_value| {
+        const vector = vector_value.object;
+        const rule_files = vector.get("ruleFiles").?.array.items;
+
+        // A query is one pattern rooted at the query root, so a vector with a second rule file, with a
+        // rule file below the root, or with more than one pattern line is a precedence case.
+        if (rule_files.len != 1) {
+            skipped += 1;
+            continue;
+        }
+        const rule_file = rule_files[0].object;
+        if (!std.mem.eql(u8, rule_file.get("dir").?.string, "")) {
+            skipped += 1;
+            continue;
+        }
+
+        const rule_text = rule_file.get("rules").?.string;
+        var pattern_line: ?[]const u8 = null;
+        var line_count: usize = 0;
+        var lines = std.mem.splitScalar(u8, rule_text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            line_count += 1;
+            pattern_line = line;
+        }
+        if (line_count != 1) {
+            skipped += 1;
+            continue;
+        }
+        const line = pattern_line.?;
+
+        // The rule-file notions a query does not have: a comment (`#`), a negation (`!`; a query has no
+        // polarity), a directory-only trailing slash (a query has no kind), and the CRLF / trailing-space
+        // trimming a `.gitignore` line receives. What remains is pure wildmatch.
+        if (line.len == 0 or line[0] == '#' or line[0] == '!') {
+            skipped += 1;
+            continue;
+        }
+        if (endsWithUnescaped(line, '/') or endsWithUnescaped(line, ' ') or line[line.len - 1] == '\r') {
+            skipped += 1;
+            continue;
+        }
+
+        const expected = vector.get("expect").?.string;
+        const should_match = !std.mem.eql(u8, expected, "no-opinion");
+        const path = vector.get("path").?.string;
+
+        var glob = try Glob.compile(testing.allocator, line);
+        defer glob.deinit(testing.allocator);
+        const got = glob.matches(path);
+        if (got != should_match) {
+            std.debug.print("vector '{s}': pattern '{s}' against '{s}', expected {s}, got {s}\n", .{
+                vector.get("name").?.string,
+                line,
+                path,
+                if (should_match) "match" else "no match",
+                if (got) "match" else "no match",
+            });
+        }
+        try testing.expectEqual(should_match, got);
+        applied += 1;
+    }
+
+    // Pin the split: a future vector edit cannot quietly turn this into a test that skips most of its cases.
+    try testing.expectEqual(@as(usize, 24), applied);
+    try testing.expectEqual(@as(usize, 10), skipped);
+}
+
+/// Whether `text` ends with `byte` and that byte is not escaped by an odd number of backslashes.
+fn endsWithUnescaped(text: []const u8, byte: u8) bool {
+    if (text.len == 0 or text[text.len - 1] != byte) return false;
+    var backslashes: usize = 0;
+    var index = text.len - 1;
+    while (index > 0 and text[index - 1] == '\\') : (index -= 1) backslashes += 1;
+    return (backslashes & 1) == 0;
+}
+
+test "glob: a doublestar prefix works when a slash follows it too" {
+    // git's `**/` is zero or more directories wherever it appears, so this is `foo/*` at any depth —
+    // not the basename-only reading an ignore rule's `**/name` shorthand would suggest.
+    var g = try Glob.compile(testing.allocator, "**/foo/*");
+    defer g.deinit(testing.allocator);
+    try testing.expect(g.matches("foo/x"));
+    try testing.expect(g.matches("a/foo/x"));
+    try testing.expect(!g.matches("a/foo"));
+    try testing.expect(!g.matches("foo/x/y"));
 }
 
 // ──────────────────────────────────────────────

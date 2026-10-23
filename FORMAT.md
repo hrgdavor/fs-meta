@@ -530,3 +530,32 @@ None of that changes the API in § 17.4, which is why the API is specified first
 
 The cost is two numbers per top-level folder and no per-file data, which is why this belongs in the sidekick rather
 than in a second index file.
+
+## 19. Query patterns (the `glob` command)
+
+`fsmeta glob <root> <pattern>` selects names from a trio. The pattern is a **git `wildmatch` pattern**,
+matched by exactly the `gitignore` project's matcher — the same code the `.gitignore` chain uses
+(`gitignore.globMatch`, pinned to `gitignore` v0.2.0 in `build.zig.zon`). There is no second glob dialect in
+fs-meta; a new pattern syntax anywhere is a format change, not a local convenience (AGENTS.md § 2, DEC-051).
+
+A query is matched against a **name path** (§ 3: `/`-separated, no trailing slash, no `.` component). The
+anchoring rule is gitignore's own:
+
+- A pattern **without a `/`** names a basename and matches it at any depth. `*.txt` matches `a.txt` and
+  `src/a.txt`.
+- A pattern **with a `/`** — a leading `/` included — is anchored to the query root and matches the whole name
+  path. `src/*.txt` matches `src/a.txt` but not `other/src/a.txt`. A leading `/` is not part of the pattern.
+
+`*` never crosses `/`; `**` follows git's three cases (a leading `**/`, a trailing `/**` and `a/**/b`); `?` is
+one character; `[...]`, `[!...]` and `[^...]` are character classes with ranges; `\` escapes. Matching is
+case-sensitive on every platform.
+
+A query is a **pattern, not a `.gitignore` line**: it has no polarity (`!` is literal), no comment syntax (`#`
+is literal), no trailing-space trimming and no directory-only notion. A name never ends in `/` (§ 3), so a
+pattern ending in `/` names nothing. The ignore rule's precedence questions — last match wins, a deeper file
+beats a shallower one, an excluded directory is not entered — do not arise: a query is one pattern matched
+against one name.
+
+`conformance/gitignore-vectors.json` is the `gitignore` project's own vector file; `src/query.zig` runs the
+subset a query can express through this path, and states there why the negation, directory-only and
+precedence cases are not query cases.
