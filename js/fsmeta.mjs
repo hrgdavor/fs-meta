@@ -306,7 +306,7 @@ function previousGeneration(directory) {
  * @returns the trio as it now reads, validated — a publish that cannot be read back is a writer bug, and
  *   checking it here is cheaper than a consumer discovering it later
  */
-export function publish(directory, files, { mode = 'text', writer = WRITER, root = '' } = {}) {
+export function publish(directory, files, { mode = 'text', writer = WRITER } = {}) {
   const ordered = [...files].sort((left, right) => compareNames(left.name, right.name));
   const txt = encodeNames(ordered.map((file) => file.name));
   const entries = [];
@@ -325,7 +325,6 @@ export function publish(directory, files, { mode = 'text', writer = WRITER, root
     generation: previous.generation + 1,
     mode,
     writer,
-    root,
     created: previous.created === '' ? now() : previous.created,
     updated: now(),
   });

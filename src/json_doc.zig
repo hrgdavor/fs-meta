@@ -51,7 +51,6 @@ pub const Fields = struct {
     normalize: []const u8,
     root_dev: u64,
     root_ino: u64,
-    root_path: ?[]const u8 = null,
     created: []const u8,
     updated: []const u8,
     writer: []const u8,
@@ -100,11 +99,6 @@ pub fn encode(gpa: std.mem.Allocator, fields: Fields) ![]u8 {
     try writer.writeAll(" },\n");
 
     try writer.print("  \"root\": {{ \"dev\": {d}, \"ino\": {d} }},\n", .{ fields.root_dev, fields.root_ino });
-    if (fields.root_path) |root_path| {
-        try writer.writeAll("  \"rootPath\": ");
-        try writeString(writer, root_path);
-        try writer.writeAll(",\n");
-    }
     if (fields.batch) |batch| {
         try writer.print("  \"batch\": {{ \"number\": {d}, \"parent\": {d}, \"added\": {d}, \"changed\": {d}, \"deleted\": {d} }},\n",
             .{ batch.number, batch.parent, batch.added, batch.changed, batch.deleted });
@@ -237,7 +231,6 @@ test "the emitted document has the keys § 7 requires, and reads back" {
         .normalize = "text",
         .root_dev = 16_777_220,
         .root_ino = 1,
-        .root_path = "D:\\wrk\\demo",
         .created = "2026-10-17T00:00:00Z",
         .updated = "2026-10-17T00:00:01Z",
         .writer = "fs-meta/1",
@@ -268,7 +261,8 @@ test "the emitted document has the keys § 7 requires, and reads back" {
     const root_identity = try objectField(root, "root");
     try std.testing.expectEqual(@as(u64, 16_777_220), try intField(root_identity, "dev"));
     try std.testing.expectEqual(@as(u64, 1), try intField(root_identity, "ino"));
-    try std.testing.expectEqualStrings("D:\\wrk\\demo", optionalString(root, "rootPath").?);
+    // A trio describes a workspace, not a path: no member carries one (§ 3, § 7).
+    try std.testing.expect(root.get("rootPath") == null);
     try std.testing.expectEqualStrings("fs-meta/1", try stringField(root, "writer"));
 
     // A `wyhash` member that is not sixteen lowercase hex characters is not this document.
@@ -290,8 +284,11 @@ test "unknown keys survive a read and a rewrite of the same value" {
     try std.testing.expectEqual(@as(u64, 0), try intField(root, "count"));
 }
 
-test "a string is escaped correctly" {
+// `rootPath` used to be the field this test exercised; the escaping rules belong to `writeString`, which every
+// string member goes through, so the test moved to `writer` rather than testing a field that no longer exists.
+test "a string member is escaped correctly" {
     const gpa = std.testing.allocator;
+    const escaped = "C:\\a \"quoted\" path\nnext";
     const bytes = try encode(gpa, .{
         .generation = 0,
         .count = 0,
@@ -302,15 +299,14 @@ test "a string is escaped correctly" {
         .normalize = "none",
         .root_dev = 0,
         .root_ino = 0,
-        .root_path = "C:\\a \"quoted\" path\nnext",
         .created = "x",
         .updated = "y",
-        .writer = "z",
+        .writer = escaped,
     });
     defer gpa.free(bytes);
     var parsed = try parse(gpa, bytes);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("C:\\a \"quoted\" path\nnext", optionalString(&parsed.value.object, "rootPath").?);
+    try std.testing.expectEqualStrings(escaped, optionalString(&parsed.value.object, "writer").?);
 }
 
 test "a batch block is emitted when present, and absent from the main meta" {

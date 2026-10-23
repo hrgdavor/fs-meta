@@ -122,7 +122,6 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "refresh") or std.mem.eql(u8, command, "publish")) {
         options.respect_gitignore = respect_gitignore;
         options.hash_mode = hash_mode;
-        options.root_path = target;
         const outcome = try engine.refresh(arena, io, target, options);
         const line = try std.fmt.allocPrint(arena, "generation {d}, {d} names, published {s} (added {d}, removed {d}, modified {d}, renamed {d}, hashed {d})\n", .{
             outcome.generation,
@@ -235,13 +234,21 @@ fn runChanged(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root
     }
 }
 
-/// Open the `.fs-meta/batches/` directory.
-fn openBatchesDir(io: std.Io, arena: std.mem.Allocator, root: []const u8) !std.Io.Dir {
-    _ = arena;
-    const root_dir: std.Io.Dir = if (std.fs.path.isAbsolute(root))
-        try std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true })
+/// Open the root argument as a directory handle.
+///
+/// The argument is a **locator**: it may be absolute or relative, and it is resolved here, once, into a handle. It
+/// is never interpolated into a stored byte — a trio describes a workspace, and names in it are workspace-relative
+/// (FORMAT.md § 3).
+fn openRoot(io: std.Io, root: []const u8) !std.Io.Dir {
+    return if (std.fs.path.isAbsolute(root))
+        std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true })
     else
-        try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+        std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+}
+
+/// Open the `.fs-meta/batches/` directory.
+fn openBatchesDir(io: std.Io, root: []const u8) !std.Io.Dir {
+    var root_dir = try openRoot(io, root);
     defer root_dir.close(io);
     const meta_dir: std.Io.Dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return error.BatchesMissing;
     defer meta_dir.close(io);
@@ -272,10 +279,7 @@ fn jsonWriteString(writer: *std.Io.Writer, s: []const u8) !void {
 
 /// Load the trio from `<root>/.fs-meta` into a Cache.
 fn loadCache(arena: std.mem.Allocator, io: std.Io, root: []const u8) !cache_mod.Cache {
-    var root_dir = if (std.fs.path.isAbsolute(root))
-        std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return error.TrioMissing
-    else
-        std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return error.TrioMissing;
+    var root_dir = openRoot(io, root) catch return error.TrioMissing;
     defer root_dir.close(io);
 
     var meta_dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return error.TrioMissing;
@@ -304,11 +308,9 @@ fn readOptional(io: std.Io, dir: std.Io.Dir, name: []const u8, allocator: std.me
 }
 
 fn verify(io: std.Io, arena: std.mem.Allocator, root: []const u8) !void {
-    const dir_path = if (root.len > 0 and (root[root.len - 1] == '/' or root[root.len - 1] == '\\'))
-        try std.fmt.allocPrint(arena, "{s}{s}", .{ root, format.directory_name })
-    else
-        try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, format.directory_name });
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
+    var root_dir = openRoot(io, root) catch return write(io, "no .fs-meta directory\n");
+    defer root_dir.close(io);
+    var dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch {
         return write(io, "no .fs-meta directory\n");
     };
     defer dir.close(io);
@@ -392,7 +394,7 @@ fn runReconcile(
 ) !void {
     const from = std.fmt.parseInt(usize, from_arg, 10) catch return fail(io, gpa, "from must be a number");
 
-    const batches_dir = try openBatchesDir(io, arena, root);
+    const batches_dir = try openBatchesDir(io, root);
     defer batches_dir.close(io);
 
     var first: usize = 0;

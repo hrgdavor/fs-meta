@@ -13,6 +13,12 @@ possible. Do not add a writer to a port to make a test pass.
 
 ## 2. Format invariants that must not drift
 
+- **A trio contains no absolute path.** Names are workspace-relative, and the root a tool is given is a **locator**:
+  it may be absolute or relative, it is resolved once at the boundary into a directory handle, and it is never
+  interpolated into a stored byte. Publishing one tree from an absolute root and from a relative root must be
+  byte-identical, and a copied or renamed workspace must still verify. `FORMAT.md` § 3.1 states it, and
+  `test/portability.test.mjs` is the test: do not add a "where this was scanned" field back, and do not pass a root
+  path into a publish.
 - **Two orders, one meaning.** `files.meta` is sorted by `(nameHash, name)`; `files.txt` by name in its stored form. They
   describe the same set; a publish that produces them in one order only is a bug, not an optimisation.
 - **A directory's stored name ends with `/`**; its `nameHash` and every lookup use the name **without** the slash.

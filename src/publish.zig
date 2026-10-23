@@ -37,7 +37,6 @@ pub const Request = struct {
     normalize: []const u8,
     root_dev: u64,
     root_ino: u64,
-    root_path: ?[]const u8 = null,
     /// Preserved from the previous trio by the caller, so the first publish's instant survives every rewrite.
     created: []const u8,
     updated: []const u8,
@@ -104,7 +103,6 @@ pub fn publish(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cache:
         .normalize = request.normalize,
         .root_dev = request.root_dev,
         .root_ino = request.root_ino,
-        .root_path = request.root_path,
         .created = request.created,
         .updated = request.updated,
         .writer = request.writer,
@@ -238,7 +236,6 @@ fn publishInto(dir: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator, cache:
         .normalize = "text",
         .root_dev = 7,
         .root_ino = 1,
-        .root_path = "D:\\wrk\\demo",
         .created = "2026-10-17T00:00:00Z",
         .updated = "2026-10-18T00:00:00Z",
         .writer = "fs-meta/1",

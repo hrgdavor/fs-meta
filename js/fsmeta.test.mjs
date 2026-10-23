@@ -270,7 +270,7 @@ describe('scan, publish and diff', () => {
     writeFiles(root, { 'a.txt': 'hello\n', 'src/b.java': 'class B {}\n' });
     const trio = join(root, '.fs-meta');
 
-    const first = publish(trio, scanTree(root, scanOptions()), { mode: 'text', writer: 'test/1', root });
+    const first = publish(trio, scanTree(root, scanOptions()), { mode: 'text', writer: 'test/1' });
     assert.equal(first.ok, true, describeValidation(first.pair?.validation ?? {}));
     assert.equal(first.config.generation, 1);
     assert.equal(first.pair.size, 2);
@@ -282,7 +282,7 @@ describe('scan, publish and diff', () => {
     assert.equal(reloaded.ok, true);
     assert.equal(reloaded.config.generation, 1);
 
-    const second = publish(trio, scanTree(root, scanOptions()), { mode: 'text', writer: 'test/1', root });
+    const second = publish(trio, scanTree(root, scanOptions()), { mode: 'text', writer: 'test/1' });
     assert.equal(second.config.generation, 2);
     assert.equal(second.config.created, first.config.created, 'created is carried over; updated moves');
     assert.deepEqual(scanTree(root, scanOptions()).map((file) => file.name), ['a.txt', 'src/b.java'],

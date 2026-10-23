@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
     defer tuning_arena_state.deinit();
     const tuning_arena = tuning_arena_state.allocator();
 
-    var flush_ctx: Flush = .{ .io = io, .root = root, .options = .{ .updated = "watch", .root_path = root } };
+    var flush_ctx: Flush = .{ .io = io, .root = root, .options = .{ .updated = "watch" } };
     var runner: watch_run.Runner = .{ .flush = Flush.call, .ctx = &flush_ctx };
     runner.state = try tuning.load(tuning_arena, io, meta_dir);
     {

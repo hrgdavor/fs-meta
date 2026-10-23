@@ -129,7 +129,6 @@ export function run(args, streams = {}) {
         const load = publish(directory, files, {
           mode: scan.hashMode,
           writer: options.get('writer') ?? WRITER,
-          root,
         });
         if (!load.ok) {
           problem(`fsmeta: the trio just written does not validate: ${load.describe()}`);
@@ -247,7 +246,6 @@ export function run(args, streams = {}) {
         const repaired = publish(directory, files, {
           mode: configHashMode(config),
           writer: WRITER,
-          root: config.root === '' ? join(directory, '..') : config.root,
         });
         line(`repaired ${files.length} entry/entries: ${repaired.describe()}`);
         return repaired.ok ? 0 : 1;

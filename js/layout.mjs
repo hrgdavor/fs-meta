@@ -356,14 +356,19 @@ export function configToJson(config) {
     updated: config.updated,
     writer: config.writer,
     ...(config.created ? { created: config.created } : {}),
-    ...(config.root ? { root: config.root } : {}),
     ...(config.extra ?? {}),
   };
   return JSON.stringify(document);
 }
 
-/** A document for a trio about to be written. */
-export function configForPublish({ count, metaBytes, txtBytes, generation, mode, writer, root, created, updated }) {
+/**
+ * A document for a trio about to be written.
+ *
+ * There is no root argument: a trio contains no absolute path (FORMAT.md § 3.1), so where the tree was scanned is
+ * not something a publish may record. The engine writes `root` as the root's `{ dev, ino }` identity, which is the
+ * only root fact a trio carries.
+ */
+export function configForPublish({ count, metaBytes, txtBytes, generation, mode, writer, created, updated }) {
   return {
     format: FORMAT,
     version: VERSION,
@@ -377,7 +382,6 @@ export function configForPublish({ count, metaBytes, txtBytes, generation, mode,
     updated,
     writer,
     created,
-    root,
     extra: {},
   };
 }

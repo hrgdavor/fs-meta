@@ -39,12 +39,36 @@ pub const Options = struct {
     updated: []const u8,
     /// Preserved across generations; defaults to `updated` when the trio has never been written.
     created: ?[]const u8 = null,
-    root_path: ?[]const u8 = null,
     /// Write a generation even when nothing changed (a caller that wants a heartbeat).
     force: bool = false,
     /// Measure the naive listing against the batched one: a readdir plus a stat per entry.
     per_file: bool = false,
 };
+
+/// Open `root` as a directory handle. This is the **one** place the CLI's locator becomes a handle: everything
+/// below works through `root_dir`, so no absolute path is interpolated into anything the trio stores or opens.
+fn openRoot(io: std.Io, root: []const u8) !std.Io.Dir {
+    return if (std.fs.path.isAbsolute(root))
+        std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true })
+    else
+        std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+}
+
+/// Open `<root>/.fs-meta`, creating it **through the root handle** when it is not there yet.
+///
+/// The create is a relative one, so it stays on the locator's own volume and needs no full path: a handle is
+/// opened on the drive it points at, and a relative create through it resolves there. The failure of a create
+/// is returned as an error the caller sees — the earlier `CreateDirectoryW` call discarded its `BOOL`, so a
+/// refused create resurfaced one call later as `FileNotFound` from this very open.
+fn openOrCreateMetaDir(io: std.Io, root_dir: std.Io.Dir) !std.Io.Dir {
+    return root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try root_dir.createDirPath(io, format.directory_name);
+            return root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+        },
+        else => return err,
+    };
+}
 
 /// Where a pass spends its time, in nanoseconds. Reported with `--stats`; the sum is the pass.
 pub const Stats = struct {
@@ -76,15 +100,6 @@ pub const Outcome = struct {
     stats: Stats = .{},
 };
 
-fn metaPath(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
-    if (root.len == 0) return allocator.dupe(u8, format.directory_name);
-    if (root[root.len - 1] == '/' or root[root.len - 1] == '\\') {
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ root, format.directory_name });
-    }
-    const separator: u8 = if (std.mem.indexOfScalar(u8, root, '\\') != null) '\\' else '/';
-    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ root, separator, format.directory_name });
-}
-
 fn readOptional(io: std.Io, dir: std.Io.Dir, name: []const u8, allocator: std.mem.Allocator) !?[]u8 {
     return dir.readFileAlloc(io, name, allocator, std.Io.Limit.limited(1 << 28)) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -113,22 +128,12 @@ pub fn refresh(arena: std.mem.Allocator, io: std.Io, root: []const u8, options: 
 var previous: std.ArrayListUnmanaged(batch_mod.Item) = .empty;
     const t0 = nowNs(io);
 
-    // Open the root, then create .fs-meta inside it: one relative component. Creating the directory from an
-    // absolute path makes createDirPath walk every component, and on Windows the first component of a drive
-    // path is the drive itself, which cannot be created — ACCESS_DENIED, from a path that was writable.
-    var root_dir = if (std.fs.path.isAbsolute(root))
-        std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return error.RootMissing
-    else
-        std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return error.RootMissing;
+    // The root is the CLI's **locator**, and this is the one place it becomes a handle. From here the pass works
+    // through `root_dir`: `.fs-meta` is opened and, when missing, created relative to it — so the pass never hands
+    // an absolute path to a path-based API and never stores one.
+    var root_dir = openRoot(io, root) catch return error.RootMissing;
     defer root_dir.close(io);
-    var meta_dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch |err| blk: {
-        if (err != error.FileNotFound) return err;
-        // Created by path rather than through a directory handle: a handle belongs to one volume, so creating a
-        // directory on another drive (a tree on C:, the checkout on D:) is ACCESS_DENIED no matter which handle
-        // is used. `CreateDirectoryW` and `mkdir` take the whole path and resolve it themselves.
-        try makeDir(arena, try metaPath(arena, root));
-        break :blk try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
-    };
+    var meta_dir = try openOrCreateMetaDir(io, root_dir);
     defer meta_dir.close(io);
 
     // 1-2. The previous generation, if it is one this reader understands.
@@ -204,7 +209,6 @@ try previous.append(arena, batch_mod.dirItem(name, cache.dirs.get(name).?));
         },
         .root_dev = root_stat.file_id_hi,
         .root_ino = root_stat.file_id_lo,
-        .root_path = options.root_path,
         .created = created,
         .updated = options.updated,
         .writer = options.writer,
@@ -314,7 +318,9 @@ test "a pass over a fresh tree publishes one generation, and a second pass chang
     try testing.expectEqual(@as(u64, 3), first.count); // a.txt, src, src/b.java
 
     // The trio on disk validates.
-    var meta_dir = try std.Io.Dir.cwd().openDir(io, try std.fmt.allocPrint(arena, "{s}/.fs-meta", .{root}), .{ .iterate = true });
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
     defer meta_dir.close(io);
     {
         const trio = (try readTrio(io, meta_dir, arena)).?;
@@ -368,8 +374,9 @@ test "a changed file makes the next pass publish, and the change is listing-only
 
 /// The names a trio describes, sorted the way the trio sorts them.
 fn trioNames(arena: std.mem.Allocator, root: []const u8, io: std.Io) ![][]const u8 {
-    const meta_path = try metaPath(arena, root);
-    var meta_dir = try std.Io.Dir.cwd().openDir(io, meta_path, .{ .iterate = true });
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
     defer meta_dir.close(io);
     const trio = (try readTrio(io, meta_dir, arena)).?;
     const result = try validate.validate(arena, .{ .json_bytes = trio.json, .meta_bytes = trio.meta, .txt_bytes = trio.txt });
@@ -460,16 +467,4 @@ test "a pass and a full walk agree about the tree, .gitignore included" {
     try testing.expect(hasName(relaxed, "x.log"));
     try testing.expect(hasName(relaxed, "build"));
     try testing.expect(hasName(relaxed, "build/y.txt"));
-}
-
-extern "kernel32" fn CreateDirectoryW(lpPathName: [*:0]const u16, lpSecurityAttributes: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
-
-/// Create the trio directory from its full path.
-///
-/// Result deliberately ignored: an existing directory is the normal second-pass case, and the reopen that
-/// follows decides whether the directory is really there. Creating through std.Io.Dir was tried first and
-/// refused a root on another drive than the working directory, which is why this call takes the path alone.
-fn makeDir(arena: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try std.unicode.utf8ToUtf16LeAllocZ(arena, path);
-    _ = CreateDirectoryW(path_z.ptr, null);
 }

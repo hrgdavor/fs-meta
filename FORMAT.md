@@ -90,6 +90,32 @@ The **name hash is over the name without the trailing slash** (`wyhash("src")`, 
 lookup is given the path and the path of the folder is `src`. A reader that needs a directory entry's hash strips
 the slash; a reader that needs the entry from a name keeps it.
 
+### 3.1 No absolute path, anywhere (invariant)
+
+**A trio contains no absolute path.** Names are workspace-relative (§ 3 above), and nothing else in the three
+files records where the workspace is: `root` in `files.json` carries the root's **identity** (`dev`/`inode`), never
+its path, and there is no path member at all. `fs-meta` is for tools bound to a **workspace**, so the trio is
+evidence about a tree that can be found at any path.
+
+The root a tool is given is therefore a **locator**: it may be absolute or relative, and it is resolved **once**,
+at the boundary, into a directory handle. It is never interpolated into a stored byte. Three consequences, and each
+one is a test (`test/portability.test.mjs`):
+
+- **Byte-identical publication.** Publishing the same tree from an absolute root and from a relative root produces
+  the same `files.meta`, `files.txt` and `files.json` bytes, because the root argument reaches none of them.
+- **Portable.** A workspace copied to another directory — the trio included — still verifies there.
+- **Relocatable.** A workspace renamed in place still verifies, and its batches still name files by their
+  workspace-relative names.
+
+The identity pair in `root` is the one thing that does move: a copied tree has a new identity and a renamed one
+keeps the old, so a reader can tell that the directory it was handed is not the one the trio was published for —
+without the trio ever recording a location. Nothing in § 8 validates `root`, so a trio is usable whatever it says,
+which is what makes a copy or a rename a supported case rather than a tolerated one.
+
+That invariant is also why the format has no optional "where this was scanned" member: an informational path would
+be the one field a copy, a rename or a second machine would invalidate, and an informational field that cannot be
+trusted is worse than no field at all.
+
 ## 4. `files.txt`
 
 The names in order, each **followed by a single LF**, including the last one. So for `n` names:
@@ -165,8 +191,7 @@ UTF-8 JSON object, no comment. The commit record.
 | `updated`        | string | RFC3339 instant of this publish, informational                                                |
 | `created`        | string | RFC3339 instant of the trio's first publish, informational; a rewriter keeps it               |
 | `writer`         | string | tool/version, informational (`fs-meta/1` is the engine)                                       |
-| `root`           | object | `{ "dev": number, "ino": number }` - identity of the root directory; tells you the root moved |
-| `rootPath`       | string | optional, informational: the absolute path that was scanned. Never used for identity — two machines reach one tree by different paths, and a copied trio must not claim to describe the original |
+| `root`           | object | `{ "dev": number, "ino": number }` - identity of the root directory; a copied tree has a different one, a renamed tree keeps it (§ 3.1) |
 | `scan`           | object | optional, the settings the engine used: `{ "hashMode": "text" \| "lf" \| "none", "ignoredDirectoryNames": [string], "respectGitignore": boolean }` |
 | `roots`          | object | optional, § 18: `{ "<direct child>": { "offset": number, "length": number } }` — byte ranges in `files.txt`, each covering the folder's own `dir/` line and its subtree |
 

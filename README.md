@@ -113,7 +113,7 @@ if (load.ok()) {
     }
 }
 FsMetaWriter.publish(dir, FsMetaScanner.scan(root, FsMetaScanOptions.defaults()), FsMetaHashMode.TEXT,
-        "my-tool/1", root.toString());
+        "my-tool/1");
 ```
 
 ```js
@@ -125,8 +125,13 @@ if (load.ok) {
   const entry = load.pair.entryOrNull('src/main/App.java');
   // entry.contentHash / entry.sizeBytes / entry.mtimeMillis (BigInt) against what you recorded
 }
-publish('.fs-meta', scanTree('.', scanOptions()), { mode: 'text', writer: 'my-tool/1', root: '.' });
+publish('.fs-meta', scanTree('.', scanOptions()), { mode: 'text', writer: 'my-tool/1' });
 ```
+
+A publish takes no root path: a trio contains no absolute path (§ 3.1 of `FORMAT.md`), so where the tree was
+scanned is not something it records. Publishing the same tree from an absolute root and from a relative root is
+byte-identical, and a copied or renamed workspace still verifies — which is what lets a tool be bound to a
+workspace rather than to a location.
 
 Java's `mvn -o -pl fs-meta install` publishes the jar for a driver project under `proto/`, the same way any
 other library here is consumed.
