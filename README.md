@@ -50,7 +50,7 @@ zig-out/bin/fsmeta.exe verify <root>                   # is the trio usable?
 zig-out/bin/fsmeta.exe refresh <root>                  # rescan and publish a new generation
 zig-out/bin/fsmeta.exe glob <root> <pattern> [--since <ts>] [--json]
 zig-out/bin/fsmeta.exe changed <root> --since <ts> [--glob <pattern>] [--json]
-zig-out/bin/fsmeta.exe merge <root> <start> [end] [--json]
+zig-out/bin/fsmeta.exe reconcile <root> <from> [to] [--json] [--baseline <root>]
 
 # the Bun port (no build step)
 bun fs-meta/js/fsmeta-cli.mjs scan --root .          # walk the tree, write .fs-meta/
@@ -76,25 +76,30 @@ bun fs-meta/check-ports.mjs                          # needs the module built (a
 chooses the content-hash mode (`text` is the default, which makes a CRLF and an LF checkout agree), and
 `--ignore NAME` adds a directory name to skip. The walk's ignore rules are `FORMAT.md` § 16.
 
-### `merge` — combined change set for a batch range
+### `reconcile` — combined change set for a batch range
 
-`fsmeta merge <root> <start> [end] [--json]` gives the **merged set of changes** for a range of batches.
-A single batch is trivial (its own entries); the command is useful when several batches are combined into one
-change set — the input a parser or checker tool needs to re-run over the names that actually moved.
+`fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]` gives the **combined set of changes**
+after generation `from`, through `to` (inclusive; omitted means the latest batch). A single batch is trivial
+(its own entries); the command is useful when several batches are combined into one change set — the input a
+parser or checker tool needs to re-run over the names that actually moved.
 
-- `start` is the **baseline** generation (not included in the range). It is the generation the consumer last
+- `from` is the **baseline** generation (not included in the range). It is the generation the consumer last
   synced at.
-- `end` is the **end of the range** (inclusive). Omitted means "the latest batch."
-- The window is batches `start + 1` through `end`, merged per the matrix in `FORMAT.md` § 17.4:
+- The window is batches `from + 1` through `to`, collapsed per the matrix in `FORMAT.md` § 17.4:
   a name added and then deleted in the window cancels out; a name changed twice is one change carrying the
   final entry.
-- The output is **added and changed only** — deleted names are filtered out — because the consumer re-runs its
-  parser or checker over the names whose content it must re-read.
+- Each change is printed as `added <name>`, `changed <name>` or `deleted <name>`, followed by an
+  `<n> names` count; `--json` emits one `{"name", "kind"}` object per change.
+- A range that predates the retained batches fails with `batch-too-old`, and one that reaches a missing batch
+  fails with `batch-gap`, both with exit code 1. The range is never silently shortened.
+- `--baseline <root>` supplies the consumer's recorded trio. Without it the answer is a superset: correct,
+  idempotent, and occasionally a no-op the consumer did not need. That is the documented trade-off in § 17.4.
 
-Without a baseline (the consumer's recorded state at `start`), the answer is a superset: correct, idempotent,
-and occasionally a no-op the consumer did not need. That is the documented trade-off in § 17.4.
+`fsmeta merge <root> <start> [end] [--json]` is a **deprecated alias** of `reconcile`, kept so existing
+scripts keep working; the batch history has exactly one reader.
 
-Batch directories are named by hex generation number, no padding: `1`, `2`, … `f`, `10`, …
+Batch directories are named by the generation in lowercase hex, zero-padded to eight digits: `00000001`,
+`00000002`, … `0000000f`, `00000010`, …
 
 ### As a library
 

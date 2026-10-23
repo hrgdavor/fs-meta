@@ -32,10 +32,10 @@ const usage =
     \\  fsmeta glob    <root> <pattern> [--since <timestamp>]
     \\                                   glob-search the trio; one line per match
     \\  fsmeta changed <root> <since>  files changed since <since>; one line per match
-    \\  fsmeta merge   <root> <start> [end] [--json]
-    \\                                   merge batches start+1..end into one change record
-    \\  reconcile <root> <from> [to] [--json]
+    \\  fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
+    \\  fsmeta merge   <root> <start> [end] [--json]
+    \\                                   deprecated: an alias of reconcile, kept for scripts
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -154,16 +154,14 @@ pub fn main(init: std.process.Init) !void {
         const since_arg = second orelse return fail(io, gpa, "changed needs a since timestamp");
         return runChanged(io, arena, gpa, target, since_arg, json_output);
     }
-    if (std.mem.eql(u8, command, "reconcile")) {
-        const from_arg = second orelse return fail(io, gpa, "reconcile needs a from generation");
+    if (std.mem.eql(u8, command, "reconcile") or std.mem.eql(u8, command, "merge")) {
+        // `merge` is a deprecated alias: its name stays because it is in the usage text and may be scripted, but the
+        // batch history has exactly one reader, so both names run the range-checked implementation below.
+        const from_arg = second orelse {
+            const message = try std.fmt.allocPrint(arena, "{s} needs a from generation", .{command});
+            return fail(io, gpa, message);
+        };
         return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output);
-    }
-    if (std.mem.eql(u8, command, "merge")) {
-        const start_arg = second orelse return fail(io, gpa, "merge needs a start batch number");
-        // The iterator is exhausted by the option loop, so this used to be null always: the third positional is where
-        // the range end actually arrives.
-        const end_arg = third;
-        return runMerge(io, arena, gpa, target, start_arg, end_arg, json_output);
     }
     return fail(io, gpa, "unknown command");
 }
@@ -233,111 +231,6 @@ fn runChanged(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root
             try write(io, line);
         }
         const total = try std.fmt.allocPrint(arena, "{d} names\n", .{results.len});
-        try write(io, total);
-    }
-}
-
-/// Merge batches from start+1 to end (inclusive) into one change record, deletions included.
-fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8, start_arg: []const u8, end_arg: ?[]const u8, json: bool) !void {
-    const start_num = std.fmt.parseInt(usize, start_arg, 10) catch return fail(io, gpa, "start must be a number");
-    const end_num: usize = if (end_arg) |e|
-        std.fmt.parseInt(usize, e, 10) catch return fail(io, gpa, "end must be a number")
-    else
-        blk: {
-            // Find the latest batch number.
-            const batches_dir = try openBatchesDir(io, arena, root);
-            defer batches_dir.close(io);
-            var max: usize = 0;
-            var iter = batches_dir.iterate();
-            while (try iter.next(io)) |entry| {
-                const name = entry.name;
-                if (entry.kind == .directory) {
-                    const n = std.fmt.parseInt(usize, name, 16) catch continue;
-                    if (n > max) max = n;
-                }
-            }
-            break :blk max;
-        };
-
-    if (end_num <= start_num) {
-        try write(io, "0 names\n");
-        return;
-    }
-
-    // Collect events from all batches in range.
-    var events: std.ArrayListUnmanaged(reconcile.Event) = .empty;
-    errdefer events.deinit(arena);
-
-    const batches_dir = try openBatchesDir(io, arena, root);
-    defer batches_dir.close(io);
-
-    for (start_num + 1 .. end_num + 1) |n| {
-        // The batch id is the generation in lowercase hex, zero-padded to eight digits: the same rule the writer
-        // follows (FORMAT.md § 17.1). Parsing and formatting it in base ten silently finds nothing.
-        const dir_name = try std.fmt.allocPrint(arena, "{x:0>8}", .{n});
-        var batch_dir = batches_dir.openDir(io, dir_name, .{ .iterate = true }) catch continue;
-        defer batch_dir.close(io);
-
-        const meta = try readOptional(io, batch_dir, format.meta_file, arena) orelse continue;
-        const txt = try readOptional(io, batch_dir, format.txt_file, arena) orelse continue;
-        const plan = try batch.decode(arena, meta, txt);
-        defer {
-            arena.free(plan.entries);
-            arena.free(plan.names);
-        }
-        const batch_events = try batch.toEvents(arena, plan);
-        defer arena.free(batch_events);
-        for (batch_events) |ev| {
-            try events.append(arena, ev);
-        }
-    }
-
-    const all_events = try events.toOwnedSlice(arena);
-
-    // Merge: the first batch becomes the change set, subsequent batches merge into it.
-    // This is the collapse matrix without a baseline — (first, last) → net kind.
-    const changes = try reconcile.collapse(arena, all_events, null);
-    defer arena.free(changes);
-    arena.free(all_events);
-
-    // Filter: added + changed only (no deleted).
-    const count: usize = changes.len;
-
-    if (json) {
-        var out: std.Io.Writer.Allocating = .init(arena);
-        errdefer out.deinit();
-        const writer = &out.writer;
-
-        if (count == 0) {
-            try writer.writeAll("[]\n");
-        } else {
-            try writer.writeAll("[\n");
-            var first = true;
-            for (changes) |c| {
-                if (!first) try writer.writeAll(",\n");
-                first = false;
-                try writer.writeAll("  {\n");
-                try writer.writeAll("    \"name\": ");
-                try jsonWriteString(writer, c.name);
-                try writer.writeAll(",\n");
-                const kind_str = switch (c.kind) {
-                    .added => "added",
-                    .changed => "changed",
-                    .deleted => "deleted",
-                };
-                try writer.print("    \"kind\": \"{s}\"\n", .{kind_str});
-                try writer.writeAll("  }");
-            }
-            try writer.writeAll("\n]\n");
-        }
-        const result = try out.toOwnedSlice();
-        try write(io, result);
-    } else {
-        for (changes) |c| {
-            const line = try std.fmt.allocPrint(arena, "{s}\n", .{c.name});
-            try write(io, line);
-        }
-        const total = try std.fmt.allocPrint(arena, "{d} names\n", .{count});
         try write(io, total);
     }
 }

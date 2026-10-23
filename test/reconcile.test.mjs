@@ -44,14 +44,19 @@ function publish(root, updated) {
   return execFileSync(binary, ['refresh', root, '--updated', updated], { encoding: 'utf8', cwd: here });
 }
 
-/** Runs reconcile and returns { code, stdout } — the refusals are exit codes, not exceptions to swallow. */
-function reconcile(root, ...args) {
+/** Runs a batch-history command and returns { code, stdout } — the refusals are exit codes, not exceptions to swallow. */
+function batchCommand(command, root, ...args) {
   try {
-    const stdout = execFileSync(binary, ['reconcile', root, ...args], { encoding: 'utf8', cwd: here });
+    const stdout = execFileSync(binary, [command, root, ...args], { encoding: 'utf8', cwd: here });
     return { code: 0, stdout };
   } catch (error) {
     return { code: error.status ?? 1, stdout: String(error.stdout ?? '') };
   }
+}
+
+/** Runs reconcile; `merge` is its deprecated alias and is exercised by the alias test below. */
+function reconcile(root, ...args) {
+  return batchCommand('reconcile', root, ...args);
 }
 
 describe('the batch history a consumer reads', () => {
@@ -138,5 +143,28 @@ describe('the batch history a consumer reads', () => {
     const withBaseline = reconcile(root, '1', '--baseline', snapshot);
     expect(withBaseline.code).toBe(0);
     expect(withBaseline.stdout).toContain('0 names');
+  });
+
+  test('merge is an alias: it prints exactly what reconcile prints for the same range', () => {
+    const root = scratch();
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'a.txt'), 'one\n');
+    writeFileSync(join(root, 'src', 'b.java'), 'class B {}\n');
+    publish(root, '2026-10-24T00:00:00Z');
+
+    // One change, one add and one delete, all in the generation after the range starts.
+    writeFileSync(join(root, 'a.txt'), 'two\n');
+    rmSync(join(root, 'src', 'b.java'));
+    writeFileSync(join(root, 'src', 'c.java'), 'class C {}\n');
+    publish(root, '2026-10-24T00:00:01Z');
+
+    const merged = batchCommand('merge', root, '1');
+    const reconciled = reconcile(root, '1');
+    expect(merged.code).toBe(0);
+    expect(merged.stdout).toBe(reconciled.stdout);
+    expect(merged.stdout).toContain('changed a.txt');
+    expect(merged.stdout).toContain('deleted src/b.java');
+    expect(merged.stdout).toContain('added src/c.java');
+    expect(merged.stdout).toContain('3 names');
   });
 });
