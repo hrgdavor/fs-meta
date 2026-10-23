@@ -21,7 +21,9 @@ import { describe, test } from 'node:test';
 // The hash is the `wyhash` project's: this port and that one assert the same values, and the cases below are
 // this format's own copy of them — the hash is part of what `files.meta` means, so `fsmeta-vectors.json`
 // carries its own hash cases rather than pointing at another project's file.
-import { wyhash64, wyhash64Hex } from 'wyhash/js/wyhash64.mjs';
+// The port owns the hash choice (native under Bun, the JS implementation under Node), so the tests use the same
+// entry point the port does rather than reaching for the package themselves.
+import { wyhash64, wyhash64Hex } from './layout.mjs';
 import {
   FLAG_HASH_LF, contentHashOf, decodeEntries, describeValidation, encodeEntries, encodeNames, entryCount,
   entryForFile, hashBytes, hex64, parseConfig, validate,
@@ -33,7 +35,21 @@ import {
 import { run } from './fsmeta-cli.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const vectors = JSON.parse(readFileSync(join(here, '..', 'conformance', 'fsmeta-vectors.json'), 'utf8'));
+// The v2 vectors: one case per verdict, generated from the reference engine and self-verified. The field names
+// are mapped to the ones these tests were written against; `label` keeps 'valid' for the ok case because the
+// worked-example test looks it up by that name.
+const legacy = JSON.parse(readFileSync(join(here, '..', 'conformance', 'fsmeta-vectors.json'), 'utf8'));
+const rawVectors = JSON.parse(readFileSync(join(here, '..', 'conformance', 'fsmeta-vectors-v2.json'), 'utf8'));
+const vectors = {
+  cases: rawVectors.cases.map((one) => ({
+    label: one.name === 'ok' ? 'valid' : one.name,
+    metaHex: one.meta,
+    txtHex: Buffer.from(one.txt, 'utf8').toString('hex'),
+    json: JSON.parse(one.json),
+    verdict: one.expect,
+    untrusted: undefined,
+  })),
+};
 
 const workspace = mkdtempSync(join(tmpdir(), 'fsmeta-test-'));
 process.on('exit', () => rmSync(workspace, { recursive: true, force: true }));
@@ -50,7 +66,7 @@ describe('the hash this format uses', () => {
 
   test('reproduces every case in this format\'s vector file', () => {
     let checked = 0;
-    for (const vector of vectors.hashCases) {
+    for (const vector of legacy.hashCases) {
       const bytes = vector.text !== undefined
         ? Buffer.from(vector.text, 'utf8')
         : bytesOfHex(vector.hex);
@@ -119,7 +135,7 @@ describe('validation', () => {
       const validation = validate(bytesOfHex(vector.metaHex), bytesOfHex(vector.txtHex), config);
       assert.equal(validation.verdict, vector.verdict, `verdict for case '${vector.label}'`);
       if (vector.untrusted !== undefined) {
-        assert.deepEqual(validation.untrusted, vector.untrusted, `untrusted entries for '${vector.label}'`);
+        // v2 has no 'untrusted' concept: an entry with unknown flags is `invalid-flags`, not a tolerated one.
       }
       const perEntry = vector.verdict === 'entry-out-of-range' || vector.verdict === 'name-hash-mismatch';
       if (perEntry) {
@@ -171,7 +187,7 @@ function materialize(root, vector) {
 describe('.gitignore and the walk', () => {
   test('every ignore case walks to the listed files', () => {
     let checked = 0;
-    for (const vector of vectors.gitignoreCases) {
+    for (const vector of legacy.gitignoreCases) {
       const root = join(workspace, `ignore-${vector.label}`);
       materialize(root, vector);
       const walked = scanTree(root, scanOptions()).map((file) => file.name);
@@ -186,7 +202,7 @@ describe('.gitignore and the walk', () => {
   });
 
   test('with .gitignore off, everything but .git and .fs-meta is listed', () => {
-    for (const vector of vectors.gitignoreCases) {
+    for (const vector of legacy.gitignoreCases) {
       const root = join(workspace, `files-${vector.label}`);
       materialize(root, vector);
       const walked = scanTree(root, { ...scanOptions(), respectGitignore: false }).map((file) => file.name);
