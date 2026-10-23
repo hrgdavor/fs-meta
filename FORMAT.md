@@ -367,8 +367,9 @@ format as the main meta.
   not at a batch.
 - The number is the **generation** the batch produces: batch `N` describes the step from generation `N-1` to
   `N`, and the main trio after that publish carries `"generation": N`.
-- Numbers are dense from 1. A gap or a duplicate is diagnosed (`batch-gap`), never skipped: a consumer that
-  skipped a batch would silently miss a change.
+- Numbers are dense from 1 for a fresh archive, and dense from the oldest retained batch once retention (§ 17.6)
+  has removed the oldest ones. A missing number in that range, or a duplicate, is diagnosed (`batch-gap`), never
+  skipped: a consumer that skipped a batch would silently miss a change.
 - **A merge of changes needs no baseline.** A consumer that recorded generation `4` reads batches `5`, `6`, `7` … and
   those *are* the changes from `4`; the state at `4` is not needed in order to see them. `--baseline <root>` is
   optional and secondary: it lets a merge drop a change whose identity has already returned to what the consumer holds,
@@ -483,27 +484,71 @@ real change, and applying it is idempotent.
 - **Must not parse `batches/` itself.** The layout is working design (§ 17.1) and becomes a log; the API is the
   contract. A port that walks the folder will break when the storage changes, and the format exists so that it
   does not have to.
-- **Must not assume dense batches are permanent forever**: retention (§ 17.6) will delete old ones. A consumer
+- **Must not assume dense batches are permanent forever**: retention (§ 17.6) deletes the oldest ones. A consumer
   whose `from` is older than the oldest retained batch is told `batch-too-old` and must fall back to a full
   pass — an explicit answer, never a silent partial reconcile.
 - **Must not infer "unchanged" from the main trio alone** in the window it is reconciling: the trio is the end
   state, and a file that changed and changed back is invisible in it.
 
-### 17.6 Storage, retention, and what is deliberately not decided yet
+### 17.6 Retention: a window, and a rotation that only removes the oldest
 
-The directory of trios is chosen because it needs no new parser and lets a batch be validated exactly like a
-trio. It is **not** the final design:
+**The decision.** A batch archive is a **window**, not a history. The writer keeps the newest **32** generations
+(`N = 32`) and removes the rest; the newest generation is always kept, so a configured `N` below 1 is read as 1.
+`N` is a writer setting with the documented default above, not a reader setting: a consumer cannot ask for a
+larger window, because the batches it would name no longer exist. The window is about how long a consumer may be
+away — a tree that publishes once a day covers a month, one that publishes every minute covers about half an
+hour — and the socket (§ 12) is the live consumer that stays inside it.
+
+**What "retained" means to a consumer.** A generation is retained when `batches/<id>/` exists. The oldest
+retained batch defines `first`; a consumer arrives with the generation it recorded, `from`, and asks for
+everything after it:
+
+| consumer's `from`   | answer                                                                     |
+| ------------------- | -------------------------------------------------------------------------- |
+| `from + 1 >= first` | every batch after `from` is present; `reconcile` reads the range           |
+| `from + 1 < first`  | **`batch-too-old`**, exit non-zero; the consumer falls back to a full pass |
+| `to > last`         | **`batch-gap`**; the range reaches a generation the archive never had      |
+
+So `from = first - 1` is fine — it needs only the oldest retained batch — and anything older is
+`batch-too-old`, never a shortened or empty answer. The socket replay (§ 12) answers the same way for the same
+reason. **Retention moves the start of the sequence; it never moves the end.** Numbering is dense from `first`,
+and a missing number above `first` is `batch-gap` — corruption, not retention.
+
+**What a rotation does.** Rotation runs after a batch is written: after the trio's commit record (§ 9) and
+after the batch that describes it. It applies the window as follows:
+
+- it considers only directory names that are exactly eight lowercase hex digits (§ 17.1); anything else in
+  `batches/` is foreign and is left alone, except the rotation's own leftovers listed below;
+- it removes the generations older than the newest `N`, **oldest first, one batch at a time**;
+- each removal is a rename out of the batch namespace followed by a recursive delete, so a reader sees a batch
+  either whole or not at all. A reader must never see a directory whose `files.meta` is already gone but whose
+  `files.txt` remains: a `reconcile` that skipped such a batch would silently lose its changes. A crash between
+  the two steps leaves a `.trash-<id>` directory, which is not a batch (not eight hex digits) and which the next
+  rotation removes;
+- the newest generation is never a candidate: the window is clamped to at least 1, so the batch a consumer is
+  about to read cannot disappear under it;
+- a failure stops the rotation and is reported, never swallowed. Everything already removed is older than
+  everything that remains, so **a gap can only ever be the oldest batches**. A gap in the middle is corruption:
+  rotation neither creates one nor repairs one, and the reader still reports it as `batch-gap`;
+- rotation is not a transaction with the publish. The trio (and its batch) is the commit record; a failed
+  rotation leaves a valid archive holding slightly more than `N` generations, and the next publishing pass
+  retries. Rotation therefore needs no journal and no repair: running it after every publish, or twice over the
+  same state, removes nothing the second time.
+
+**Storage is still open.** The directory of trios is chosen because it needs no new parser and lets a batch be
+validated exactly like a trio. It is **not** the final design:
 
 - One append-only file per generation, with a header per batch, is cheaper (one open instead of three, no
   directory per write) and can be rotated by appending a sequence marker; a reader replays from an offset.
-- Retention: a window (e.g. the last 32 generations, or everything a socket client could need) plus a
-  `reconcile` answer of `batch-too-old` when the window is exceeded. Deleting batches is safe only for
-  consumers known to be past them; the socket (§ 12) is the place to know that.
+- The retention window above is a promise of the API, not of the layout: the log must keep the newest `N`
+  batches, answer `batch-too-old` below them and `batch-gap` above them, with the same whole-batch-or-absent
+  guarantee. Nothing in § 17.4 changes with the storage.
 - Whether a batch is written before or after the main trio: the tentative answer is **after** (the trio is the
   commit record, § 9), with a missing batch diagnosed as `batch-gap` rather than reconstructed, because a
   guessed batch is a wrong change record.
 
 None of that changes the API in § 17.4, which is why the API is specified first.
+
 
 ## 18. roots: where the direct children live
 

@@ -39,16 +39,19 @@ const usage =
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   deprecated: an alias of reconcile, kept for scripts
-    \\  fsmeta serve   <root>        serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md
+    \\  fsmeta serve   <root> [--live]
+    \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
     \\  --hash none|lf|text          content hash mode recorded in the trio (default: text)
     \\  --updated <ISO-8601>         the pass timestamp; the engine has no clock of its own
     \\  --per-file                   naive listing (stat per entry) instead of the batched one
+    \\  --live                       serve: keep subscribers connected and publish a pass every 250 ms
     \\  --stats                      print where the pass spent its time
     \\  --since <timestamp>          mtime filter for glob (ISO-8601 or relative: 1h, 30m, 2d)
-    \\  --json                       emit results as a JSON array
+    \\  --keep-batches <n>           how many generations of batch history to retain (default 32)\
+\\  --json                       emit results as a JSON array
     \\
 ;
 
@@ -74,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
     var since: ?[]const u8 = null;
     var json_output = false;
     var baseline_root: ?[]const u8 = null;
+    var live = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--no-gitignore")) {
             respect_gitignore = false;
@@ -99,6 +103,11 @@ pub fn main(init: std.process.Init) !void {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--baseline")) {
             baseline_root = args.next() orelse return fail(io, gpa, "--baseline needs a root directory");
+        } else if (std.mem.eql(u8, arg, "--keep-batches")) {
+            const value = args.next() orelse return fail(io, gpa, "--keep-batches needs a count");
+            options.keep_batches = std.fmt.parseInt(usize, value, 10) catch return fail(io, gpa, "--keep-batches needs a count");
+        } else if (std.mem.eql(u8, arg, "--live")) {
+            live = true;
         } else if (arg.len > 0 and arg[0] == '-') {
             return fail(io, gpa, "unknown option");
         } else if (root == null) {
@@ -167,7 +176,13 @@ pub fn main(init: std.process.Init) !void {
         };
         return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output);
     }
-    if (std.mem.eql(u8, command, "serve")) return runServe(io, arena, gpa, target);
+    if (std.mem.eql(u8, command, "serve")) {
+        // The live publisher runs the same pass `refresh` does, so it must see the same options the
+        // user gave the command (`--hash`, `--no-gitignore`, `--per-file`).
+        options.respect_gitignore = respect_gitignore;
+        options.hash_mode = hash_mode;
+        return runServe(io, arena, gpa, target, options, live);
+    }
     return fail(io, gpa, "unknown command");
 }
 
@@ -175,7 +190,18 @@ pub fn main(init: std.process.Init) !void {
 ///
 /// The load is the readiness check: a server whose state is missing or fails validation can only answer
 /// with errors, and saying so on stdout is more useful than binding a socket that refuses every request.
-fn runServe(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8) !void {
+///
+/// With `live`, the server also publishes: it runs one `engine.refresh` pass every
+/// `server.poll_interval_ms` and streams each new batch to the clients that are already connected. The
+/// pass is the engine's, not the server's — `serve` calls it and never writes a batch itself.
+fn runServe(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    options: engine.Options,
+    live: bool,
+) !void {
     var cache = loadCache(arena, io, root) catch |err| {
         const message = switch (err) {
             error.TrioMissing => try std.fmt.allocPrint(arena, "no usable trio under {s}: .fs-meta/files.meta, files.txt and files.json are all required; run `fsmeta refresh {s}` first", .{ root, root }),
@@ -185,7 +211,8 @@ fn runServe(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: 
         return fail(io, gpa, message);
     };
     defer cache.deinit();
-    return server.run(io, arena, root, &cache);
+    const live_options: ?server.LiveOptions = if (live) .{ .engine = options } else null;
+    return server.run(io, arena, root, &cache, live_options);
 }
 
 /// Load the trio, run a glob query, and print one line per match (or a JSON array with --json).

@@ -9,24 +9,51 @@
 //! greet the client, read its greeting, check it, take its `SUBSCRIBE`, and replay the batch archive
 //! as `START_BATCH` / `CHANGE_ENTRY` / `END_BATCH`.
 //!
-//! Two deliberate limits:
+//! ## Two modes
 //!
-//! - **No live stream.** A pass publishes generations through the watcher, which is a different
-//!   artifact; a `serve` process has no publisher to subscribe to, so the connection ends after the
-//!   replay. The client resumes by reconnecting with its new `from_batch`, which is the replay path.
-//! - **`HELLO.capabilities` is 0 and `END_BATCH.changes_hash` is 0.** `FORMAT.socket.md` still does not
-//!   say what `changes_hash` hashes, and its § Values this implementation pins says a client must not rely
-//!   on it; this server therefore does not advertise the capability and leaves the field zero. The counts
-//!   in `END_BATCH` are exact and are what the document actually defines.
+//! - **Replay (the default).** The connection ends after the replay; the client resumes by reconnecting
+//!   with its new `from_batch`. This is the mode `test/socket.test.mjs` pins, and a one-shot consumer
+//!   wants the connection to end.
+//! - **Live (`fsmeta serve --live`).** One publisher task runs `engine.refresh` at the server's own
+//!   cadence; a subscriber that has caught up stays connected and receives every new batch with the
+//!   **same** `START_BATCH` / `CHANGE_ENTRY` / `END_BATCH` frames the replay uses. Live updates are
+//!   already specified by `FORMAT.socket.md` § "Replay, resume and the two refusals" ("Live updates are
+//!   the same messages"), so no kind, flag or payload was added — this is the publisher the protocol
+//!   was waiting for, not a protocol change.
 //!
-//! Single-threaded: `run` accepts one connection at a time, serves it, closes it, and accepts the
-//! next. With no publisher there is nothing to multiplex.
+//! `--live` is opt-in rather than the default because the replay-and-close contract is what the
+//! existing socket suite asserts, and a client that asked from `from_batch` and wants a snapshot has no
+//! reason to stay. Publishing stays the engine's job: the task calls `engine.refresh`, the one pass
+//! that writes a generation and its batch, and never writes a batch itself.
+//!
+//! ## Concurrency
+//!
+//! One task per connection plus one publisher task, all in a `std.Io.Group` (`Group.concurrent`), which
+//! is the shape Zig 0.17's `std.Io` makes simple: the group is long-lived and tasks are added as
+//! connections arrive, each task owning its stream. The only shared state is `Live.newest`, an atomic
+//! batch number. A connection copies it with acquire ordering, then loads and writes the batch through
+//! its own directory handle — so there is **no lock**, and therefore none held across a socket write.
+//! The publisher stores the number only after `batch.write` has returned, which is what makes a batch a
+//! connection can read: `batch.write` creates its directory before its files, so the directory's
+//! existence alone would expose a half-written batch.
+//!
+//! The publisher runs the engine pass on the server's own cadence (`poll_interval_ms`) and stamps each
+//! pass with the wall clock, because a long-lived process's passes are not one instant; the engine core
+//! deliberately has no clock of its own. A subscriber wakes every `wake_interval_ms` to read the atomic
+//! — one sleep per wake, not a busy wait — because a delivery below a third of a second is well inside
+//! the cost of the pass that produced it.
+//!
+//! `HELLO.capabilities` is 0 and `END_BATCH.changes_hash` is 0. `FORMAT.socket.md` still does not say
+//! what `changes_hash` hashes, and its § Values this implementation pins says a client must not rely on
+//! it; this server therefore does not advertise the capability and leaves the field zero. The counts in
+//! `END_BATCH` are exact and are what the document actually defines.
 
 const std = @import("std");
 const format = @import("format.zig");
 const cache_mod = @import("cache.zig");
 const batch = @import("batch.zig");
 const wire = @import("wire.zig");
+const engine = @import("engine.zig");
 
 /// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`).
 /// 1.0 is the layout the document describes; `FORMAT.socket.md` § Values this implementation pins states the
@@ -38,6 +65,15 @@ pub const socket_name = "socket";
 
 /// The path the server listens on, relative to a root: `.fs-meta/socket`.
 pub const socket_path = format.directory_name ++ "/" ++ socket_name;
+
+/// How often live mode runs one engine pass. Small enough that a client sees a change promptly, large
+/// enough that a full walk is not a busy wait; `--live` is a development tool, and a tree large enough
+/// for one pass to be expensive should use the watcher, which publishes on file-system events.
+pub const poll_interval_ms: u64 = 250;
+
+/// How often a live subscriber reads the shared batch number. It reads one atomic and otherwise sleeps,
+/// so delivery latency is bounded well below the pass interval at a negligible cost per connection.
+const wake_interval_ms: u64 = 50;
 
 /// Failure codes carried by `ERROR` (kind `0x05`). `FORMAT.socket.md` § Values this implementation pins
 /// gives the numeric table; the UTF-8 message carries the same vocabulary (`protocol`, `batch-too-old`,
@@ -64,15 +100,46 @@ pub const BatchWindow = struct {
     last: u64 = 0,
 };
 
+/// What enables live mode and how it publishes. `null` at `run` is the replay-only server.
+pub const LiveOptions = struct {
+    /// The engine options the CLI parsed (`--hash`, `--no-gitignore`, `--per-file`). Each pass gets its
+    /// own `updated` stamp, so this value supplies the rest of the `Options` and nothing else.
+    engine: engine.Options,
+    /// How often the publisher runs one pass; `--live` leaves it at `poll_interval_ms`.
+    poll_ms: u64 = poll_interval_ms,
+};
+
+/// The state the publisher and every subscriber share. `newest` is the newest **batch** on disk; a pass
+/// that publishes a generation but no batch (a touch that changes no entry) does not advance it, because
+/// the stream's unit is the batch.
+const Live = struct {
+    io: std.Io,
+    root: []const u8,
+    options: engine.Options,
+    poll_ms: u64,
+    newest: std.atomic.Value(u64),
+};
+
 /// Serve until the process is killed: bind `<root>/.fs-meta/socket` and replay batches to subscribers.
 ///
 /// `cache` is the loaded trio. The binary protocol replays the batch archive, so the cache is not
 /// read here; loading it is the readiness check `fsmeta serve` performs before binding, because a
 /// server with no usable trio could only answer with errors. Its count is reported at startup.
-pub fn run(io: std.Io, allocator: std.mem.Allocator, root: []const u8, cache: *const cache_mod.Cache) !void {
+///
+/// A non-null `live` starts the publisher task and keeps subscribers connected; a null one is the
+/// replay-only server this command has always been.
+pub fn run(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    cache: *const cache_mod.Cache,
+    live: ?LiveOptions,
+) !void {
     const path = try absoluteSocketPath(io, allocator, root);
     defer allocator.free(path);
 
+    // The startup bounds are the banner's; each connection opens the archive for itself, because a live
+    // server's archive grows while it runs and a `Dir` iteration position is not shared between tasks.
     const window = try openBatchWindow(io, root);
     defer if (window.dir) |dir| dir.close(io);
 
@@ -85,21 +152,53 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, root: []const u8, cache: *c
     defer server.deinit(io);
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
-    const banner = try std.fmt.allocPrint(
-        allocator,
-        "fsmeta: listening on {s} ({d} names, generation {d})\n",
-        .{ path, cache.fileCount() + cache.dirCount(), window.last },
-    );
+    const banner = if (live) |options|
+        try std.fmt.allocPrint(
+            allocator,
+            "fsmeta: listening on {s} ({d} names, generation {d}), live (a pass every {d} ms)\n",
+            .{ path, cache.fileCount() + cache.dirCount(), window.last, options.poll_ms },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "fsmeta: listening on {s} ({d} names, generation {d})\n",
+            .{ path, cache.fileCount() + cache.dirCount(), window.last },
+        );
     try std.Io.File.stdout().writeStreamingAll(io, banner);
+
+    var state: Live = undefined;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    if (live) |options| {
+        state = .{
+            .io = io,
+            .root = root,
+            .options = options.engine,
+            .poll_ms = options.poll_ms,
+            .newest = std.atomic.Value(u64).init(window.last),
+        };
+        // One publisher for the whole process: two passes over the same root would race on the trio and
+        // on the generation number, and a batch must have exactly one writer (§ 17).
+        try group.concurrent(io, publisherTask, .{&state});
+    }
 
     while (true) {
         const stream = try server.accept(io);
-        serveConnection(io, allocator, stream, window) catch {};
-        stream.close(io);
+        if (live != null) {
+            group.concurrent(io, connectionTask, .{ &state, stream }) catch {
+                // A task could not be spawned; refuse the connection rather than serve it on the accept
+                // thread, which would stall every other subscriber.
+                std.debug.print("fsmeta: cannot start a connection task\n", .{});
+                stream.close(io);
+            };
+        } else {
+            serveConnection(io, allocator, stream, window) catch {};
+            stream.close(io);
+        }
     }
 }
 
-/// Serve one connection: greet, check the client's greeting, take its `SUBSCRIBE`, replay, close.
+/// Serve one replay-only connection: greet, check the client's greeting, take its `SUBSCRIBE`, replay, close.
 ///
 /// The error path sends one `ERROR` and returns; a read error is the peer leaving and is propagated so
 /// `run` can ignore it and accept the next connection.
@@ -111,6 +210,18 @@ pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.St
     var read_buffer: [8192]u8 = undefined;
     var reader = std.Io.net.Stream.Reader.init(stream, io, &read_buffer);
 
+    const from_batch = (try negotiate(io, stream, &reader.interface, window)) orelse return;
+    try replay(io, arena, stream, window, from_batch);
+}
+
+/// The handshake: send `HELLO` for the window's newest batch, read the peer's, then its `SUBSCRIBE`.
+/// Returns the client's `from_batch`, or `null` when the request was refused (an `ERROR` has been sent).
+fn negotiate(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    reader: *std.Io.Reader,
+    window: BatchWindow,
+) !?u64 {
     // Simultaneous greeting: both sides send HELLO without waiting for the other (FORMAT.socket.md).
     const ours = wire.Hello{
         .protocol = protocol,
@@ -125,38 +236,43 @@ pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.St
     ours.write(&hello_bytes);
     try writeBytes(io, stream, &hello_bytes);
 
-    const hello_frame = (try readFramePrefix(io, stream, &reader.interface)) orelse return;
+    const hello_frame = (try readFramePrefix(io, stream, reader)) orelse return null;
     if (hello_frame.kind != .hello or hello_frame.length != wire.hello_size) {
-        return refuse(io, stream, .protocol, "expected a 24-byte HELLO greeting", .{});
+        refuse(io, stream, .protocol, "expected a 24-byte HELLO greeting", .{});
+        return null;
     }
-    const hello_payload = try reader.interface.take(hello_frame.length);
+    const hello_payload = try reader.take(hello_frame.length);
     const theirs = wire.Hello.read(hello_payload) catch {
-        return refuse(io, stream, .protocol, "malformed HELLO payload", .{});
+        refuse(io, stream, .protocol, "malformed HELLO payload", .{});
+        return null;
     };
     const verdict = wire.checkHello(ours, theirs);
     if (verdict != .ok) {
-        return refuse(io, stream, .protocol, "{s}", .{helloVerdictWord(verdict)});
+        refuse(io, stream, .protocol, "{s}", .{helloVerdictWord(verdict)});
+        return null;
     }
 
-    const subscribe_frame = (try readFramePrefix(io, stream, &reader.interface)) orelse return;
+    const subscribe_frame = (try readFramePrefix(io, stream, reader)) orelse return null;
     if (subscribe_frame.kind != .subscribe or subscribe_frame.length != 8) {
-        return refuse(io, stream, .protocol, "expected SUBSCRIBE with a u64 from_batch", .{});
+        refuse(io, stream, .protocol, "expected SUBSCRIBE with a u64 from_batch", .{});
+        return null;
     }
-    const subscribe_payload = try reader.interface.take(subscribe_frame.length);
+    const subscribe_payload = try reader.take(subscribe_frame.length);
     const from_batch = std.mem.readInt(u64, subscribe_payload[0..8], .little);
 
     if (from_batch > window.last) {
         // FORMAT.socket.md does not say what a client ahead of the server means; refusing it is the
         // only answer that cannot silently skip a change set.
-        return refuse(io, stream, .protocol, "from_batch {d} is newer than the newest batch {d}", .{ from_batch, window.last });
+        refuse(io, stream, .protocol, "from_batch {d} is newer than the newest batch {d}", .{ from_batch, window.last });
+        return null;
     }
     if (window.first) |first| {
         if (from_batch + 1 < first) {
-            return refuse(io, stream, .batch_too_old, "batches start at {d}, so from_batch {d} cannot be replayed", .{ first, from_batch });
+            refuse(io, stream, .batch_too_old, "batches start at {d}, so from_batch {d} cannot be replayed", .{ first, from_batch });
+            return null;
         }
     }
-
-    try replay(io, arena, stream, window, from_batch);
+    return from_batch;
 }
 
 /// Send `START_BATCH` … `END_BATCH` for every generation after `from_batch`.
@@ -177,6 +293,155 @@ fn replay(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, w
         }
         try sendEndBatch(io, stream, generation, counts(plan));
     }
+}
+
+// ---------------------------------------------------------------- live streaming
+
+/// One live connection: negotiate, replay what the archive has, then stay subscribed.
+fn liveConnection(io: std.Io, root: []const u8, stream: std.Io.net.Stream, live: *Live) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var read_buffer: [8192]u8 = undefined;
+    var reader = std.Io.net.Stream.Reader.init(stream, io, &read_buffer);
+
+    var window = try openBatchWindow(io, root);
+    defer if (window.dir) |dir| dir.close(io);
+
+    const from_batch = (try negotiate(io, stream, &reader.interface, window)) orelse return;
+    try replay(io, arena, stream, window, from_batch);
+
+    // The replay's own handle is no longer needed; the live loop opens the archive per delivery so it
+    // sees batches written after this connection started, and never shares an iteration position.
+    const replayed = window.last;
+    if (window.dir) |dir| dir.close(io);
+    window.dir = null;
+
+    try streamBatches(io, stream, live, replayed);
+}
+
+/// Stream every batch after `from` as the publisher makes it the newest, without reconnecting.
+///
+/// The loop reads one atomic per wake. A batch that the atomic names must be readable because the
+/// publisher stores the number only after `batch.write` returned; if it is missing anyway the archive
+/// has a hole, and a hole is `batch-gap` rather than a silent skip (FORMAT.md § 17.1, FORMAT.socket.md
+/// § Replay, resume and the two refusals).
+fn streamBatches(io: std.Io, stream: std.Io.net.Stream, live: *Live, from: u64) !void {
+    var sent = from;
+    while (true) {
+        const newest = live.newest.load(.acquire);
+        if (newest <= sent) {
+            try io.sleep(.fromMilliseconds(wake_interval_ms), .real);
+            continue;
+        }
+
+        const window = try openBatchWindow(io, live.root);
+        defer if (window.dir) |dir| dir.close(io);
+        const dir = window.dir orelse {
+            return refuse(io, stream, .batch_gap, "no batch {d}; the archive is empty", .{sent + 1});
+        };
+
+        // One arena per wake, so a long-lived connection does not accumulate every batch it ever sent.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var generation = sent + 1;
+        while (generation <= newest) : (generation += 1) {
+            const plan = loadBatch(arena, io, dir, generation) catch |err| switch (err) {
+                error.BatchGap => {
+                    return refuse(io, stream, .batch_gap, "no batch {d}; the archive ends at {d}", .{ generation, sent });
+                },
+                else => return err,
+            };
+
+            try sendStartBatch(io, stream, generation, generation - 1);
+            for (plan.entries, plan.names) |entry, name| {
+                try sendChangeEntry(io, arena, stream, entry, name);
+            }
+            try sendEndBatch(io, stream, generation, counts(plan));
+        }
+        sent = newest;
+    }
+}
+
+/// The publisher task: one engine pass per `poll_ms`, forever. A pass that fails is reported once and
+/// retried on the next tick; it must never stop the publisher, because a transient read error is not a
+/// reason to leave every subscriber stale.
+fn publisherTask(live: *Live) void {
+    var reported_failure = false;
+    while (true) {
+        const interval: i64 = @intCast(live.poll_ms);
+        live.io.sleep(.fromMilliseconds(interval), .real) catch return; // only `Canceled`: shut down
+        publishOnce(live) catch |err| {
+            if (!reported_failure) {
+                std.debug.print("fsmeta: live pass failed: {s}\n", .{@errorName(err)});
+                reported_failure = true;
+            }
+            continue;
+        };
+        reported_failure = false;
+    }
+}
+
+/// One pass for live mode: refresh the root, then advertise the batch the pass wrote, if any.
+fn publishOnce(live: *Live) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var options = live.options;
+    // The engine core has no clock, so the caller supplies the instant. A long-lived server runs many
+    // passes, and one start-up instant for all of them would describe none of them.
+    var stamp: [32]u8 = undefined;
+    options.updated = rfc3339Utc(live.io, &stamp);
+
+    const outcome = try engine.refresh(arena, live.io, live.root, options);
+    if (!outcome.published) return;
+    if (outcome.generation <= live.newest.load(.acquire)) return;
+    // A pass can publish a generation without a batch (a touched file whose hash and size did not
+    // change produces an empty diff). The stream's unit is the batch, so only a written batch advances
+    // the advertised number. `batchExists` runs after `batch.write` returned in this same task, so the
+    // directory it finds is complete.
+    if (!batchExists(live.io, live.root, outcome.generation)) return;
+    live.newest.store(outcome.generation, .release);
+}
+
+/// Whether `batches/<generation>` exists under the root.
+fn batchExists(io: std.Io, root: []const u8, generation: u64) bool {
+    var name_buffer: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buffer, "{x:0>8}", .{generation}) catch return false;
+
+    var root_dir = openRootDir(io, root) catch return false;
+    defer root_dir.close(io);
+    var meta_dir = root_dir.openDir(io, format.directory_name, .{}) catch return false;
+    defer meta_dir.close(io);
+    var batches = meta_dir.openDir(io, "batches", .{}) catch return false;
+    defer batches.close(io);
+    var dir = batches.openDir(io, name, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
+/// The pass timestamp as RFC3339 UTC (`FORMAT.md` § 5 describes `updated` as an RFC3339 instant).
+/// Seconds precision: the field is informational, and a server stamping every 250 ms does not need
+/// sub-second digits to say when a pass ran.
+fn rfc3339Utc(io: std.Io, buffer: *[32]u8) []const u8 {
+    const seconds = std.Io.Clock.real.now(io).toSeconds();
+    const secs: u64 = if (seconds < 0) 0 else @intCast(seconds);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    return std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch "1970-01-01T00:00:00Z";
 }
 
 /// The change counts `END_BATCH` must agree with (FORMAT.socket.md: "the counts must equal the entries
@@ -368,6 +633,14 @@ fn helloVerdictWord(verdict: wire.HelloVerdict) []const u8 {
     };
 }
 
+// ---------------------------------------------------------------- live helpers
+
+/// A connection task: the stream belongs to it, and it ends when the peer leaves or streaming fails.
+fn connectionTask(live: *Live, stream: std.Io.net.Stream) void {
+    defer stream.close(live.io);
+    liveConnection(live.io, live.root, stream, live) catch {};
+}
+
 test "the greeting is the document's fixed 24-byte payload, not the kind table's short one" {
     const ours = wire.Hello{
         .protocol = protocol,
@@ -395,4 +668,16 @@ test "the world is not JSON: a binary frame's first byte is never 0x7B" {
         wire.writePrefix(&prefix, kind, 0, 0);
         try std.testing.expect(prefix[0] < 0x7B);
     }
+}
+
+test "the live pass timestamp is an RFC3339 instant, not a bare word" {
+    var buffer: [32]u8 = undefined;
+    const text = rfc3339Utc(std.testing.io, &buffer);
+    try std.testing.expectEqual(@as(usize, 20), text.len);
+    try std.testing.expectEqual(@as(u8, '-'), text[4]);
+    try std.testing.expectEqual(@as(u8, '-'), text[7]);
+    try std.testing.expectEqual(@as(u8, 'T'), text[10]);
+    try std.testing.expectEqual(@as(u8, ':'), text[13]);
+    try std.testing.expectEqual(@as(u8, ':'), text[16]);
+    try std.testing.expectEqual(@as(u8, 'Z'), text[19]);
 }

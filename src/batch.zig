@@ -477,6 +477,118 @@ const relative = try std.fmt.allocPrint(allocator, "batches/{x:0>8}", .{context.
     try dir.writeFile(io, .{ .sub_path = format.json_file, .data = json_bytes });
 }
 
+// ---------------------------------------------------------------- retention (FORMAT.md § 17.6)
+
+/// How many generations a batch archive keeps by default: the newest thirty-two (FORMAT.md § 17.6).
+///
+/// The window is a policy of the archive, not of one batch, so it is a parameter of `rotate` rather than of
+/// `write`; the engine passes its own `keep_batches`, which defaults here. Thirty-two is about a month of one
+/// pass a day, or half an hour of one pass a minute, and it is small enough that the archive a long-lived tree
+/// accumulates stays bounded.
+pub const default_keep: usize = 32;
+
+/// The prefix a generation is renamed to while it is being removed. It is not eight hex digits, so a reader
+/// never mistakes a leftover for a batch; the next rotation deletes it.
+const trash_prefix = ".trash-";
+
+/// What a rotation left behind, so a caller can report or test it.
+pub const Rotation = struct {
+    /// Generations retained: the newest `keep`, or every generation when the archive is smaller than the window.
+    kept: usize = 0,
+    /// Generations removed by this rotation: the oldest ones beyond the window, in ascending number order.
+    dropped: u64 = 0,
+};
+
+/// Whether `name` is a batch id: exactly eight lowercase hex digits (§ 17.1). Anything else in `batches/` is a
+/// foreign entry, not a batch, and rotation leaves it alone.
+fn isBatchName(name: []const u8) bool {
+    if (name.len != 8) return false;
+    for (name) |char| switch (char) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// The numbers a rotation removes: everything older than the newest `keep` generations, ascending.
+///
+/// Pure — no file system, no names — so the window arithmetic is testable on its own. The newest generation is
+/// always kept: `keep` is clamped to at least one, which makes "never delete the current change set" a property
+/// of this function rather than a promise of its caller. `numbers` need not be sorted, and a gap already in it
+/// stays a gap: rotation removes a prefix, it neither creates nor repairs a hole in the middle.
+pub fn toDrop(allocator: std.mem.Allocator, numbers: []const u64, keep_requested: usize) ![]u64 {
+    const keep = @max(keep_requested, 1);
+    if (numbers.len <= keep) return allocator.alloc(u64, 0);
+    const sorted = try allocator.dupe(u64, numbers);
+    defer allocator.free(sorted);
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+    return allocator.dupe(u64, sorted[0 .. sorted.len - keep]);
+}
+
+/// Apply the retention window to `<meta_dir>/batches`: remove the oldest generations beyond `keep`.
+///
+/// Safe to run after every publish. It reads the archive as it is now, so a second run over the same state
+/// removes nothing, and the newest generation is never a candidate (§ 17.6).
+///
+/// **Oldest first, one at a time.** A removal is a rename out of the batch namespace followed by a recursive
+/// delete, so a reader sees a batch either whole or not at all — never a directory with some of its three files
+/// already gone, which a consumer would read as a shortened change record. On the first failure the rotation
+/// stops and returns the error: everything already removed is older than everything that remains, so the
+/// archive is still a contiguous suffix of the sequence, and a later pass retries. A missing `batches/`
+/// directory is not an error — a trio can exist before its first change batch.
+pub fn rotate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    meta_dir: std.Io.Dir,
+    keep_requested: usize,
+) !Rotation {
+    var batches = meta_dir.openDir(io, "batches", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer batches.close(io);
+
+    var numbers: std.ArrayListUnmanaged(u64) = .empty;
+    defer numbers.deinit(allocator);
+    var trash: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (trash.items) |name| allocator.free(name);
+        trash.deinit(allocator);
+    }
+
+    var iterator = batches.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, trash_prefix)) {
+            // A removal that was interrupted after its rename: no longer a batch, and still our garbage.
+            try trash.append(allocator, try allocator.dupe(u8, entry.name));
+            continue;
+        }
+        if (entry.kind != .directory or !isBatchName(entry.name)) continue;
+        const number = std.fmt.parseInt(u64, entry.name, 16) catch continue;
+        try numbers.append(allocator, number);
+    }
+
+    // Finish the previous rotation's last step before starting this one: the rename below must not collide.
+    for (trash.items) |name| try batches.deleteTree(io, name);
+
+    const keep = @max(keep_requested, 1);
+    const drop = try toDrop(allocator, numbers.items, keep);
+    defer allocator.free(drop);
+
+    for (drop) |number| {
+        const name = try std.fmt.allocPrint(allocator, "{x:0>8}", .{number});
+        defer allocator.free(name);
+        const aside = try std.fmt.allocPrint(allocator, "{s}{s}", .{ trash_prefix, name });
+        defer allocator.free(aside);
+        // Rename is the atomic step: after it the generation is out of the archive. The delete is cleanup, and
+        // a crash between the two leaves `aside`, which the next rotation removes.
+        try batches.rename(name, batches, aside, io);
+        try batches.deleteTree(io, aside);
+    }
+
+    return .{ .kept = @min(numbers.items.len, keep), .dropped = drop.len };
+}
+
 test "a written batch lands under batches/<generation>, three files, decodable" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -545,4 +657,104 @@ test "a batch directory is named in lowercase hex, so the id arithmetic is nibbl
     // apart, which is why the test uses it: a base-ten padding passes every smaller number.
     var dir = try tmp.dir.openDir(io, "batches/00000010", .{});
     defer dir.close(io);
+}
+
+// ---------------------------------------------------------------- retention tests
+
+/// A batch directory as rotation sees it: a name and one file, so a removal exercises the recursive delete rather
+/// than an empty directory.
+fn makeBatch(io: std.Io, meta_dir: std.Io.Dir, number: u64) !void {
+    const relative = try std.fmt.allocPrint(testing.allocator, "batches/{x:0>8}", .{number});
+    defer testing.allocator.free(relative);
+    try meta_dir.createDirPath(io, relative);
+    var dir = try meta_dir.openDir(io, relative, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = format.meta_file, .data = "entry" });
+}
+
+/// Whether `batches/<number>` is still there, with its file.
+fn batchExists(io: std.Io, meta_dir: std.Io.Dir, number: u64) !bool {
+    const relative = try std.fmt.allocPrint(testing.allocator, "batches/{x:0>8}/{s}", .{ number, format.meta_file });
+    defer testing.allocator.free(relative);
+    const bytes = meta_dir.readFileAlloc(io, relative, testing.allocator, std.Io.Limit.limited(64)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    testing.allocator.free(bytes);
+    return true;
+}
+
+test "the retention window is the newest N, and never fewer than the newest one" {
+    // Unsorted on purpose: the directory hands entries over in whatever order the file system chose.
+    const numbers = [_]u64{ 5, 2, 9, 1, 7 };
+
+    const keep_three = try toDrop(testing.allocator, &numbers, 3);
+    defer testing.allocator.free(keep_three);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, keep_three);
+
+    // Keep zero is read as one: the generation a consumer is about to read must never disappear.
+    const keep_zero = try toDrop(testing.allocator, &numbers, 0);
+    defer testing.allocator.free(keep_zero);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 5, 7 }, keep_zero);
+
+    // A window larger than the archive removes nothing.
+    const keep_all = try toDrop(testing.allocator, &numbers, 99);
+    defer testing.allocator.free(keep_all);
+    try testing.expectEqual(@as(usize, 0), keep_all.len);
+}
+
+test "a rotation drops the oldest generations, keeps the newest, and leaves what is not a batch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]u64{ 1, 2, 3, 4, 5 }) |number| try makeBatch(io, tmp.dir, number);
+    // A leftover from an interrupted rotation, and a foreign entry: neither is a batch.
+    try tmp.dir.createDirPath(io, "batches/.trash-00000001");
+    try tmp.dir.createDirPath(io, "batches/notes");
+
+    const rotation = try rotate(testing.allocator, io, tmp.dir, 3);
+    try testing.expectEqual(@as(usize, 3), rotation.kept);
+    try testing.expectEqual(@as(u64, 2), rotation.dropped);
+
+    try testing.expect(!try batchExists(io, tmp.dir, 1));
+    try testing.expect(!try batchExists(io, tmp.dir, 2));
+    for ([_]u64{ 3, 4, 5 }) |number| try testing.expect(try batchExists(io, tmp.dir, number));
+    // The older three disappeared as whole batches: no half-deleted directory is left behind.
+    for ([_]u64{ 1, 2 }) |number| {
+        const relative = try std.fmt.allocPrint(testing.allocator, "batches/{x:0>8}", .{number});
+        defer testing.allocator.free(relative);
+        try testing.expectError(error.FileNotFound, tmp.dir.openDir(io, relative, .{}));
+    }
+    // The interrupted rotation's leftover was cleaned, and the foreign entry was not touched.
+    try testing.expectError(error.FileNotFound, tmp.dir.openDir(io, "batches/.trash-00000001", .{}));
+    var notes = try tmp.dir.openDir(io, "batches/notes", .{});
+    notes.close(io);
+
+    // Running it again removes nothing: rotation is idempotent after a publish.
+    const again = try rotate(testing.allocator, io, tmp.dir, 3);
+    try testing.expectEqual(@as(u64, 0), again.dropped);
+    try testing.expectEqual(@as(usize, 3), again.kept);
+}
+
+test "a rotation that may keep only one still keeps the newest batch" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try makeBatch(io, tmp.dir, 1);
+    try makeBatch(io, tmp.dir, 2);
+    const rotation = try rotate(testing.allocator, io, tmp.dir, 0);
+    try testing.expectEqual(@as(usize, 1), rotation.kept);
+    try testing.expectEqual(@as(u64, 1), rotation.dropped);
+    try testing.expect(!try batchExists(io, tmp.dir, 1));
+    try testing.expect(try batchExists(io, tmp.dir, 2));
+}
+
+test "a rotation with no batches directory is a no-op, not an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rotation = try rotate(testing.allocator, std.testing.io, tmp.dir, 4);
+    try testing.expectEqual(@as(u64, 0), rotation.dropped);
+    try testing.expectEqual(@as(usize, 0), rotation.kept);
 }

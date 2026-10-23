@@ -41,6 +41,9 @@ pub const Options = struct {
     created: ?[]const u8 = null,
     /// Write a generation even when nothing changed (a caller that wants a heartbeat).
     force: bool = false,
+    /// How many generations of `batches/` the archive retains (FORMAT.md § 17.6). The newest is always kept, so
+    /// a value below one is read as one. Rotation runs on a publishing pass, after the batch that describes it.
+    keep_batches: usize = batch_mod.default_keep,
     /// Measure the naive listing against the batched one: a readdir plus a stat per entry.
     per_file: bool = false,
 };
@@ -251,6 +254,13 @@ try batch_mod.write(arena, io, meta_dir, plan, .{
 });
 }
 }
+
+    // Retention (§ 17.6): the archive is a window, not a history. It runs after the commit record and after the
+    // batch that describes it, oldest first, so a failure can only leave the oldest generations removed. A
+    // rotation failure is reported rather than swallowed: the trio is already committed, but a writer that
+    // claims to have trimmed the archive and did not is lying about its own output.
+    _ = try batch_mod.rotate(arena, io, meta_dir, options.keep_batches);
+
     outcome.stats = .{ .load_ns = t1 - t0, .discover_ns = t2 - t1, .hash_ns = t3 - t2, .publish_ns = nowNs(io) - t3 };
     return outcome;
 }
