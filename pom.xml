@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        STANDALONE, AND DELIBERATELY NOT A `jcodebuddy` ARTIFACT.
+
+        This project has its own group id, its own artifact id, its own version and no parent: it does not
+        inherit `jcodebuddy-parent`, and nothing about it belongs to the JCodeBuddy namespace. That is a
+        decision about what it is, not tidiness — the file-system state contract is not a JCodeBuddy feature.
+        It is a small library a watcher and any number of other tools share, it depends on nothing from this
+        checkout except the `wyhash` project's Java artifact once that lands, and a tool that wants it should
+        be able to take it without taking anything else.
+
+        WHERE IT SITS AND WHY. The directory is at the root of this checkout and the root POM still lists it
+        as a `<module>`: the reactor is how it is built and how the recorded gate runs its tests, while the
+        *coordinates* are what make it standalone. Being in a reactor is a build relationship, not a
+        namespace — the same distinction the `watch/` standalone rule makes about the shared build parent.
+
+        `java-watch*` MAY DEPEND ON THIS PROJECT. The watcher family's rule is that it must not know about
+        Jackson, OpenRewrite, or this workspace's `jcodebuddy-*` / `hipster-*` / `metadata-*` / `jwa-*`
+        artifacts (AGENTS.md § 2, `scripts/check-watch-standalone.js`). `fs-meta` is none of those: it is a
+        standalone package with its own identity, no workspace dependency and no JCodeBuddy vocabulary, so the
+        watcher may consume it — which is the point, because the watcher is the writer of the trio. The
+        amendment is recorded in `AGENTS.md` and in the check's own header.
+    -->
+
+    <groupId>hr.hrg</groupId>
+    <artifactId>fs-meta</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>fs-meta</name>
+    <description>
+        The file-system state of one codebase folder as a trio of files — a compact binary index
+        (files.meta), its LF-delimited names (files.txt) and a JSON sidekick (files.json) — so that a
+        watcher can maintain it once and every other tool can ask "is this file still what I indexed?"
+        without walking the tree. The format is specified in FORMAT.md; the Java, Bun and (later) Zig
+        implementations all assert the same conformance vectors.
+    </description>
+
+    <!--
+        No parent means no managed versions, so everything this build uses is pinned here. The values are the
+        ones `jcodebuddy-parent` pins, kept identical on purpose: this project is built by the same reactor and
+        the same JDK 25, and a different compiler or surefire version here would be a difference nobody asked
+        for.
+    -->
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>25</maven.compiler.release>
+
+        <wyhash.version>1.1.0-SNAPSHOT</wyhash.version>
+        <junit.version>5.10.2</junit.version>
+
+        <maven.compiler.plugin.version>3.11.0</maven.compiler.plugin.version>
+        <maven.surefire.plugin.version>3.2.5</maven.surefire.plugin.version>
+        <maven.jar.plugin.version>3.3.0</maven.jar.plugin.version>
+        <maven.install.plugin.version>3.1.4</maven.install.plugin.version>
+        <maven.deploy.plugin.version>3.1.2</maven.deploy.plugin.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            The one hash the format uses: `wyhash64`, seed 0 — the same coordinates this file has always
+            resolved, now at `1.1.0-SNAPSHOT` because the implementation this project needs (zero-allocation
+            `String`, `MemorySegment`, the generated vectors) lives there and `1.0.0` did not have it.
+
+            THE HASH IS NOT BUILT HERE (DEC-050). `hr.hrg:wyhash` has its own repository
+            (github.com/hrgdavor/wyhash); this dependency resolves from the local repository, so a machine needs
+            it installed once — `cd <wyhash checkout> && mvn -o install -Dgpg.skip=true` — or, once 1.1.0 is
+            published, from Maven Central. `mvn -pl :fs-meta` therefore does NOT build its own dependency, and
+            `-am` no longer reaches it: a "cannot resolve hr.hrg:wyhash" failure means the install is missing,
+            not that the POM is wrong.
+
+            Both ports of this format still hash with the SAME CODE rather than with the same algorithm: this
+            artifact is the Java half, and the Bun half imports the same project's `js/wyhash64.mjs` through the
+            package link the root `package.json` declares. The vectors prove it either way —
+            `conformance/fsmeta-vectors.json`'s `hashCases` pin the values, and the wyhash project's own
+            generated vectors pin them against the Zig builtin reference.
+        -->
+        <dependency>
+            <groupId>hr.hrg</groupId>
+            <artifactId>wyhash</artifactId>
+            <version>${wyhash.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.compiler.plugin.version}</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven.surefire.plugin.version}</version>
+                <configuration>
+                    <parallel>none</parallel>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>${maven.jar.plugin.version}</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-install-plugin</artifactId>
+                <version>${maven.install.plugin.version}</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <version>${maven.deploy.plugin.version}</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

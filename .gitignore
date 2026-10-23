@@ -1,0 +1,6 @@
+/.tmp
+/.zig-cache
+/zig-out
+/.fs-meta
+/target
+/zig-pkg
