@@ -157,7 +157,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "merge")) {
         const start_arg = second orelse return fail(io, gpa, "merge needs a start batch number");
-        const end_arg = args.next() orelse null;
+        // The iterator is exhausted by the option loop, so this used to be null always: the third positional is where
+        // the range end actually arrives.
+        const end_arg = third;
         return runMerge(io, arena, gpa, target, start_arg, end_arg, json_output);
     }
     return fail(io, gpa, "unknown command");
