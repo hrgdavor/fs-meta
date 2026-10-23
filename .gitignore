@@ -1,6 +1,123 @@
-/.tmp
-/.zig-cache
-/zig-out
-/.fs-meta
-/target
-/zig-pkg
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and ad-hoc build/scratch output
+*.log
+agent_log*.txt
+build_error.txt
+build_output.txt
+cross_verify.bin
+zig-watch-scp/test_create/test.txt
+zig-watch-scp/test_hex
+zig-watch-scp/test_padding
+zig-watch-scp/test_tab
+zig-watch-scp/build_output.txt
+java-watch-scp/bad.conf
+
+# JCodeBuddy tool output. A `.jcodebuddy/` directory appears only in modules that apply
+# `project-automation`, and each one carries its own .gitignore as the authority (see
+# hipster-entity-example/.jcodebuddy/README.md and
+# doc-hipster-entity/architecture/decisions/DEC-026.md). These entries are the
+# belt-and-braces net for the root and for any module that forgets its own; the tracked
+# subtrees (context/, reports/) are deliberately absent, so they stay visible in
+# `git status`.
+.jcodebuddy/metadata/
+.jcodebuddy/agent-state/
+.jcodebuddy/worktrees/
+
+# Compatibility: the watch agent's cache/audit root before it moved under .jcodebuddy.
+.watch
+
+# Node / Gradle trees inside the tooling subprojects
+vscode-jwa/node_modules
+intellij-jwa/.gradle
+vscode-jswa/node_modules
+jswa-core/node_modules
+intellij-jswa/.gradle
+node_modules
+.vscode-test
+/webview-vscode/out
+/webview-vscode/*.vsix
+
+# The VS Code host moved under webview/, so its build output is ignored at the new path too. The two
+# entries above are kept because a checkout that predates the move still has them.
+webview/webview-vscode/out
+webview/webview-vscode/*.vsix
+# The JetBrains host's Gradle build, which was never listed because the module used to publish its own
+# .gitignore.
+webview/webview-jetbrains/build
+webview/webview-jetbrains/.gradle
+webview/webview-jetbrains/.kotlin
+# The IntelliJ compiler writes `.class` files to bin/ rather than build/, so the Gradle paths above miss
+# it; observed untracked on 2026-09-25 after the plugin was opened in the IDE.
+webview/webview-jetbrains/bin
+
+# Zed compiles a dev extension in place and drops the artifact next to the manifest, so this appears the
+# moment someone runs `Install Dev Extension` on webview/zed/webview-zed-dev-extension. Cargo's own
+# target/ is covered by the root `target/` rule above.
+webview/zed/*/extension.wasm
+
+# The standalone host publishes its port and token path inside the project it serves. Derived and
+# per-machine, so it is ignored - but only this subtree: a module's `.jcodebuddy/context` and
+# `.jcodebuddy/reports` are contracts and stay visible (DEC-026).
+.jcodebuddy/webview
+
+# Agent harness state. `.kilo/plans` holds untracked per-round plans; the tool's own
+# config (package.json, node_modules) is covered above.
+.kilo/plans
+.mvn-local-repo
+
+# Agent scratch. Deliberately NOT under `target/`: the recorded gate runs `mvn clean` on every
+# invocation, so a scratch script written under target/ is deleted by the very command that
+# verifies the work it enabled. `.tmp/` survives that, and being ignored it also cannot be
+# swallowed by a `git add -A`. It is durable against `clean`, not against a clone: nothing here
+# is ever committed or required. The rule is in AGENTS.md § 2.
+.tmp/
+
+# fs-meta's per-checkout state: the trio a watcher maintains (fs-meta/FORMAT.md) is derived output for
+# whichever folder it describes, exactly like `.jcodebuddy/`'s derived subtrees, and a clone carries none
+# of it. A project that wants to *commit* a trio opts it back in with a `!` rule.
+.fs-meta/
+
+# The Zig build's own output and caches, wherever a Zig port lives (fs-meta/zig when it lands, and any future
+# one). The check runners pin the caches under the module so a sandboxed or CI run writes nothing outside the
+# tree, and a check that compiles Java for itself writes `.java-check/` for the same reason.
+zig-out/
+.zig-cache/
+.java-check/
+
+# The jsx6 checkout that AGENTS.md § 2 requires for any UI work: a local clone, updated on demand
+# (`git -C .jsx6 pull --ff-only`), never pinned and never committed. It sits beside `.tmp/` for the
+# same reason the scratch rule gives — the recorded gate runs `clean`, so it must not live under
+# target/, and it must be ignored or a `git add -A` would swallow the whole checkout.
+.jsx6/
+
+# proto/ is the driver-project area: real projects that exercise JCodeBuddy while it is under
+# development. They are *not* part of this repository - each one is a repository of its own.
+#
+# The whole directory is ignored, with no exceptions. That is deliberate for this phase: driver
+# projects are a local workspace, not something another developer checks out from here, so nothing
+# under proto/ - a project's sources, its .jcodebuddy/, its .git/, its build output, or the README
+# and AGENTS.md that sit in the area itself - needs to survive a clone of this repository.
+proto/
+node_modules/
