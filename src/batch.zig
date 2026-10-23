@@ -463,7 +463,10 @@ pub fn write(
     });
     defer allocator.free(json_bytes);
 
-    const relative = try std.fmt.allocPrint(allocator, "batches/{d:0>8}", .{context.generation});
+    // The batch id is the generation in **lowercase hex**, zero-padded to eight digits. Hex is not cosmetic: a
+// bit count divided by four is a digit count, so padding, parsing and modulo are shifts and masks rather than
+// divisions by ten, and the digits line up with the bits a consumer already has.
+const relative = try std.fmt.allocPrint(allocator, "batches/{x:0>8}", .{context.generation});
     defer allocator.free(relative);
     try meta_dir.createDirPath(io, relative);
     const dir = try meta_dir.openDir(io, relative, .{});
@@ -516,4 +519,30 @@ test "a written batch lands under batches/<generation>, three files, decodable" 
     }
     try testing.expectEqual(@as(usize, 2), decoded.entries.len);
     try testing.expectEqual(reconcile.Kind.added, kindOf(decoded.entries[0]).?);
+}
+
+test "a batch directory is named in lowercase hex, so the id arithmetic is nibble-aligned" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plan = try diff(std.testing.allocator, &.{}, &.{
+        item("a.txt", 10, format.flags.regular_file | format.flags.content_known),
+    });
+    defer {
+        std.testing.allocator.free(plan.entries);
+        std.testing.allocator.free(plan.names);
+    }
+
+    try write(std.testing.allocator, io, tmp.dir, plan, .{
+        .generation = 16,
+        .parent = 15,
+        .created = "2026-10-19T00:00:00Z",
+        .updated = "2026-10-19T00:00:00Z",
+    });
+
+    // Generation 16 is `00000010` in hex and `00000016` in decimal. This is the only value that can tell the two
+    // apart, which is why the test uses it: a base-ten padding passes every smaller number.
+    var dir = try tmp.dir.openDir(io, "batches/00000010", .{});
+    defer dir.close(io);
 }

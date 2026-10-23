@@ -335,6 +335,11 @@ format as the main meta.
     00000002/  ...
 ```
 
+- A batch directory is named with the generation in **lowercase hex, zero-padded to eight digits** (`0000000a` is
+  generation 10). Hex is a requirement rather than a style: a bit count divided by four is a digit count, so the
+  digits needed, the parse and any modulo are shifts and masks rather than divisions by ten, and the digits line up
+  with the bits the id already occupies. A validator that sees a name which is not hex is looking at a foreign file,
+  not at a batch.
 - The number is the **generation** the batch produces: batch `N` describes the step from generation `N-1` to
   `N`, and the main trio after that publish carries `"generation": N`.
 - Numbers are dense from 1. A gap or a duplicate is diagnosed (`batch-gap`), never skipped: a consumer that

@@ -33,7 +33,7 @@ const usage =
     \\                                   glob-search the trio; one line per match
     \\  fsmeta changed <root> <since>  files changed since <since>; one line per match
     \\  fsmeta merge   <root> <start> [end] [--json]
-    \\                                   merge batches start+1..end; added+changed only
+    \\                                   merge batches start+1..end into one change record
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -223,7 +223,7 @@ fn runChanged(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root
     }
 }
 
-/// Merge batches from start+1 to end (inclusive), outputting added and changed names only.
+/// Merge batches from start+1 to end (inclusive) into one change record, deletions included.
 fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8, start_arg: []const u8, end_arg: ?[]const u8, json: bool) !void {
     const start_num = std.fmt.parseInt(usize, start_arg, 10) catch return fail(io, gpa, "start must be a number");
     const end_num: usize = if (end_arg) |e|
@@ -258,7 +258,9 @@ fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: 
     defer batches_dir.close(io);
 
     for (start_num + 1 .. end_num + 1) |n| {
-        const dir_name = try std.fmt.allocPrint(arena, "{x}", .{n});
+        // The batch id is the generation in lowercase hex, zero-padded to eight digits: the same rule the writer
+        // follows (FORMAT.md § 17.1). Parsing and formatting it in base ten silently finds nothing.
+        const dir_name = try std.fmt.allocPrint(arena, "{x:0>8}", .{n});
         var batch_dir = batches_dir.openDir(io, dir_name, .{ .iterate = true }) catch continue;
         defer batch_dir.close(io);
 
@@ -285,11 +287,7 @@ fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: 
     arena.free(all_events);
 
     // Filter: added + changed only (no deleted).
-    var count: usize = 0;
-    for (changes) |c| {
-        if (c.kind == .deleted) continue;
-        count += 1;
-    }
+    const count: usize = changes.len;
 
     if (json) {
         var out: std.Io.Writer.Allocating = .init(arena);
@@ -302,14 +300,17 @@ fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: 
             try writer.writeAll("[\n");
             var first = true;
             for (changes) |c| {
-                if (c.kind == .deleted) continue;
                 if (!first) try writer.writeAll(",\n");
                 first = false;
                 try writer.writeAll("  {\n");
                 try writer.writeAll("    \"name\": ");
                 try jsonWriteString(writer, c.name);
                 try writer.writeAll(",\n");
-                const kind_str = if (c.kind == .added) "added" else "changed";
+                const kind_str = switch (c.kind) {
+                    .added => "added",
+                    .changed => "changed",
+                    .deleted => "deleted",
+                };
                 try writer.print("    \"kind\": \"{s}\"\n", .{kind_str});
                 try writer.writeAll("  }");
             }
@@ -319,7 +320,6 @@ fn runMerge(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: 
         try write(io, result);
     } else {
         for (changes) |c| {
-            if (c.kind == .deleted) continue;
             const line = try std.fmt.allocPrint(arena, "{s}\n", .{c.name});
             try write(io, line);
         }
