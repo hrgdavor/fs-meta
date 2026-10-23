@@ -13,6 +13,11 @@ possible. Do not add a writer to a port to make a test pass.
 
 ## 2. Format invariants that must not drift
 
+- **`glob` is abandoned and strictly not supported; `wildmatch` is the only wildcard syntax.** That applies here, in
+  `gitignore` and in `jcodebuddy`; `java-watch*` predates the decision and is exempt for now. Do not accept braces,
+  extglob or any other dialect, and do not add a pattern syntax of your own: a change to the syntax is a change to
+  `gitignore`, its vectors, and every implementation that answers them.
+
 - **One wildcard implementation.** Every wildcard is git's `wildmatch` semantics via the `gitignore` project
   (DEC-051); fs-meta has no glob dialect of its own. A new pattern syntax anywhere — the `glob` query, the
   `.gitignore` chain, a future socket request — is a format change, not a local convenience, and it goes

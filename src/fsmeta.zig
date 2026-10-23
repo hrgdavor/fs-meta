@@ -149,7 +149,8 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
-    if (std.mem.eql(u8, command, "glob")) {
+    // `glob` is abandoned as a name and as a dialect; `match` is the command, and the old name stays for scripts.
+    if (std.mem.eql(u8, command, "match") or std.mem.eql(u8, command, "glob")) {
         const pattern = second orelse return fail(io, gpa, "glob needs a pattern");
         return runGlob(io, arena, gpa, target, pattern, since, json_output);
     }

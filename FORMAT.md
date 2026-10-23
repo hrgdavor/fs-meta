@@ -531,9 +531,16 @@ None of that changes the API in § 17.4, which is why the API is specified first
 The cost is two numbers per top-level folder and no per-file data, which is why this belongs in the sidekick rather
 than in a second index file.
 
-## 19. Query patterns (the `glob` command)
+## 19. Query patterns (`wildmatch`)
 
-`fsmeta glob <root> <pattern>` selects names from a trio. The pattern is a **git `wildmatch` pattern**,
+**`glob` is abandoned and strictly not supported.** No glob dialect — braces, extglob, PCRE or any other spelling —
+is accepted anywhere in this ecosystem. **`wildmatch`** (git's semantics, as implemented by the `gitignore` project)
+is the only wildcard syntax: in `fs-meta`, in `gitignore` itself, and in `jcodebuddy`. A pattern that looks like a
+different dialect is read by `wildmatch`'s rules, not rejected, so the only way to be sure is to check against the
+shared vectors. `java-watch*` predates this decision and is exempt for now.
+
+The command is `fsmeta match <root> <pattern>`; `glob` is a deprecated alias kept for scripts, and the
+pattern it accepts. The pattern is a **git `wildmatch` pattern**,
 matched by exactly the `gitignore` project's matcher — the same code the `.gitignore` chain uses
 (`gitignore.globMatch`, pinned to `gitignore` v0.2.0 in `build.zig.zon`). There is no second glob dialect in
 fs-meta; a new pattern syntax anywhere is a format change, not a local convenience (AGENTS.md § 2, DEC-051).
