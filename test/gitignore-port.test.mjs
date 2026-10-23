@@ -1,18 +1,18 @@
 #!/usr/bin/env bun
-// The vendored .gitignore vectors, run against the copy of the matcher this project ships.
+// The vendored .gitignore vectors, run against the dependency this project consumes.
 //
 //   bun test test
 //
-// Two JS matchers exist in this ecosystem and only one was measured: gitignore/js/gitignore.mjs has its own runner, while
-// fs-meta/js/gitignore.mjs is a copy that had already drifted by four fixes before this test existed. The fixture is
-// vendored from gitignore v0.2.0 (the version build.zig.zon pins), so refreshing the pin and forgetting the copy now fails
-// here instead of silently changing which files a walk skips.
+// fs-meta implements no matcher of its own: the matcher is `@hrg/gitignore` (the gitignore project, whose Zig
+// port `build.zig.zon` pins at the same version), consumed here through the package entry point. The fixture is
+// vendored from gitignore v0.2.0, so upgrading the dependency without refreshing the vectors — or the reverse —
+// fails here instead of silently changing which files a walk skips.
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseGitignore, GitIgnoreRules } from '../js/gitignore.mjs';
+import { parseGitignore, GitIgnoreRules } from '@hrg/gitignore';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vectors = JSON.parse(readFileSync(join(here, '..', 'conformance', 'gitignore-vectors.json'), 'utf8'));

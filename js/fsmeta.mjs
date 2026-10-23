@@ -22,7 +22,7 @@ import {
   configToJson, contentKnown, decodeEntries, describeValidation, encodeEntries, encodeNames, entryCount, entryForFile,
   hashBytes, hashLf, hex64, listingOnlyEntry, nameHashOf, now, parseConfig, trusted, utf8Length, validate,
 } from './layout.mjs';
-import { GitIgnoreRules, readGitignore } from './gitignore.mjs';
+import { GitIgnoreRules, readGitignore } from '@hrg/gitignore';
 
 /** The `writer` field this port writes. */
 export const WRITER = 'fsmeta-js/1';

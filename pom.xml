@@ -52,6 +52,7 @@
         <maven.compiler.release>25</maven.compiler.release>
 
         <wyhash.version>1.1.0-SNAPSHOT</wyhash.version>
+        <gitignore.version>0.2.0</gitignore.version>
         <junit.version>5.10.2</junit.version>
 
         <maven.compiler.plugin.version>3.11.0</maven.compiler.plugin.version>
@@ -84,6 +85,23 @@
             <groupId>hr.hrg</groupId>
             <artifactId>wyhash</artifactId>
             <version>${wyhash.version}</version>
+        </dependency>
+
+        <!--
+            The `.gitignore` matcher, from the project that owns it: `hr.hrg:gitignore` (DEC-051). This project
+            implements no matcher of its own and carries no copy — `FsMetaScanner` calls
+            `hr.hrg.gitignore.GitIgnoreFile` / `GitIgnoreRules`, whose API is the one the deleted local copies
+            had. The Zig side takes the same project through `build.zig.zon` at the same version, so all three
+            walks are the same rules.
+
+            Resolved the way `wyhash` is: from the local repository (install the gitignore checkout once with
+            `mvn install`), or from Maven Central once 0.2.0 is released. A "cannot resolve hr.hrg:gitignore"
+            failure means that install is missing.
+        -->
+        <dependency>
+            <groupId>hr.hrg</groupId>
+            <artifactId>gitignore</artifactId>
+            <version>${gitignore.version}</version>
         </dependency>
 
         <dependency>

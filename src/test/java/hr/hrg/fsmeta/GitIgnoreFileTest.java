@@ -7,6 +7,9 @@ import java.util.Optional;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import hr.hrg.gitignore.GitIgnoreFile;
+import hr.hrg.gitignore.GitIgnoreRules;
+
 /**
  * The {@code .gitignore} semantics themselves — the rules a walk depends on, each stated as one case so a
  * failure names the rule rather than a tree.
@@ -114,8 +117,9 @@ class GitIgnoreFileTest {
         Assertions.assertTrue(ignored("[!a].txt", "b.txt"));
         Assertions.assertFalse(ignored("[!a].txt", "a.txt"));
         Assertions.assertTrue(ignored("[abc].dat", "c.dat"));
-        Assertions.assertTrue(ignored("no[class", "no[class"),
-                "an unterminated class is a literal '[', the way git treats it");
+        Assertions.assertFalse(ignored("no[class", "no[class"),
+                "an unterminated class matches nothing: git's wildmatch aborts the pattern, which is what the "
+                        + "shared gitignore-vectors.json case 'an unterminated class matches nothing' pins");
         Assertions.assertFalse(ignored("no[class", "noXclass"));
         Assertions.assertTrue(ignored("q?estion", "question"));
         Assertions.assertFalse(ignored("q?estion", "qestion"), "? needs exactly one character");

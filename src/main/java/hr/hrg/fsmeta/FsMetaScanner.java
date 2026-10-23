@@ -13,6 +13,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 
+import hr.hrg.gitignore.GitIgnoreFile;
+import hr.hrg.gitignore.GitIgnoreRules;
+
 /**
  * Walks a codebase folder and produces the files a trio will describe.
  *

@@ -5,6 +5,9 @@ package hr.hrg.fsmeta;
 import java.util.LinkedHashSet;
 import java.util.Set;
 
+import hr.hrg.gitignore.GitIgnoreFile;
+import hr.hrg.gitignore.GitIgnoreRules;
+
 /**
  * What a scan walks, and how it hashes — the two decisions that shape the trio a scan produces.
  *

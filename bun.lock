@@ -5,11 +5,11 @@
     "": {
       "name": "@hrg/fs-meta",
       "dependencies": {
-        "wyhash": "github:hrgdavor/wyhash",
+        "@hrg/gitignore": "file:D:/wrk/core/gitignore",
       },
     },
   },
   "packages": {
-    "wyhash": ["wyhash@github:hrgdavor/wyhash#22c88e3", {}, "hrgdavor-wyhash-22c88e3", "sha512-EwJCoM6E6n/1efwd++g0F0fHRMO8tbzIKuVF8kyT8cPZthAbiDvvzbKFToJB2+oMM4aOD0ipyCOYxinFzX+6LQ=="],
+    "@hrg/gitignore": ["@hrg/gitignore@file:../gitignore", {}],
   }
 }
