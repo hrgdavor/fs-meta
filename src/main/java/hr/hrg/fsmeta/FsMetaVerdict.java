@@ -35,14 +35,29 @@ public enum FsMetaVerdict {
     /** The meta file's size disagrees with itself, the count, or the document (§ 8, check 6). */
     META_SIZE_MISMATCH("meta-size-mismatch"),
 
+    /**
+     * The meta file's whole-file hash disagrees with the document's {@code meta.wyhash} (§ 8, check 6b).
+     * A size that agrees is not a claim about the bytes; this is.
+     */
+    META_HASH_MISMATCH("meta-hash-mismatch"),
+
     /** The text file's size disagrees with the document, or its line structure with the count (check 7). */
     TXT_SIZE_MISMATCH("txt-size-mismatch"),
+
+    /** The text file's whole-file hash disagrees with the document's {@code txt.wyhash} (check 7b). */
+    TXT_HASH_MISMATCH("txt-hash-mismatch"),
 
     /** An entry's name slice falls outside {@code files.txt}, is empty, or is not LF-terminated (check 8). */
     ENTRY_OUT_OF_RANGE("entry-out-of-range"),
 
     /** The name at an entry's offset does not hash to the entry's {@code nameHash} (check 9). */
-    NAME_HASH_MISMATCH("name-hash-mismatch");
+    NAME_HASH_MISMATCH("name-hash-mismatch"),
+
+    /**
+     * An entry's flags do not set exactly one type bit, carry a bit this version does not define, or set
+     * {@code HASH_LF} without {@code CONTENT_KNOWN} (§ 6, § 8 check 10).
+     */
+    INVALID_FLAGS("invalid-flags");
 
     private final String wire;
 

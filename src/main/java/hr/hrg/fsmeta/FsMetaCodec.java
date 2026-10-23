@@ -28,30 +28,30 @@ public final class FsMetaCodec {
      */
     public static void putEntry(ByteBuffer target, long entryOffset, FsMetaEntry entry) {
         int at = Math.toIntExact(entryOffset);
-        target.putLong(at + FsMetaFormat.OFFSET_MTIME_MILLIS, entry.mtimeMillis());
-        target.putLong(at + FsMetaFormat.OFFSET_NAME_HASH, entry.nameHash());
-        target.putLong(at + FsMetaFormat.OFFSET_CONTENT_HASH, entry.contentHash());
+        target.putLong(at + FsMetaFormat.OFFSET_MTIME_NS, entry.mtimeNs());
         target.putLong(at + FsMetaFormat.OFFSET_SIZE_BYTES, entry.sizeBytes());
+        target.putLong(at + FsMetaFormat.OFFSET_CONTENT_HASH, entry.contentHash());
+        target.putLong(at + FsMetaFormat.OFFSET_NAME_HASH, entry.nameHash());
         target.putLong(at + FsMetaFormat.OFFSET_NAME_OFFSET, entry.nameOffset());
         target.putInt(at + FsMetaFormat.OFFSET_NAME_LENGTH, entry.nameLength());
         target.putInt(at + FsMetaFormat.OFFSET_FLAGS, entry.flags());
-        target.putLong(at + FsMetaFormat.OFFSET_FILE_ID, entry.fileId());
-        target.putLong(at + FsMetaFormat.OFFSET_RESERVED, entry.reserved());
+        target.putLong(at + FsMetaFormat.OFFSET_FILE_ID_LO, entry.fileIdLo());
+        target.putLong(at + FsMetaFormat.OFFSET_FILE_ID_HI, entry.fileIdHi());
     }
 
     /** One entry read from {@code source} at {@code offset} — the caller owns the 64-byte bound. */
     public static FsMetaEntry getEntry(ByteBuffer source, long offset) {
         int at = Math.toIntExact(offset);
         return new FsMetaEntry(
-                source.getLong(at + FsMetaFormat.OFFSET_MTIME_MILLIS),
-                source.getLong(at + FsMetaFormat.OFFSET_NAME_HASH),
-                source.getLong(at + FsMetaFormat.OFFSET_CONTENT_HASH),
+                source.getLong(at + FsMetaFormat.OFFSET_MTIME_NS),
                 source.getLong(at + FsMetaFormat.OFFSET_SIZE_BYTES),
+                source.getLong(at + FsMetaFormat.OFFSET_CONTENT_HASH),
+                source.getLong(at + FsMetaFormat.OFFSET_NAME_HASH),
                 source.getLong(at + FsMetaFormat.OFFSET_NAME_OFFSET),
                 source.getInt(at + FsMetaFormat.OFFSET_NAME_LENGTH),
                 source.getInt(at + FsMetaFormat.OFFSET_FLAGS),
-                source.getLong(at + FsMetaFormat.OFFSET_FILE_ID),
-                source.getLong(at + FsMetaFormat.OFFSET_RESERVED));
+                source.getLong(at + FsMetaFormat.OFFSET_FILE_ID_LO),
+                source.getLong(at + FsMetaFormat.OFFSET_FILE_ID_HI));
     }
 
     /** The whole {@code files.meta} for {@code entries}, in the order given. */

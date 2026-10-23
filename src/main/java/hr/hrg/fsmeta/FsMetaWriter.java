@@ -70,8 +70,8 @@ public final class FsMetaWriter {
         String created = previous.created().isEmpty() ? FsMetaConfig.now() : previous.created();
         FsMetaConfig config = FsMetaConfig.forPublish(
                 entries.size(),
-                meta.length,
-                txt.length,
+                meta,
+                txt,
                 previous.generation() + 1,
                 mode,
                 writer,

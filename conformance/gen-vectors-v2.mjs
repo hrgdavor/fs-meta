@@ -14,11 +14,12 @@
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { wyhash64Hex } from "wyhash/js/wyhash64.mjs";
+// Generated under Bun, whose native hash is the same std.hash.Wyhash the engine calls.
+import { wyhash64Hex } from "../js/layout.mjs";
 
 const module_dir = join(import.meta.dir, "..");
 const engine = process.env.FSMETA ?? join(module_dir, "zig-out", "bin", process.platform === "win32" ? "fsmeta.exe" : "fsmeta");
-const scratch = join(module_dir, "..", ".tmp", "vectors");
+// Inside the module: the engine s absolute-path handling refuses a scratch tree outside it, and a generator that cannot run is worse than one with a scratch directory.`nconst scratch = join(module_dir, ".tmp", "vectors");
 const out = join(import.meta.dir, "fsmeta-vectors-v2.json");
 
 const run = (command, cwd) => {
@@ -34,6 +35,9 @@ const must = (command, cwd) => {
 };
 
 // ---- the tree the valid case describes
+// Inside the module: the engine refuses a scratch tree outside it (a known absolute-path limitation), and a
+// generator that cannot run is worse than one with a scratch directory.
+const scratch = join(module_dir, ".tmp", "vectors");
 rmSync(scratch, { recursive: true, force: true });
 const tree = join(scratch, "tree");
 mkdirSync(join(tree, "src"), { recursive: true });

@@ -150,6 +150,17 @@ class FsMetaCliTest {
                 scrambled, 0 * entrySize + FsMetaFormat.OFFSET_NAME_OFFSET, nameSlice);
         Files.write(trio().resolve(FsMetaFormat.META_FILE), scrambled);
 
+        // § 8 checks the whole-file hash before any entry, so a hand-edited files.meta must also update the
+        // document's meta.wyhash to describe the bytes being presented. Otherwise the trio is rejected as a
+        // torn publish (meta-hash-mismatch) and the pairing is never examined — which is the correct verdict
+        // for the wrong experiment.
+        Path document = trio().resolve(FsMetaFormat.JSON_FILE);
+        String json = Files.readString(document, StandardCharsets.UTF_8);
+        String previousHash = FsMetaConfig.parse(json).metaWyhash();
+        Files.writeString(document,
+                json.replace(previousHash, FsMetaHash.hex(FsMetaHash.of(scrambled))),
+                StandardCharsets.UTF_8);
+
         Run verify = fsmeta("verify", "--dir", trio().toString());
         Assertions.assertEquals(1, verify.code());
         Assertions.assertTrue(verify.out().contains("name-hash-mismatch"), verify.all());

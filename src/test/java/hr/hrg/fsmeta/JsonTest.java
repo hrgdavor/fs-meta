@@ -49,8 +49,10 @@ class JsonTest {
     @Test
     void keepsTheKeyOrderSoAnUnknownKeySurvivesARewrite() {
         FsMetaConfig config = FsMetaConfig.parse("""
-                {"format":"fs-meta","version":1,"entrySize":64,"count":0,"meta":{"bytes":0},
-                 "txt":{"bytes":0},"hash":{"content":"wyhash64","name":"wyhash64","seed":0,"normalize":"none"},
+                {"format":"fs-meta","version":1,"entrySize":64,"count":0,
+                 "meta":{"bytes":0,"wyhash":"0000000000000000"},
+                 "txt":{"bytes":0,"wyhash":"0000000000000000"},
+                 "hash":{"content":"wyhash64","name":"wyhash64","seed":0,"normalize":"none"},
                  "futureKey":{"kept":true}}""");
         Assertions.assertTrue(config.extra().containsKey("futureKey"),
                 "a key this version does not know is kept, not dropped");

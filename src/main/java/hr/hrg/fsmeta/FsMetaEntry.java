@@ -5,29 +5,30 @@ package hr.hrg.fsmeta;
 /**
  * One {@code files.meta} entry — {@code FORMAT.md} § 5's nine fields, in a value.
  *
- * <p>The record keeps the reserved words ({@code fileId}, {@code reserved}) because a reader that rewrites
- * a pair must not silently drop what a later version wrote there; § 5 says a v1 reader ignores them, and
- * ignoring is not the same as discarding.</p>
+ * <p>The record keeps the two identity words ({@code fileIdLo}, {@code fileIdHi}) because a reader that
+ * rewrites a pair must not silently drop what a later version wrote there; § 5 says a v1 reader ignores
+ * them, and ignoring is not the same as discarding. The field order below is the wire order, so a reader
+ * and a writer can compare the value against the table in § 5 without translating positions.</p>
  */
 public record FsMetaEntry(
-        long mtimeMillis,
-        long nameHash,
-        long contentHash,
+        long mtimeNs,
         long sizeBytes,
+        long contentHash,
+        long nameHash,
         long nameOffset,
         int nameLength,
         int flags,
-        long fileId,
-        long reserved) {
+        long fileIdLo,
+        long fileIdHi) {
 
     /** A hashed regular file: every fingerprint field is valid. */
     public static FsMetaEntry forFile(
-            String name, long mtimeMillis, long sizeBytes, long contentHash, long nameOffset, boolean hashLf) {
+            String name, long mtimeNs, long sizeBytes, long contentHash, long nameOffset, boolean hashLf) {
         return new FsMetaEntry(
-                mtimeMillis,
-                FsMetaHash.ofName(name),
-                contentHash,
+                mtimeNs,
                 sizeBytes,
+                contentHash,
+                FsMetaHash.ofName(name),
                 nameOffset,
                 FsMetaCodec.utf8Length(name),
                 FsMetaFormat.fileFlags(hashLf),
@@ -42,9 +43,9 @@ public record FsMetaEntry(
     public static FsMetaEntry listingOnly(String name, long nameOffset) {
         return new FsMetaEntry(
                 0L,
+                0L,
+                0L,
                 FsMetaHash.ofName(name),
-                0L,
-                0L,
                 nameOffset,
                 FsMetaCodec.utf8Length(name),
                 FsMetaFormat.listingOnlyFlags(),
@@ -52,7 +53,7 @@ public record FsMetaEntry(
                 0L);
     }
 
-    /** § 6: {@code mtimeMillis}, {@code contentHash} and {@code sizeBytes} are all valid. */
+    /** § 6: {@code mtimeNs}, {@code contentHash} and {@code sizeBytes} are all valid. */
     public boolean contentKnown() {
         return (flags & FsMetaFormat.FLAG_CONTENT_KNOWN) != 0;
     }
@@ -62,17 +63,28 @@ public record FsMetaEntry(
         return (flags & FsMetaFormat.FLAG_REGULAR_FILE) != 0;
     }
 
+    /** § 6: the entry describes a directory. */
+    public boolean directory() {
+        return (flags & FsMetaFormat.FLAG_IS_DIR) != 0;
+    }
+
+    /** § 6: the entry describes a symbolic link. */
+    public boolean symlink() {
+        return (flags & FsMetaFormat.FLAG_SYMLINK) != 0;
+    }
+
     /** § 12: the content hash was taken over LF-normalised content. */
     public boolean hashLf() {
         return (flags & FsMetaFormat.FLAG_HASH_LF) != 0;
     }
 
     /**
-     * § 6: whether the entry may be used at all. A reserved bit means a later version gave it a meaning
-     * this reader does not know, so the fingerprint is not to be trusted.
+     * § 6: whether the entry may be used at all. A flags word this version does not define makes the
+     * fingerprint untrustworthy; the validator reports it as {@code invalid-flags} rather than delivering
+     * it, so on a usable pair this is true for every entry.
      */
     public boolean trusted() {
-        return !FsMetaFormat.hasUnknownFlags(flags);
+        return FsMetaFormat.isValidFlags(flags);
     }
 
     /** Whether there is a fingerprint to compare: trusted <em>and</em> content-known (§ 11, step 2). */
@@ -88,7 +100,7 @@ public record FsMetaEntry(
     /** One line, the shape {@code fsmeta query} and {@code fsmeta dump} print. */
     public String format(String name) {
         return name + "\t"
-                + mtimeMillis + "\t"
+                + mtimeNs + "\t"
                 + sizeBytes + "\t"
                 + String.format("%016x", contentHash) + "\t"
                 + String.format("%016x", nameHash) + "\t"

@@ -9,7 +9,5 @@
     "test": "bun test js",
     "conformance": "bun js/conformance.mjs"
   },
-  "dependencies": {
-    "wyhash": "github:hrgdavor/wyhash"
-  }
+  "dependencies": {}
 }

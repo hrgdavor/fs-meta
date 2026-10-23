@@ -11,7 +11,8 @@ import java.util.List;
  * @param verdict       the wire verdict; only {@link FsMetaVerdict#OK} is usable
  * @param firstBadEntry the 0-based index of the first entry a check rejected, or {@code -1}
  * @param untrusted     indices of entries with a flag bit this version does not define (§ 6), ascending;
- *                      empty when the verdict is not {@link FsMetaVerdict#OK}
+ *                      v1 reports such an entry as {@link FsMetaVerdict#INVALID_FLAGS}, so this is always
+ *                      empty on a usable trio and is kept for callers that carried the older state
  * @param detail        one sentence for a human, never empty on a failure
  */
 public record FsMetaValidation(

@@ -47,29 +47,38 @@ public final class FsMetaFormat {
 
     // ---- entry field offsets, § 5 ------------------------------------------
 
-    public static final int OFFSET_MTIME_MILLIS = 0;
-    public static final int OFFSET_NAME_HASH = 8;
+    public static final int OFFSET_MTIME_NS = 0;
+    public static final int OFFSET_SIZE_BYTES = 8;
     public static final int OFFSET_CONTENT_HASH = 16;
-    public static final int OFFSET_SIZE_BYTES = 24;
+    public static final int OFFSET_NAME_HASH = 24;
     public static final int OFFSET_NAME_OFFSET = 32;
     public static final int OFFSET_NAME_LENGTH = 40;
     public static final int OFFSET_FLAGS = 44;
-    public static final int OFFSET_FILE_ID = 48;
-    public static final int OFFSET_RESERVED = 56;
+    public static final int OFFSET_FILE_ID_LO = 48;
+    public static final int OFFSET_FILE_ID_HI = 56;
 
     // ---- entry flags, § 6 --------------------------------------------------
 
-    /** {@code mtimeMillis}, {@code contentHash} and {@code sizeBytes} are all valid. */
+    /** {@code mtimeNs}, {@code contentHash} and {@code sizeBytes} are all valid. */
     public static final int FLAG_CONTENT_KNOWN = 0x01;
 
     /** The entry describes a regular file. */
     public static final int FLAG_REGULAR_FILE = 0x02;
 
-    /** The content hash was taken over LF-normalised content rather than over the raw bytes. */
-    public static final int FLAG_HASH_LF = 0x04;
+    /** The entry describes a directory — listed for its own mtime, never with a content hash. */
+    public static final int FLAG_IS_DIR = 0x04;
 
-    /** The bits this version defines; anything else makes an entry untrusted (§ 6). */
-    public static final int FLAG_KNOWN_MASK = FLAG_CONTENT_KNOWN | FLAG_REGULAR_FILE | FLAG_HASH_LF;
+    /** The content hash was taken over LF-normalised content rather than over the raw bytes. */
+    public static final int FLAG_HASH_LF = 0x08;
+
+    /** The entry describes a symbolic link, which is listed but never followed. */
+    public static final int FLAG_SYMLINK = 0x10;
+
+    /** Exactly one of these must be set on every entry (§ 6). */
+    public static final int FLAG_TYPE_MASK = FLAG_REGULAR_FILE | FLAG_IS_DIR | FLAG_SYMLINK;
+
+    /** The bits this version defines; anything else is {@code invalid-flags} (§ 6, § 8 check 10). */
+    public static final int FLAG_KNOWN_MASK = FLAG_CONTENT_KNOWN | FLAG_TYPE_MASK | FLAG_HASH_LF;
 
     /**
      * The writer's name order (§ 3): unsigned byte comparison of the UTF-8 encoding.
@@ -128,6 +137,22 @@ public final class FsMetaFormat {
         return (flags & ~FLAG_KNOWN_MASK) != 0;
     }
 
+    /** Whether exactly one of {@code REGULAR_FILE}, {@code IS_DIR}, {@code SYMLINK} is set (§ 6). */
+    public static boolean hasExactlyOneTypeFlag(int flags) {
+        int type = flags & FLAG_TYPE_MASK;
+        return type == FLAG_REGULAR_FILE || type == FLAG_IS_DIR || type == FLAG_SYMLINK;
+    }
+
+    /** Whether {@code HASH_LF} is set without {@code CONTENT_KNOWN}, which § 6 forbids. */
+    public static boolean hasHashLfWithoutContent(int flags) {
+        return (flags & FLAG_HASH_LF) != 0 && (flags & FLAG_CONTENT_KNOWN) == 0;
+    }
+
+    /** § 8 check 10 and § 6: whether an entry's flags word is one this version allows. */
+    public static boolean isValidFlags(int flags) {
+        return !hasUnknownFlags(flags) && hasExactlyOneTypeFlag(flags) && !hasHashLfWithoutContent(flags);
+    }
+
     /** The flags word a hashed regular file gets. */
     public static int fileFlags(boolean hashLf) {
         return FLAG_CONTENT_KNOWN | FLAG_REGULAR_FILE | (hashLf ? FLAG_HASH_LF : 0);
@@ -136,5 +161,15 @@ public final class FsMetaFormat {
     /** The flags word a listing-only entry gets: the file is known, no fingerprint was taken (§ 6). */
     public static int listingOnlyFlags() {
         return FLAG_REGULAR_FILE;
+    }
+
+    /** The flags word a directory entry gets: its own mtime, and never a content fingerprint (§ 6). */
+    public static int directoryFlags() {
+        return FLAG_IS_DIR;
+    }
+
+    /** The flags word a symlink entry gets: the link's own identity, never its target's content (§ 6). */
+    public static int symlinkFlags() {
+        return FLAG_SYMLINK;
     }
 }

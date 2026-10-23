@@ -4,6 +4,7 @@ package hr.hrg.fsmeta;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -12,15 +13,17 @@ import java.util.Optional;
  * The sidekick document, {@code files.json} — {@code FORMAT.md} § 7.
  *
  * <p>It is the <em>commit record</em>: it describes the generation a reader is looking at, which is why a
- * writer publishes it last (§ 9) and why it repeats the two data files' sizes. Everything a reader must
- * know before interpreting {@code files.meta}'s bytes is here.</p>
+ * writer publishes it last (§ 9) and why it repeats the two data files' sizes and whole-file hashes.
+ * Everything a reader must know before interpreting {@code files.meta}'s bytes is here, and the hashes are
+ * what make a torn publish detectable rather than merely a size disagreement.</p>
  *
  * <h3>Required and optional keys</h3>
  * <p>A reader requires {@code format}, {@code version}, {@code entrySize}, {@code count},
- * {@code meta.bytes}, {@code txt.bytes} and the four {@code hash} keys; a missing or wrongly-typed one
- * means the document is not understood, which is {@link FsMetaVerdict#UNSUPPORTED_FORMAT}. Every other key
- * — {@code order}, {@code generation}, {@code updated}, {@code writer}, {@code created}, {@code root},
- * {@code scan} — is optional.</p>
+ * {@code meta.bytes}, {@code meta.wyhash}, {@code txt.bytes}, {@code txt.wyhash} and the four {@code hash}
+ * keys; a missing or wrongly-typed one means the document is not understood, which is
+ * {@link FsMetaVerdict#UNSUPPORTED_FORMAT}. A {@code wyhash} is sixteen lowercase hex characters (§ 8,
+ * check 1). Every other key — {@code order}, {@code generation}, {@code updated}, {@code writer},
+ * {@code created}, {@code root}, {@code scan} — is optional.</p>
  *
  * <h3>Unknown keys survive a rewrite</h3>
  * <p>{@link #extra()} holds the top-level keys this version does not know, and {@link #toJson()} writes
@@ -29,13 +32,15 @@ import java.util.Optional;
  */
 public record FsMetaConfig(
         String format,
-        int version,
-        int entrySize,
+        long version,
+        long entrySize,
         String order,
         long generation,
         long count,
         long metaBytes,
+        String metaWyhash,
         long txtBytes,
+        String txtWyhash,
         String hashContent,
         String hashName,
         long hashSeed,
@@ -55,8 +60,35 @@ public record FsMetaConfig(
     /** A document for a trio that is about to be written, with the counters a writer owns. */
     public static FsMetaConfig forPublish(
             long count,
+            byte[] meta,
+            byte[] txt,
+            long generation,
+            FsMetaHashMode mode,
+            String writer,
+            String root,
+            String created,
+            String updated) {
+        return forPublish(
+                count,
+                meta.length,
+                FsMetaHash.hex(FsMetaHash.of(meta)),
+                txt.length,
+                FsMetaHash.hex(FsMetaHash.of(txt)),
+                generation,
+                mode,
+                writer,
+                root,
+                created,
+                updated);
+    }
+
+    /** A document whose recorded sizes and hashes are supplied separately — for a test or a repair. */
+    public static FsMetaConfig forPublish(
+            long count,
             long metaBytes,
+            String metaWyhash,
             long txtBytes,
+            String txtWyhash,
             long generation,
             FsMetaHashMode mode,
             String writer,
@@ -71,7 +103,9 @@ public record FsMetaConfig(
                 generation,
                 count,
                 metaBytes,
+                metaWyhash,
                 txtBytes,
+                txtWyhash,
                 FsMetaFormat.HASH_ALGO,
                 FsMetaFormat.HASH_ALGO,
                 FsMetaFormat.HASH_SEED,
@@ -118,13 +152,15 @@ public record FsMetaConfig(
 
         return new FsMetaConfig(
                 requiredString(document, "format"),
-                Math.toIntExact(requiredLong(document, "version")),
-                Math.toIntExact(requiredLong(document, "entrySize")),
+                requiredLong(document, "version"),
+                requiredLong(document, "entrySize"),
                 optionalString(document, "order", FsMetaFormat.ORDER),
                 optionalLong(document, "generation", 0L),
                 requiredLong(document, "count"),
                 requiredLong(meta, "bytes"),
+                requiredWyhash(meta, "wyhash"),
                 requiredLong(txt, "bytes"),
+                requiredWyhash(txt, "wyhash"),
                 requiredString(hash, "content"),
                 requiredString(hash, "name"),
                 requiredLong(hash, "seed"),
@@ -133,7 +169,8 @@ public record FsMetaConfig(
                 optionalString(document, "writer", ""),
                 optionalString(document, "created", ""),
                 optionalString(document, "root", ""),
-                Map.copyOf(extra));
+                // A null value is legal JSON, so the extra map must keep one; Map.copyOf would refuse it.
+                Collections.unmodifiableMap(extra));
     }
 
     /** The document as compact JSON, known keys first and the unknown ones preserved after them. */
@@ -145,8 +182,8 @@ public record FsMetaConfig(
         document.put("order", order);
         document.put("generation", generation);
         document.put("count", count);
-        document.put("meta", Map.of("bytes", metaBytes));
-        document.put("txt", Map.of("bytes", txtBytes));
+        document.put("meta", sizeAndHash(metaBytes, metaWyhash));
+        document.put("txt", sizeAndHash(txtBytes, txtWyhash));
         Map<String, Object> hash = new LinkedHashMap<>();
         hash.put("content", hashContent);
         hash.put("name", hashName);
@@ -163,6 +200,13 @@ public record FsMetaConfig(
         }
         document.putAll(extra);
         return Json.write(document);
+    }
+
+    private static Map<String, Object> sizeAndHash(long bytes, String wyhash) {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("bytes", bytes);
+        value.put("wyhash", wyhash);
+        return value;
     }
 
     /**
@@ -204,6 +248,25 @@ public record FsMetaConfig(
         Object value = document.get(key);
         if (!(value instanceof String text)) {
             throw new IllegalArgumentException("files.json needs a string at '" + key + "'");
+        }
+        return text;
+    }
+
+    /**
+     * A {@code meta.wyhash} / {@code txt.wyhash}: sixteen lowercase hex characters, exactly as § 8 check 1
+     * requires before any size or hash comparison can mean anything.
+     */
+    private static String requiredWyhash(Map<String, Object> document, String key) {
+        String text = requiredString(document, key);
+        if (text.length() != 16) {
+            throw new IllegalArgumentException("files.json needs a 16-digit hex 'wyhash' at '" + key + "'");
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                throw new IllegalArgumentException(
+                        "files.json needs a 16-digit lowercase hex 'wyhash' at '" + key + "': " + text);
+            }
         }
         return text;
     }

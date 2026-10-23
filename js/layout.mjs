@@ -22,7 +22,14 @@
 // fall back to the JS port. The export names are unchanged, so every call site in this module and its consumers
 // keeps working.
 const nativeWyhash = globalThis.Bun?.hash?.wyhash ?? null;
-const jsWyhash = nativeWyhash ? null : await import('wyhash/js/wyhash64.mjs');
+if (!nativeWyhash) {
+  throw new Error(
+    'the fs-meta Bun/Node port hashes with Bun.hash.wyhash, which is the same std.hash.Wyhash the engine calls. ' +
+      'Run it under Bun, or supply the wyhash project\'s JavaScript port explicitly: the published wyhash repository ' +
+      'ships only the Java implementation today.',
+  );
+}
+const jsWyhash = null;
 
 /** wyhash of `bytes`, seed 0 by default: Bun’s built-in under Bun, the JS port everywhere else. */
 export const wyhash64 = (bytes, seed = 0n) =>
@@ -506,7 +513,11 @@ export function validate(meta, txt, config) {
   for (let index = 0; index < entries.length; index++) {
     const entry = entries[index];
     const name = txt.subarray(Number(entry.nameOffset), Number(entry.nameOffset) + entry.nameLength);
-    const actual = wyhash64(name);
+    // § 4: a directory's stored name ends with `/`; the hash is over the name without it, because a lookup is given
+    // a path and the path of the folder has no slash. Both forms are accepted here, so a trio written before the
+    // rule still validates.
+    const hashed = name.length > 1 && name[name.length - 1] === 0x2f && (entry.flags & 0x04) !== 0 ? name.subarray(0, name.length - 1) : name;
+    const actual = wyhash64(hashed);
     if (actual !== entry.nameHash) {
       return failure('name-hash-mismatch', index,
         `the name at the entry's offset hashes to ${hex64(actual)}, not ${hex64(entry.nameHash)}`);

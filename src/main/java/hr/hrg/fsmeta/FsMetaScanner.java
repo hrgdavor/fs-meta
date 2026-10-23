@@ -160,7 +160,7 @@ public final class FsMetaScanner {
         FsMetaHash.Hashed hashed = FsMetaHash.hash(content, options.hashMode());
         return FsMetaFile.hashed(
                 relativeName(base, file),
-                attributes.lastModifiedTime().toMillis(),
+                attributes.lastModifiedTime().to(java.util.concurrent.TimeUnit.NANOSECONDS),
                 attributes.size(),
                 hashed.hash(),
                 hashed.hashLf());

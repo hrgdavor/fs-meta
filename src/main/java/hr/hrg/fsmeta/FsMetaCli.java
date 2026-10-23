@@ -262,7 +262,7 @@ public final class FsMetaCli {
             FsMetaEntry entry = entries.get(one.entryIndex());
             files.add(new FsMetaFile(
                     one.name(),
-                    entry.mtimeMillis(),
+                    entry.mtimeNs(),
                     entry.sizeBytes(),
                     entry.contentHash(),
                     entry.flags() & FsMetaFormat.FLAG_KNOWN_MASK));

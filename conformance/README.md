@@ -1,3 +1,7 @@
+> **Status:** `fsmeta-vectors-v2.json` is generated from the engine by `gen-vectors-v2.mjs`, and the cases
+> reflect the current format: `files.meta` ordered by `(nameHash, name)`, `files.txt` by name, and a
+> directory's stored name ending with `/` (the hash is over the name without it). The older
+> `fsmeta-vectors.json` predates both and is kept for history, not for conformance.
 # fs-meta conformance vectors
 
 `fsmeta-vectors.json` is the machine-checkable form of [`../FORMAT.md`](../FORMAT.md): every *reader* of the

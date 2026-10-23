@@ -139,7 +139,7 @@ public final class FsMetaPair {
         FsMetaConfig config;
         try {
             config = FsMetaConfig.parse(new String(Files.readAllBytes(jsonFile), StandardCharsets.UTF_8));
-        } catch (IllegalArgumentException malformed) {
+        } catch (RuntimeException malformed) {
             // § 8 check 1: a document that cannot be read at all is the same verdict as one that is not ours.
             return new FsMetaLoad(directory, FsMetaVerdict.UNSUPPORTED_FORMAT, null, null, malformed.getMessage());
         }
@@ -235,7 +235,13 @@ public final class FsMetaPair {
         int low = lowerBound(wanted);
         for (int i = low; i < sortedIndices.length && sortedHashes[i] == wanted; i++) {
             int index = sortedIndices[i];
-            if (names[index].equals(name)) {
+            // § 3: a directory's stored line may carry the trailing slash that bounds its subtree, but the
+            // path a lookup is given is the one without it. A file's stored form has no trailing slash.
+            String stored = names[index];
+            String logical = entries.get(index).directory() && stored.endsWith("/")
+                    ? stored.substring(0, stored.length() - 1)
+                    : stored;
+            if (logical.equals(name)) {
                 return OptionalInt.of(index);
             }
         }
@@ -252,7 +258,7 @@ public final class FsMetaPair {
      *
      * <p>Note what a present entry does <em>not</em> mean: § 11 is the contract for what may be concluded
      * from it. Check {@link FsMetaEntry#usableFingerprint()} before comparing a hash, and read the file
-     * when the fingerprint's {@code mtimeMillis}/{@code sizeBytes} disagree with what the caller's own
+     * when the fingerprint's {@code mtimeNs}/{@code sizeBytes} disagree with what the caller's own
      * record of the file says.</p>
      */
     public FsMetaEntry entryOrNull(String name) {

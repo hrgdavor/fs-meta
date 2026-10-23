@@ -101,7 +101,7 @@ public final class FsMetaDiff {
         if (before.contentHash() != after.contentHash() || before.sizeBytes() != after.sizeBytes()) {
             return Kind.MODIFIED;
         }
-        return before.mtimeMillis() != after.mtimeMillis() ? Kind.TOUCHED : null;
+        return before.mtimeNs() != after.mtimeNs() ? Kind.TOUCHED : null;
     }
 
     private static Map<String, FsMetaEntry> index(FsMetaPair pair) {

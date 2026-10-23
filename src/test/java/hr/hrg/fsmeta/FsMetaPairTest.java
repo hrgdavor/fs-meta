@@ -21,7 +21,7 @@ class FsMetaPairTest {
     private static FsMetaPair pairOf(List<String> names, List<FsMetaEntry> entries) {
         byte[] txt = FsMetaCodec.encodeNames(names);
         byte[] meta = FsMetaCodec.encodeEntries(entries);
-        FsMetaConfig config = FsMetaConfig.forPublish(entries.size(), meta.length, txt.length, 3L,
+        FsMetaConfig config = FsMetaConfig.forPublish(entries.size(), meta, txt, 3L,
                 FsMetaHashMode.NONE, "test/1", "/tmp/root", "2026-01-01T00:00:00.000Z",
                 "2026-01-01T00:00:01.000Z");
         return FsMetaPair.of(meta, txt, config);
@@ -41,6 +41,18 @@ class FsMetaPairTest {
         Assertions.assertEquals(0x5678L, pair.entryOrNull("src/b.java").contentHash());
         Assertions.assertNull(pair.entryOrNull("missing.txt"));
         Assertions.assertEquals("ok", pair.validation().describe());
+    }
+
+    @Test
+    void findsADirectoryByThePathWithoutItsStoredSlash() {
+        FsMetaEntry directory = new FsMetaEntry(1L, 0L, 0L, FsMetaHash.ofName("src"),
+                0L, 4, FsMetaFormat.directoryFlags(), 0L, 0L);
+        FsMetaEntry file = FsMetaEntry.forFile("src/b.java", 2L, 11L, 0x1234L, 5L, true);
+        FsMetaPair pair = pairOf(List.of("src/", "src/b.java"), List.of(directory, file));
+
+        Assertions.assertEquals(0, pair.find("src").orElseThrow(),
+                "§ 3: files.txt stores `src/`, but the path a lookup is given is `src`");
+        Assertions.assertEquals(1, pair.find("src/b.java").orElseThrow());
     }
 
     @Test
@@ -69,17 +81,20 @@ class FsMetaPairTest {
     }
 
     @Test
-    void anUntrustedEntryIsReportedButDoesNotFailThePair() {
-        FsMetaEntry future = new FsMetaEntry(1L, FsMetaHash.ofName("a.txt"), 0x11L, 1L, 0L, 5,
+    void anUnknownFlagBitIsInvalidFlagsRatherThanUntrusted() {
+        FsMetaEntry future = new FsMetaEntry(1L, 1L, 0x11L, FsMetaHash.ofName("a.txt"), 0L, 5,
                 FsMetaFormat.fileFlags(false) | 0x80, 0L, 0L);
-        FsMetaPair pair = pairOf(List.of("a.txt"), List.of(future));
+        byte[] txt = FsMetaCodec.encodeNames(List.of("a.txt"));
+        byte[] meta = FsMetaCodec.encodeEntries(List.of(future));
+        FsMetaConfig config = FsMetaConfig.forPublish(1, meta, txt, 1L,
+                FsMetaHashMode.NONE, "test/1", "", "", "");
 
-        Assertions.assertTrue(pair.validation().usable());
-        Assertions.assertEquals(List.of(0), pair.validation().untrusted());
-        Assertions.assertTrue(pair.untrusted(0));
-        Assertions.assertFalse(pair.entry(0).usableFingerprint(),
-                "§ 6: an unknown flag bit means the fingerprint is not to be trusted");
-        Assertions.assertTrue(pair.validation().describe().contains("untrusted"));
+        FsMetaValidation validation = FsMetaValidator.validate(meta, txt, config);
+        Assertions.assertEquals(FsMetaVerdict.INVALID_FLAGS, validation.verdict());
+        Assertions.assertEquals(0, validation.firstBadEntry());
+        Assertions.assertFalse(validation.usable());
+        Assertions.assertThrows(IllegalArgumentException.class, () -> FsMetaPair.of(meta, txt, config),
+                "§ 8: an undefined flag bit makes the trio unusable, not an entry merely untrusted");
     }
 
     @Test
@@ -97,7 +112,9 @@ class FsMetaPairTest {
     void ofRefusesAnUnusablePair() {
         byte[] txt = FsMetaCodec.encodeNames(List.of("a.txt"));
         byte[] meta = FsMetaCodec.encodeEntries(List.of(FsMetaEntry.forFile("a.txt", 1L, 1L, 1L, 0L, false)));
-        FsMetaConfig config = FsMetaConfig.forPublish(1, meta.length, txt.length + 1, 1L,
+        FsMetaConfig config = FsMetaConfig.forPublish(1, meta.length,
+                FsMetaHash.hex(FsMetaHash.of(meta)), txt.length + 1,
+                FsMetaHash.hex(FsMetaHash.of(txt)), 1L,
                 FsMetaHashMode.NONE, "test/1", "", "", "");
         IllegalArgumentException failure = Assertions.assertThrows(IllegalArgumentException.class,
                 () -> FsMetaPair.of(meta, txt, config));
@@ -119,7 +136,9 @@ class FsMetaPairTest {
         byte[] meta = FsMetaCodec.encodeEntries(List.of(
                 FsMetaEntry.forFile("a.txt", 1L, 1L, 1L, 0L, false),
                 FsMetaEntry.forFile("b.txt", 1L, 1L, 1L, 6L, false)));
-        FsMetaConfig stale = FsMetaConfig.forPublish(1, 64, 6, 1L,
+        FsMetaConfig stale = FsMetaConfig.forPublish(1, 64,
+                FsMetaHash.hex(FsMetaHash.of(meta)), 6,
+                FsMetaHash.hex(FsMetaHash.of(txt)), 1L,
                 FsMetaHashMode.NONE, "test/1", "", "", "");
         Files.write(directory.resolve(FsMetaFormat.TXT_FILE), txt);
         Files.write(directory.resolve(FsMetaFormat.META_FILE), meta);

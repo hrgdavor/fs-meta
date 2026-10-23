@@ -3,20 +3,19 @@
 package hr.hrg.fsmeta;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
- * {@code FORMAT.md} § 8: the checks a reader owes before it trusts a pair.
+ * {@code FORMAT.md} § 8: the checks a reader owes before it trusts a trio.
  *
  * <p>The order is part of the contract, because the first failure is the verdict a reader reports and two
  * implementations must report the same one for the same bytes. The shared vectors assert exactly that,
- * including two cases whose whole point is the order (a document that is not ours <em>and</em> has a bad
- * size is {@code unsupported-format}, and an entry that is both out of range and mis-hashed is
- * {@code entry-out-of-range}).</p>
+ * including cases whose whole point is the order (a document that is not ours <em>and</em> has a bad size
+ * is {@code unsupported-format}, an entry that is both out of range and mis-hashed is
+ * {@code entry-out-of-range}, and a size that agrees while the bytes do not is {@code meta-hash-mismatch}).</p>
  *
  * <p>A failure never means "the caller's work fails": it means the trio is unusable and the caller falls
- * back to the file system (§ 1).</p>
+ * back to the file system (§ 1). Validation does not write anything and does not throw for bad input.</p>
  */
 public final class FsMetaValidator {
 
@@ -31,7 +30,9 @@ public final class FsMetaValidator {
      * @param config the parsed sidekick document
      */
     public static FsMetaValidation validate(byte[] meta, byte[] txt, FsMetaConfig config) {
-        // 2. the format's name.
+        // 2. the format's name. (Check 1 — the document parses and has the required keys — has already
+        //    happened in FsMetaConfig.parse; a caller that could not parse it reports unsupported-format
+        //    without reaching this method.)
         if (!FsMetaFormat.FORMAT.equals(config.format())) {
             return FsMetaValidation.failure(FsMetaVerdict.UNSUPPORTED_FORMAT, -1,
                     "the document's format is '" + config.format() + "', not '" + FsMetaFormat.FORMAT + "'");
@@ -39,7 +40,7 @@ public final class FsMetaValidator {
         // 3. the version.
         if (config.version() != FsMetaFormat.VERSION) {
             return FsMetaValidation.failure(FsMetaVerdict.UNSUPPORTED_VERSION, -1,
-                    "version " + config.version() + " is not implemented (this reader writes and reads "
+                    "version " + config.version() + " is not implemented (this reader reads and writes "
                             + FsMetaFormat.VERSION + ")");
         }
         // 4. the entry size, which is part of the gate rather than a field to scale.
@@ -67,14 +68,22 @@ public final class FsMetaValidator {
                     "files.meta is " + metaBytes + " bytes, not a whole number of "
                             + FsMetaFormat.ENTRY_SIZE + "-byte entries");
         }
-        if (metaBytes != (config.count() << 6)) {
+        if (config.count() < 0 || (metaBytes >>> 6) != config.count()) {
             return FsMetaValidation.failure(FsMetaVerdict.META_SIZE_MISMATCH, -1,
-                    "files.meta holds " + (metaBytes >> 6) + " entries but the document says "
+                    "files.meta holds " + (metaBytes >>> 6) + " entries but the document says "
                             + config.count());
         }
         if (metaBytes != config.metaBytes()) {
             return FsMetaValidation.failure(FsMetaVerdict.META_SIZE_MISMATCH, -1,
                     "files.meta is " + metaBytes + " bytes but the document records " + config.metaBytes());
+        }
+
+        // 6b. the size is not a claim about the bytes; the whole-file hash is. Checked before any entry, or a
+        //     corrupted meta would be reported as the first thing *inside* it that looks wrong.
+        String actualMetaHash = FsMetaHash.hex(FsMetaHash.of(meta));
+        if (!actualMetaHash.equals(config.metaWyhash())) {
+            return FsMetaValidation.failure(FsMetaVerdict.META_HASH_MISMATCH, -1,
+                    "wyhash(files.meta) is " + actualMetaHash + ", meta.wyhash says " + config.metaWyhash());
         }
 
         // 7. the text file: the recorded size, one LF per name, and a terminator at the end. An empty
@@ -106,6 +115,13 @@ public final class FsMetaValidator {
             }
         }
 
+        // 7b. the text file's own hash, before a single name is read out of it.
+        String actualTxtHash = FsMetaHash.hex(FsMetaHash.of(txt));
+        if (!actualTxtHash.equals(config.txtWyhash())) {
+            return FsMetaValidation.failure(FsMetaVerdict.TXT_HASH_MISMATCH, -1,
+                    "wyhash(files.txt) is " + actualTxtHash + ", txt.wyhash says " + config.txtWyhash());
+        }
+
         // 8. each entry: its name slice is inside files.txt, is terminated by LF, holds no LF, and names
         //    something (an empty name is not a path, § 3).
         List<FsMetaEntry> entries = FsMetaCodec.decodeEntries(meta);
@@ -113,9 +129,9 @@ public final class FsMetaValidator {
             FsMetaEntry entry = entries.get(index);
             long offset = entry.nameOffset();
             int length = entry.nameLength();
-            if (length == 0) {
+            if (length <= 0) {
                 return FsMetaValidation.failure(FsMetaVerdict.ENTRY_OUT_OF_RANGE, index,
-                        "the entry's nameLength is 0, which names nothing");
+                        "the entry's nameLength is " + length + ", which names nothing");
             }
             if (offset < 0 || offset >= txtBytes || offset + length >= txtBytes) {
                 return FsMetaValidation.failure(FsMetaVerdict.ENTRY_OUT_OF_RANGE, index,
@@ -135,10 +151,19 @@ public final class FsMetaValidator {
         }
 
         // 9. each entry's name hashes to the nameHash it recorded — what makes the pair self-identifying.
+        //    A directory's stored line carries the trailing slash that bounds its subtree (§ 3, § 4), but the
+        //    hash and the lookup name are the path without it. Stripping here accepts both the spec's stored
+        //    form and a stored form that omits the slash, because the hash is over the same path either way.
         for (int index = 0; index < entries.size(); index++) {
             FsMetaEntry entry = entries.get(index);
-            byte[] name = new byte[entry.nameLength()];
-            System.arraycopy(txt, (int) entry.nameOffset(), name, 0, name.length);
+            int offset = (int) entry.nameOffset();
+            int length = entry.nameLength();
+            int hashedLength = length;
+            if (entry.directory() && length > 1 && txt[offset + length - 1] == '/') {
+                hashedLength = length - 1;
+            }
+            byte[] name = new byte[hashedLength];
+            System.arraycopy(txt, offset, name, 0, hashedLength);
             long actual = FsMetaHash.of(name);
             if (actual != entry.nameHash()) {
                 return FsMetaValidation.failure(FsMetaVerdict.NAME_HASH_MISMATCH, index,
@@ -147,15 +172,18 @@ public final class FsMetaValidator {
             }
         }
 
-        // Independent of the verdict: an entry with a flag bit this version does not define is not to be
-        // trusted, and that is a normal state rather than a failure (§ 6).
-        List<Integer> untrusted = new ArrayList<>();
+        // 10. the flags word: exactly one kind bit, nothing outside § 6's vocabulary, and HASH_LF only
+        //     where CONTENT_KNOWN says a hash was taken. There is no "untrusted but usable" entry in v1.
         for (int index = 0; index < entries.size(); index++) {
-            if (!entries.get(index).trusted()) {
-                untrusted.add(index);
+            FsMetaEntry entry = entries.get(index);
+            if (!FsMetaFormat.isValidFlags(entry.flags())) {
+                return FsMetaValidation.failure(FsMetaVerdict.INVALID_FLAGS, index,
+                        "the entry's flags are 0x" + Integer.toHexString(entry.flags())
+                                + ": not exactly one of file/dir/symlink, or a bit this version does not define");
             }
         }
-        return FsMetaValidation.ok(untrusted);
+
+        return FsMetaValidation.ok();
     }
 
     /** The {@code String} form of a name slice, for a caller that already knows the slice is valid. */

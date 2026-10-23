@@ -33,24 +33,24 @@ class FsMetaCodecTest {
         FsMetaEntry second = FsMetaEntry.forFile("src/b.java", 1_700_000_001_456L, 11L,
                 FsMetaHash.of(FsMetaHash.utf8("class B {}\n")), 6L, false);
 
-        String expected = "7b68e5cf8b01000082c009acd17d916a9059068e3329d1e60600000000000000"
+        String expected = "7b68e5cf8b01000006000000000000009059068e3329d1e682c009acd17d916a"
                 + "0000000000000000050000000300000000000000000000000000000000000000"
-                + "b06de5cf8b0100004b24dab568afd479692d7f9414c2739c0b00000000000000"
+                + "b06de5cf8b0100000b00000000000000692d7f9414c2739c4b24dab568afd479"
                 + "06000000000000000a0000000300000000000000000000000000000000000000";
         Assertions.assertEquals(expected, hex(FsMetaCodec.encodeEntries(List.of(first, second))));
 
         // and the first entry field by field, so a failure says which field moved
         byte[] entry = new byte[FsMetaFormat.ENTRY_SIZE];
         FsMetaCodec.putEntry(java.nio.ByteBuffer.wrap(entry).order(java.nio.ByteOrder.LITTLE_ENDIAN), 0L, first);
-        Assertions.assertEquals("7b68e5cf8b010000", hex(java.util.Arrays.copyOfRange(entry, 0, 8)), "mtimeMillis");
-        Assertions.assertEquals("82c009acd17d916a", hex(java.util.Arrays.copyOfRange(entry, 8, 16)), "nameHash");
+        Assertions.assertEquals("7b68e5cf8b010000", hex(java.util.Arrays.copyOfRange(entry, 0, 8)), "mtimeNs");
+        Assertions.assertEquals("0600000000000000", hex(java.util.Arrays.copyOfRange(entry, 8, 16)), "sizeBytes");
         Assertions.assertEquals("9059068e3329d1e6", hex(java.util.Arrays.copyOfRange(entry, 16, 24)), "contentHash");
-        Assertions.assertEquals("0600000000000000", hex(java.util.Arrays.copyOfRange(entry, 24, 32)), "sizeBytes");
+        Assertions.assertEquals("82c009acd17d916a", hex(java.util.Arrays.copyOfRange(entry, 24, 32)), "nameHash");
         Assertions.assertEquals("0000000000000000", hex(java.util.Arrays.copyOfRange(entry, 32, 40)), "nameOffset");
         Assertions.assertEquals("05000000", hex(java.util.Arrays.copyOfRange(entry, 40, 44)), "nameLength");
         Assertions.assertEquals("03000000", hex(java.util.Arrays.copyOfRange(entry, 44, 48)), "flags");
-        Assertions.assertEquals("0000000000000000", hex(java.util.Arrays.copyOfRange(entry, 48, 56)), "fileId");
-        Assertions.assertEquals("0000000000000000", hex(java.util.Arrays.copyOfRange(entry, 56, 64)), "reserved");
+        Assertions.assertEquals("0000000000000000", hex(java.util.Arrays.copyOfRange(entry, 48, 56)), "fileIdLo");
+        Assertions.assertEquals("0000000000000000", hex(java.util.Arrays.copyOfRange(entry, 56, 64)), "fileIdHi");
     }
 
     @Test
@@ -65,7 +65,7 @@ class FsMetaCodecTest {
     @Test
     void decodeIsTheInverseOfEncodeForEveryField() {
         FsMetaEntry awkward = new FsMetaEntry(
-                -1L, 0L, Long.MIN_VALUE, Long.MAX_VALUE, 0x0123_4567_89AB_CDEFL, -2, 0x0102_0304, 7L, 9L);
+                -1L, Long.MAX_VALUE, Long.MIN_VALUE, 0L, 0x0123_4567_89AB_CDEFL, -2, 0x0102_0304, 7L, 9L);
         FsMetaEntry plain = FsMetaEntry.forFile("README.md", 0L, 0L, 0L, 0L, false);
         List<FsMetaEntry> decoded = FsMetaCodec.decodeEntries(
                 FsMetaCodec.encodeEntries(List.of(awkward, plain)));
@@ -116,9 +116,9 @@ class FsMetaCodecTest {
         Assertions.assertFalse(listingOnly.usableFingerprint(),
                 "listing-only means there is nothing to compare, so a tool reads the file");
 
-        FsMetaEntry future = new FsMetaEntry(1L, 2L, 3L, 4L, 0L, 5, 0x10, 0L, 0L);
+        FsMetaEntry future = new FsMetaEntry(1L, 4L, 3L, 2L, 0L, 5, 0x20, 0L, 0L);
         Assertions.assertFalse(future.trusted(), "an unknown flag bit makes the entry untrusted");
-        Assertions.assertEquals(0x10, future.unknownFlagBits());
+        Assertions.assertEquals(0x20, future.unknownFlagBits());
     }
 
     @Test
