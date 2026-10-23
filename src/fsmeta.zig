@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: LicenseRef-GPL-3.0-with-Commons-Clause
 // Copyright (c) 2026 Davor Hrg
-//! `fsmeta` — the engine's command line: the three things you can ask a trio to do.
+//! `fsmeta` — the engine's command line: what you can ask a trio to do.
 //!
 //! ```text
 //! fsmeta verify  <root>      # does the trio describe what it claims? (§ 8) — exit 1 when it does not
 //! fsmeta scan    <root>      # what does the walker see? one line per name, no trio written
 //! fsmeta refresh <root>      # bring <root>/.fs-meta up to date; publishes only if something changed
+//! fsmeta serve   <root>      # serve <root>/.fs-meta/socket (FORMAT.socket.md binary protocol)
 //! ```
 //!
 //! `refresh` is the engine pass; `verify` is the reader's gate; `scan` is the diagnostic that shows what a walk
-//! would put in a fresh trio. `--no-gitignore` and `--hash none|lf|text` mirror the engine's options, and
-//! `--updated` supplies the pass's timestamp, because the engine core deliberately has no clock.
+//! would put in a fresh trio; `serve` is the live path, and it loads the trio first because a server with no
+//! usable state can only answer with an error. `--no-gitignore` and `--hash none|lf|text` mirror the engine's
+//! options, and `--updated` supplies the pass's timestamp, because the engine core deliberately has no clock.
 
 const std = @import("std");
 const format = @import("format.zig");
@@ -21,6 +23,7 @@ const query = @import("query.zig");
 const cache_mod = @import("cache.zig");
 const batch = @import("batch.zig");
 const reconcile = @import("reconcile.zig");
+const server = @import("server.zig");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -36,6 +39,7 @@ const usage =
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   deprecated: an alias of reconcile, kept for scripts
+    \\  fsmeta serve   <root>        serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -162,7 +166,25 @@ pub fn main(init: std.process.Init) !void {
         };
         return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output);
     }
+    if (std.mem.eql(u8, command, "serve")) return runServe(io, arena, gpa, target);
     return fail(io, gpa, "unknown command");
+}
+
+/// Load the trio, then serve it over `<root>/.fs-meta/socket` until the process is killed.
+///
+/// The load is the readiness check: a server whose state is missing or fails validation can only answer
+/// with errors, and saying so on stdout is more useful than binding a socket that refuses every request.
+fn runServe(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8) !void {
+    var cache = loadCache(arena, io, root) catch |err| {
+        const message = switch (err) {
+            error.TrioMissing => try std.fmt.allocPrint(arena, "no usable trio under {s}: .fs-meta/files.meta, files.txt and files.json are all required; run `fsmeta refresh {s}` first", .{ root, root }),
+            error.TrioInvalid => try std.fmt.allocPrint(arena, "the trio under {s}/.fs-meta is not usable; run `fsmeta verify {s}` for the verdict", .{ root, root }),
+            else => try std.fmt.allocPrint(arena, "cannot load the trio from {s}: {s}", .{ root, @errorName(err) }),
+        };
+        return fail(io, gpa, message);
+    };
+    defer cache.deinit();
+    return server.run(io, arena, root, &cache);
 }
 
 /// Load the trio, run a glob query, and print one line per match (or a JSON array with --json).
