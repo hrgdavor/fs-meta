@@ -45,6 +45,11 @@ edited only when the format itself changes, and then it is regenerated rather th
 The bench times a **process**, so a cold run measures loader and JIT as much as the matcher. `--rounds N` (on the CLIs)
 repeats the decision loop inside one process and gives steady state; start-up is measured separately, by running the same
 command against an empty path list, and subtracted. Run-to-run variance is about 13% at 12 rounds, so **interleave the two
+
+- **A cached build prints no test counts.** `zig build test` against a warm cache reports `37/37 steps succeeded` and
+  nothing else, so a count quoted from such a run is stale at best — and this project has had a report that claimed a
+  passing total it never ran (`98/100` against a true `300/306`). When a number is going into a report, a commit message
+  or a document, run the gate with a fresh `--cache-dir` (`.zig-cache\<something-new>`) and quote what it prints.
 configurations in one run** rather than comparing two runs, and do not report a difference smaller than that.
 
 ## 5. House rules
