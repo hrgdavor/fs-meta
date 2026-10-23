@@ -1,5 +1,10 @@
 # The Java port — what it must become
 
+**Status: the reader is ported.** `FsMetaValidator` implements the twelve verdicts in § 8 order, the codec reads the
+current § 5 layout, and `FsMetaConformanceTest` passes **14/14** cases of `conformance/fsmeta-vectors-v2.json`;
+the module's suite is **62 tests, 0 failures, 1 skipped** (a symlink privilege). Writing stays with the Zig engine,
+which is the only writer; what is described below is the plan that was followed, kept for the record.
+
 **Status: not ported.** The Zig reference is complete and the Bun reader now passes all fourteen conformance vectors
 (see [`benchmark.md`](benchmark.md) and [`../conformance/gen-vectors-v2.mjs`](../conformance/gen-vectors-v2.mjs)).
 The Java module predates the format it is supposed to implement, and this document is the plan for closing that, so
