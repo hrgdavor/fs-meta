@@ -10,8 +10,12 @@ cd fs-meta
 D:\wrk\zig\17\zig.exe build test --cache-dir .zig-cache\local --summary all
 ```
 
-Today: **37/37 steps, 298/304 tests** (6 platform skips). Before the move it was 41 steps: the four file-modules for
-the matcher and the chain left with their 27 tests.
+Today: **37/37 steps, 321/327 tests** (6 skipped — **two** platform guards, each counted in three test binaries;
+see § G). Before the move it was 41 steps: the four file-modules for the matcher and the chain left with their 27
+tests.
+
+The Bun gate (`bun test`, which runs `js/` and `test/`) is **71 pass, 4 skip, 0 fail** across 75 tests: three
+writer-scope tests (§ G1) and one POSIX-only socket assertion (§ G2).
 
 ## A. Sync with the gitignore move
 
@@ -83,3 +87,31 @@ Full detail, with the code, is in [`plans/next-session-pair-layout.md`](next-ses
 it unchanged.
 
 - `reconcile --baseline <root>`: specified in [`reconcile-baseline.md`](reconcile-baseline.md); the adapter, the flags it must reconstruct, and the test that proves it.
+
+## G. The skips, and why each one is deliberate
+
+A fresh-cache gate prints `321/327 tests passed (6 skipped)`. That is **two** Zig tests counted in three test
+binaries — `scan`, `lister` and `engine` all import `scan.zig`, and a test binary runs its imports' tests too — so
+the six are not six separate gaps. Both skip sites print their platform and condition before returning
+`error.SkipZigTest`; `zig build test` echoes them once per test binary (the three that import `scan.zig`),
+preceded by the builder's `+- run test` / `failed command:` context header. That header is the builder showing a
+step's stderr, not a failed step: the summary still ends `37/37 steps succeeded`. A direct run of the binary shows
+the same reason next to its `SKIP` line.
+
+| Test (`src/scan.zig`)                                   | Why it skips | What would close it                                                                     |
+| ------------------------------------------------------- | ------------ | --------------------------------------------------------------------------------------- |
+| `a symlink is listed as a symlink and never followed`   | Creating a symbolic link needs `SeCreateSymbolicLinkPrivilege` or Windows Developer Mode. This host has neither: the call returns `AccessDenied` (probed directly too), so the walk's symlink case cannot be constructed. The kind mapping is still covered by `the kind mapping covers all three listed kinds`. | Run the gate on a host or account that grants the privilege, or with Developer Mode on. |
+| `a name the format cannot store is skipped and counted` | Win32/NTFS cannot construct any name § 3 forbids: `\` is the path separator, the control characters (LF/CR/NUL) are rejected (`BadPathName` when probed), and an invalid-UTF-16 name cannot be passed through Zig's path conversion. | POSIX CI runs it. A Windows fixture would need a native `NtCreateFile` with an unpaired surrogate; the engine has no reason to grow one. |
+
+**G1. The Bun writer tests (3) — feature missing, not a host limitation.** `js/fsmeta.test.mjs` keeps the port's
+writing-side cases (`the worked example is byte-exact in both directions`, `every pair case reaches the verdict it
+records`, `the repair case recovers the pairing from the hashes`) because porting the writing side stays possible.
+They are declared through a `writerTest` helper that calls `test.skip` with the reason in the reported name, so
+`bun test` prints `4 skip` and never counts them as passes; the reason is "writer scope: the Zig engine is the only
+writer (AGENTS.md § 1); set FSMETA_PORT_WRITER=1 to run it". With `FSMETA_PORT_WRITER=1 bun test` they run and are
+expected to fail until the port learns the two-order layout — that is the writer half of E1, and it is the one gap
+this plan keeps open on purpose.
+
+**G2. The POSIX-only socket assertion (1) — platform guard, no gap.** `test/socket.test.mjs` runs its four replay
+tests on Windows AF_UNIX; only `POSIX: the bound address is a socket node…` is skipped, with the reason "this host
+is win32; an S_ISSOCK node on the bound address is POSIX-only". Linux/macOS CI is what covers it.

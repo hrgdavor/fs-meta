@@ -9,15 +9,15 @@
 //! greet the client, read its greeting, check it, take its `SUBSCRIBE`, and replay the batch archive
 //! as `START_BATCH` / `CHANGE_ENTRY` / `END_BATCH`.
 //!
-//! Two deliberate limits, both of them gaps in the document today rather than choices of this code:
+//! Two deliberate limits:
 //!
 //! - **No live stream.** A pass publishes generations through the watcher, which is a different
 //!   artifact; a `serve` process has no publisher to subscribe to, so the connection ends after the
 //!   replay. The client resumes by reconnecting with its new `from_batch`, which is the replay path.
-//! - **`HELLO.capabilities` is 0 and `END_BATCH.changes_hash` is 0.** `FORMAT.socket.md` names the
-//!   `changes_hash` field but never says what it hashes, so this server does not advertise the
-//!   `changes_hash` capability and leaves the field zero. The counts in `END_BATCH` are exact and are
-//!   what the document actually defines.
+//! - **`HELLO.capabilities` is 0 and `END_BATCH.changes_hash` is 0.** `FORMAT.socket.md` still does not
+//!   say what `changes_hash` hashes, and its § Values this implementation pins says a client must not rely
+//!   on it; this server therefore does not advertise the capability and leaves the field zero. The counts
+//!   in `END_BATCH` are exact and are what the document actually defines.
 //!
 //! Single-threaded: `run` accepts one connection at a time, serves it, closes it, and accepts the
 //! next. With no publisher there is nothing to multiplex.
@@ -29,8 +29,8 @@ const batch = @import("batch.zig");
 const wire = @import("wire.zig");
 
 /// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`).
-/// `FORMAT.socket.md` fixes the field's shape but not its value; 1.0 is the layout the document
-/// describes and the value `wire.zig`'s tests use.
+/// 1.0 is the layout the document describes; `FORMAT.socket.md` § Values this implementation pins states the
+/// value, and `wire.zig`'s tests use it too.
 pub const protocol: u16 = 0x0100;
 
 /// The socket's name inside `<root>/.fs-meta`.
@@ -39,9 +39,9 @@ pub const socket_name = "socket";
 /// The path the server listens on, relative to a root: `.fs-meta/socket`.
 pub const socket_path = format.directory_name ++ "/" ++ socket_name;
 
-/// Failure codes carried by `ERROR` (kind `0x05`). `FORMAT.socket.md` specifies the payload's
-/// `u16 code` but not a numeric table; these values are this implementation's, and the UTF-8 message
-/// always carries the document's vocabulary (`protocol`, `batch-too-old`, `batch-gap`).
+/// Failure codes carried by `ERROR` (kind `0x05`). `FORMAT.socket.md` § Values this implementation pins
+/// gives the numeric table; the UTF-8 message carries the same vocabulary (`protocol`, `batch-too-old`,
+/// `batch-gap`).
 pub const ErrorCode = enum(u16) {
     protocol = 1,
     batch_too_old = 2,

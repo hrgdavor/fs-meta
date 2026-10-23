@@ -760,6 +760,20 @@ test "respect_gitignore = false lists everything except the reserved directories
     });
 }
 
+/// A symlink cannot be created without the privilege that creates one: on Windows that is
+/// `SeCreateSymbolicLinkPrivilege` (or Developer Mode), and on a restricted POSIX host it is the parent
+/// directory's permission or the mount's options. The skip is a platform guard with a printed reason, so a
+/// `SKIP` line is never an unexplained absence; the kind mapping itself is covered by
+/// `the kind mapping covers all three listed kinds` below.
+fn symlinkSkipped(err: anyerror) error{SkipZigTest} {
+    std.debug.print(
+        "skip: this {s} host refused to create a symbolic link (error.{t}): Windows needs " ++
+            "SeCreateSymbolicLinkPrivilege or Developer Mode, so the walk's symlink case needs a host that grants it\n",
+        .{ @tagName(builtin.os.tag), err },
+    );
+    return error.SkipZigTest;
+}
+
 test "a symlink is listed as a symlink and never followed" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -770,13 +784,11 @@ test "a symlink is listed as a symlink and never followed" {
     try tmp.dir.writeFile(io, .{ .sub_path = "realdir/inside.txt", .data = "inside" });
 
     tmp.dir.symLink(io, "target.txt", "link.txt", .{}) catch |err| switch (err) {
-        // Creating a symbolic link needs SeCreateSymbolicLinkPrivilege (or Developer Mode) on Windows. The
-        // kind mapping is still exercised by the `factKind` test below; this one needs a link to exist.
-        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        error.AccessDenied, error.PermissionDenied => return symlinkSkipped(err),
         else => return err,
     };
     tmp.dir.symLink(io, "realdir", "linkdir", .{ .is_directory = true }) catch |err| switch (err) {
-        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        error.AccessDenied, error.PermissionDenied => return symlinkSkipped(err),
         else => return err,
     };
 
@@ -818,8 +830,14 @@ test "the kind mapping covers all three listed kinds" {
 
 test "a name the format cannot store is skipped and counted" {
     if (builtin.os.tag == .windows) {
-        // Win32/NT reject or cannot enumerate control characters and invalid UTF-16 file names, so the case
-        // cannot be constructed on this platform. POSIX exercises it below.
+        // `\` is the path separator here, and Win32/NT reject the control characters and invalid UTF-16 that
+        // are the other shapes § 3 forbids, so none of them can be created as a name. The skip is a platform
+        // guard with a printed reason rather than a silent pass; POSIX exercises the case below.
+        std.debug.print(
+            "skip: this {s} host cannot construct a name § 3 forbids (`\\` is the path separator, and Win32/NT " ++
+                "reject control characters and invalid UTF-16), so the case is POSIX-only\n",
+            .{@tagName(builtin.os.tag)},
+        );
         return error.SkipZigTest;
     }
 
@@ -828,8 +846,9 @@ test "a name the format cannot store is skipped and counted" {
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a" });
-    // A backslash is a legal POSIX filename byte but § 3 forbids it in a stored name.
-    tmp.dir.writeFile(io, .{ .sub_path = "bad\\name", .data = "b" }) catch return error.SkipZigTest;
+    // A backslash is a legal POSIX filename byte but § 3 forbids it in a stored name. A failure here is a real
+    // failure, not a platform skip: on the platforms that run this test the write is expected to succeed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "bad\\name", .data = "b" });
 
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(io, tmp.dir, &path_buffer);

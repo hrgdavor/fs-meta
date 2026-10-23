@@ -387,6 +387,19 @@ const unixTest = afUnixAvailable
   ? test
   : (name, fn) => test.skip(`${name} [skipped: ${AF_UNIX_REASON}]`, fn);
 
+/**
+ * The bound address being an `S_ISSOCK` file-system node is a POSIX property: Windows serves AF_UNIX sockets
+ * (the tests above run there) but does not expose the node this assertion lstat's. The skip names the host and
+ * the condition, so the reported count is a decision rather than an unexplained absence.
+ */
+const posixNodeTest = process.platform === 'win32'
+  ? (name, fn, ...rest) => test.skip(
+      `${name} [skipped: this host is win32; an S_ISSOCK node on the bound address is POSIX-only]`,
+      fn,
+      ...rest,
+    )
+  : test;
+
 // ──────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────
@@ -498,7 +511,7 @@ describe('FORMAT.socket.md over a Unix socket', () => {
 
   // POSIX-only variant: the same replay, plus the property Linux CI has and Windows does not guarantee —
   // that the bound address is a socket node in the file system (S_ISSOCK).
-  test.skipIf(process.platform === 'win32')(
+  posixNodeTest(
     'POSIX: the bound address is a socket node and the replay still matches the archive',
     async () => {
       const root = twoGenerationTree();

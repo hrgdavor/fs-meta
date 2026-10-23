@@ -81,17 +81,22 @@ describe('the hash this format uses', () => {
   });
 });
 
+// ------------------------------------------------------------------ writer scope
+
+// The Zig engine is the only writer (AGENTS.md § 1): this port is a reader, and its writing-side tests are kept
+// so a future writer port has them. They must be reported as *skipped*, never as passing tests that assert
+// nothing — the count has to tell the truth. `FSMETA_PORT_WRITER=1 bun test` runs them, and they are expected
+// to fail until the port learns the two-order layout.
+const WRITER_SCOPE_REASON =
+    'writer scope: the Zig engine is the only writer (AGENTS.md § 1); set FSMETA_PORT_WRITER=1 to run it';
+const writerTest = process.env.FSMETA_PORT_WRITER === '1'
+    ? test
+    : (name, fn) => test.skip(`${name} [skipped: ${WRITER_SCOPE_REASON}]`, fn);
+
 // ------------------------------------------------------------------ the layout
 
 describe('the entry layout', () => {
-  test('the worked example is byte-exact in both directions', () => {
-    // Writer scope (see the header): the Zig engine is the writer, so this test runs only when a writer port is
-    // being worked on. `FSMETA_PORT_WRITER=1 bun test js` runs it, and it is expected to fail until the port
-    // learns the two-order layout.
-    if (process.env.FSMETA_PORT_WRITER !== '1') {
-        console.log('  skipped (writer scope): set FSMETA_PORT_WRITER=1 to run it');
-        return;
-    }
+  writerTest('the worked example is byte-exact in both directions', () => {
     const valid = vectors.cases.find((one) => one.label === 'valid');
     const config = parseConfig(JSON.stringify(valid.json));
     const meta = bytesOfHex(valid.metaHex);
@@ -135,14 +140,7 @@ describe('the entry layout', () => {
 // ------------------------------------------------------------------ validation
 
 describe('validation', () => {
-  test('every pair case reaches the verdict it records', () => {
-    // Writer scope (see the header): the Zig engine is the writer, so this test runs only when a writer port is
-    // being worked on. `FSMETA_PORT_WRITER=1 bun test js` runs it, and it is expected to fail until the port
-    // learns the two-order layout.
-    if (process.env.FSMETA_PORT_WRITER !== '1') {
-        console.log('  skipped (writer scope): set FSMETA_PORT_WRITER=1 to run it');
-        return;
-    }
+  writerTest('every pair case reaches the verdict it records', () => {
     let checked = 0;
     for (const vector of vectors.cases) {
       const config = parseConfig(JSON.stringify(vector.json));
@@ -168,14 +166,7 @@ describe('validation', () => {
     }
   });
 
-  test('the repair case recovers the pairing from the hashes', () => {
-    // Writer scope (see the header): the Zig engine is the writer, so this test runs only when a writer port is
-    // being worked on. `FSMETA_PORT_WRITER=1 bun test js` runs it, and it is expected to fail until the port
-    // learns the two-order layout.
-    if (process.env.FSMETA_PORT_WRITER !== '1') {
-        console.log('  skipped (writer scope): set FSMETA_PORT_WRITER=1 to run it');
-        return;
-    }
+  writerTest('the repair case recovers the pairing from the hashes', () => {
     const repair = vectors.repairCase;
     const meta = bytesOfHex(repair.metaHex);
     const txt = bytesOfHex(repair.txtHex);

@@ -34,16 +34,19 @@ what makes the JSON-RPC side of the socket recognisable from its first byte, as 
 
 ### Messages
 
-| `kind` | Name           | Payload                                                                      |
-| ------ | -------------- | ---------------------------------------------------------------------------- |
-| `0x01` | `HELLO`        | `u16 protocol`, `u16 entry_size = 64`, `u64 generation`, `u8 hash_algorithm` |
-| `0x02` | `START_BATCH`  | `u64 number`, `u64 parent`, `u64 started_ns`                                 |
-| `0x03` | `CHANGE_ENTRY` | 64-byte entry (§ 5) + name bytes, no LF                                      |
-| `0x04` | `END_BATCH`    | `u64 number`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`  |
-| `0x05` | `ERROR`        | `u16 code`, then a UTF-8 message                                             |
-| `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing)     |
-| `0x07` | `PING`         | empty                                                                        |
-| `0x08` | `PONG`         | empty                                                                        |
+| `kind` | Name           | Payload                                                                                |
+| ------ | -------------- | -------------------------------------------------------------------------------------- |
+| `0x01` | `HELLO`        | the fixed 24-byte greeting of § Handshake — its one definition, not a second size here |
+| `0x02` | `START_BATCH`  | `u64 number`, `u64 parent`, `u64 started_ns`                                           |
+| `0x03` | `CHANGE_ENTRY` | 64-byte entry (§ 5) + name bytes, no LF                                                |
+| `0x04` | `END_BATCH`    | `u64 number`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`            |
+| `0x05` | `ERROR`        | `u16 code`, then a UTF-8 message                                                       |
+| `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing)               |
+| `0x07` | `PING`         | empty                                                                                  |
+| `0x08` | `PONG`         | empty                                                                                  |
+
+**`HELLO` is defined once**, in § Handshake; the row above is a pointer that keeps the kind numbering in one place,
+not a second payload layout.
 
 **`CHANGE_ENTRY` is the trio's entry, unchanged.** Its `nameLength` (offset 40) makes the frame self-delimiting:
 `length == 64 + nameLength`, and a client checks that equality rather than trusting `length` alone. The change kind
@@ -154,11 +157,40 @@ format uses, so a client reports one vocabulary:
 
 Minor versions are negotiated by allowance: a newer minor may append fields after byte 23 and advertise them in
 `capabilities`; an older peer reads the fixed 24 bytes and ignores the rest because `length` tells it how much to skip.
-Major versions change the layout and are refused rather than guessed.
+**This implementation does not use that allowance yet** — it accepts `length = 24` exactly and refuses a longer
+greeting (see § Values this implementation pins). Major versions change the layout and are refused rather than guessed.
 
 After the greeting the client sends `SUBSCRIBE {from_batch}`; the server replies with `HELLO`-derived replay
 (`START_BATCH` … `END_BATCH` per generation) or the live stream. There is no "who speaks first" question because both
 greet at once, and no state machine whose order can deadlock.
+
+### Values this implementation pins
+
+The layout above is the format. Three of its values are this implementation's choice, and they are pinned here so a
+client author reads them instead of inferring them from the server's bytes.
+
+**`protocol` is `0x0100`** — major 1, minor 0. A client must use major 1; a different major is `unsupported-version`.
+The minor is negotiated by allowance, as above.
+
+**`ERROR` codes** are the `u16 code` at offset 0 of the payload (kind `0x05`). The number is the contract: the UTF-8
+message that follows begins with the code's word and `: `, then detail for a human, so a client branches on the number
+and never on the text.
+
+| code | word            | sent when                                                                                          |
+| ---- | --------------- | -------------------------------------------------------------------------------------------------- |
+| 1    | `protocol`      | the peer's greeting is not a `HELLO` frame with `length = 24`, its payload does not decode (`role` outside 0/1), or it fails a greeting check (`unsupported-entry-size`, `unsupported-hash`, `unsupported-version`, `unsupported-capability`); `SUBSCRIBE` is not an 8-byte payload, or its `from_batch` is newer than the newest batch; or a frame prefix is refused (`unknown-kind`, `unsupported-flags`, `frame-too-large`) |
+| 2    | `batch-too-old` | `from_batch + 1` is below the oldest retained batch, so replay cannot start where the client asked |
+| 3    | `batch-gap`     | a generation in `from_batch + 1 ..= newest` has no batch directory                                 |
+
+**`changes_hash` is `0`, and its capability bit is clear.** The server advertises `capabilities = 0`, so bit 1
+(`changes_hash`) is off and every `END_BATCH` carries `changes_hash = 0`. What the field would hash is not specified
+yet, so **a hash-verifying client must not rely on it**: treat it as absent and use the exact `added` / `changed` /
+`deleted` counts, which the document does define, as the batch's integrity check. Bit 0 (`snapshot`) is clear for the
+same reason — the snapshot message is not specified yet.
+
+Two consequences of the same "pin it, do not guess" rule. Capability bits outside `0x03` are treated as required by
+this server and refused with `unsupported-capability`, so a reserved bit is never silently ignored. And a greeting
+longer than 24 bytes is a protocol error, so a newer minor must still greet in the fixed 24 bytes.
 
 ### Lessons taken from ZMTP (ZeroMQ's wire protocol)
 
