@@ -34,6 +34,8 @@ const usage =
     \\  fsmeta changed <root> <since>  files changed since <since>; one line per match
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   merge batches start+1..end into one change record
+    \\  reconcile <root> <from> [to] [--json]
+    \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -60,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
 
     var root: ?[]const u8 = null;
     var second: ?[]const u8 = null;
+    var third: ?[]const u8 = null;
     var options: engine.Options = .{ .updated = "1970-01-01T00:00:00Z" };
     var respect_gitignore = true;
     var show_stats = false;
@@ -93,8 +96,10 @@ pub fn main(init: std.process.Init) !void {
             return fail(io, gpa, "unknown option");
         } else if (root == null) {
             root = arg;
-        } else {
+        } else if (second == null) {
             second = arg;
+        } else {
+            third = arg;
         }
     }
 
@@ -145,6 +150,10 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "changed")) {
         const since_arg = second orelse return fail(io, gpa, "changed needs a since timestamp");
         return runChanged(io, arena, gpa, target, since_arg, json_output);
+    }
+    if (std.mem.eql(u8, command, "reconcile")) {
+        const from_arg = second orelse return fail(io, gpa, "reconcile needs a from generation");
+        return runReconcile(io, arena, gpa, target, from_arg, third, json_output);
     }
     if (std.mem.eql(u8, command, "merge")) {
         const start_arg = second orelse return fail(io, gpa, "merge needs a start batch number");
@@ -456,4 +465,139 @@ fn fail(io: std.Io, allocator: std.mem.Allocator, message: []const u8) !void {
     const text = try std.fmt.allocPrint(allocator, "fsmeta: {s}\n{s}", .{ message, usage });
     try std.Io.File.stdout().writeStreamingAll(io, text);
     std.process.exit(2);
+}
+
+/// A range of batches is what a consumer asks for: everything after the generation it recorded, up to one it names.
+pub const RangeError = error{ BatchGap, BatchTooOld };
+
+/// Whether batches `from+1` to `to` can be read from an archive that retains `first` to `last`.
+///
+/// Dense numbering is the format's rule (FORMAT.md § 17.1), so bounds are enough: a range that starts before the archive
+/// begins is `BatchTooOld`, and one that reaches past a missing batch is `BatchGap`. Neither is skippable — a consumer
+/// that skipped a batch would silently miss a change, which is the failure the sequence exists to prevent.
+pub fn checkRange(first: usize, last: usize, from: usize, to: usize) RangeError!void {
+    if (to <= from) return;
+    if (first > 0 and from + 1 < first) return error.BatchTooOld;
+    if (to > last) return error.BatchGap;
+}
+
+/// Reconcile the batches after `from` up to `to` (default: the latest) into one record.
+fn runReconcile(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    from_arg: []const u8,
+    to_arg: ?[]const u8,
+    json: bool,
+) !void {
+    const from = std.fmt.parseInt(usize, from_arg, 10) catch return fail(io, gpa, "from must be a number");
+
+    const batches_dir = try openBatchesDir(io, arena, root);
+    defer batches_dir.close(io);
+
+    var first: usize = 0;
+    var last: usize = 0;
+    var count: usize = 0;
+    var iter = batches_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const number = std.fmt.parseInt(usize, entry.name, 16) catch continue;
+        if (count == 0 or number < first) first = number;
+        if (count == 0 or number > last) last = number;
+        count += 1;
+    }
+
+    if (count == 0) {
+        try write(io, if (json) "[]\n" else "0 names\n");
+        return;
+    }
+
+    const to = if (to_arg) |value|
+        std.fmt.parseInt(usize, value, 10) catch return fail(io, gpa, "to must be a number")
+    else
+        last;
+
+    checkRange(first, last, from, to) catch |err| switch (err) {
+        error.BatchTooOld => {
+            const message = try std.fmt.allocPrint(arena, "batch-too-old: batches start at {d}, so generation {d} cannot be reconciled from\n", .{ first, from });
+            try write(io, message);
+            return;
+        },
+        error.BatchGap => {
+            const message = try std.fmt.allocPrint(arena, "batch-gap: no batch {d}; the archive holds {d}..{d}\n", .{ to, first, last });
+            try write(io, message);
+            return;
+        },
+    };
+
+    var events: std.ArrayListUnmanaged(reconcile.Event) = .empty;
+    errdefer events.deinit(arena);
+    for (from + 1 .. to + 1) |n| {
+        const dir_name = try std.fmt.allocPrint(arena, "{x:0>8}", .{n});
+        var batch_dir = batches_dir.openDir(io, dir_name, .{ .iterate = true }) catch {
+            const message = try std.fmt.allocPrint(arena, "batch-gap: no batch {d}\n", .{n});
+            try write(io, message);
+            return;
+        };
+        defer batch_dir.close(io);
+
+        const meta = try readOptional(io, batch_dir, format.meta_file, arena) orelse continue;
+        const txt = try readOptional(io, batch_dir, format.txt_file, arena) orelse continue;
+        const plan = try batch.decode(arena, meta, txt);
+        defer {
+            arena.free(plan.entries);
+            arena.free(plan.names);
+        }
+        const batch_events = try batch.toEvents(arena, plan);
+        try events.appendSlice(arena, batch_events);
+    }
+
+    const changes = try reconcile.collapse(arena, events.items, null);
+    defer arena.free(changes);
+
+    if (json) {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("[\n");
+        for (changes, 0..) |change, index| {
+            if (index > 0) try writer.writeAll(",\n");
+            try writer.writeAll("  {\"name\": ");
+            try jsonWriteString(writer, change.name);
+            const kind = switch (change.kind) {
+                .added => "added",
+                .changed => "changed",
+                .deleted => "deleted",
+            };
+            try writer.print(", \"kind\": \"{s}\"}}", .{kind});
+        }
+        try writer.writeAll("\n]\n");
+        try write(io, out.written());
+        return;
+    }
+
+    for (changes) |change| {
+        const kind = switch (change.kind) {
+            .added => "added",
+            .changed => "changed",
+            .deleted => "deleted",
+        };
+        const line = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ kind, change.name });
+        try write(io, line);
+    }
+    const total = try std.fmt.allocPrint(arena, "{d} names\n", .{changes.len});
+    try write(io, total);
+}
+
+test "a batch range is refused rather than silently shortened" {
+    // Everything the archive has.
+    try checkRange(1, 3, 0, 3);
+    try checkRange(1, 3, 1, 3);
+    // Nothing to do.
+    try checkRange(1, 3, 3, 3);
+    // The baseline predates the archive.
+    try std.testing.expectError(error.BatchTooOld, checkRange(2, 3, 0, 2));
+    // The range reaches a batch the archive does not have.
+    try std.testing.expectError(error.BatchGap, checkRange(1, 3, 1, 4));
 }
