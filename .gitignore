@@ -121,3 +121,4 @@ zig-out/
 # and AGENTS.md that sit in the area itself - needs to survive a clone of this repository.
 proto/
 node_modules/
+/zig-pkg
