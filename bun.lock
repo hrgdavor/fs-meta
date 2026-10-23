@@ -5,11 +5,11 @@
     "": {
       "name": "@hrg/fs-meta",
       "dependencies": {
-        "@hrg/gitignore": "file:D:/wrk/core/gitignore",
+        "@hrg/gitignore": "^0.3.0",
       },
     },
   },
   "packages": {
-    "@hrg/gitignore": ["@hrg/gitignore@file:../gitignore", {}],
+    "@hrg/gitignore": ["@hrg/gitignore@0.3.0", "", {}, "sha512-qSC6M++gQoZ9LfNulnqlFGEJYmMNmfvDVx9xHzmWE5zHuQYMgOrmBZQI826zonn6qcJE4aLkn3W2ndaVcZdlzg=="],
   }
 }

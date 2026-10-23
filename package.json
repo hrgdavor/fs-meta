@@ -11,6 +11,6 @@
     "conformance": "bun js/conformance.mjs"
   },
   "dependencies": {
-    "@hrg/gitignore": "file:D:/wrk/core/gitignore"
+    "@hrg/gitignore": "^0.3.0"
   }
 }
