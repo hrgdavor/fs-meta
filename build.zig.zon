@@ -1,6 +1,6 @@
 .{
     .name = .watcher,
-    .version = "0.3.0",
+    .version = "0.3.1",
     .fingerprint = 0xb28fe6ac387cc966,
     .dependencies = .{
         // The .gitignore matcher and the directory chain, pinned to their published tag (github.com/hrgdavor/gitignore).
