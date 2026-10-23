@@ -9,8 +9,8 @@
             .hash = "nightwatch-1.0.0-uXzeH1ALAwAr6LLM0H1Z0aBO_a5gpxQ1YsXpdlh3Xv6U",
         },
         .gitignore = .{
-            .url = "https://github.com/hrgdavor/gitignore/archive/refs/tags/v0.2.0.tar.gz",
-            .hash = "gitignore-0.2.0--BNkLrdtAQDXJWC82YaG4sp4bbYpmY91ufXR_pAU8W9t",
+            .url = "https://github.com/hrgdavor/gitignore/archive/refs/tags/v0.3.0.tar.gz",
+            .hash = "gitignore-0.3.0--BNkLphyAQAceqTZqo-JB3vSmYeNzh0ccjSPnDvsaL7s",
         },
     },
     .paths = .{""},
