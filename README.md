@@ -215,3 +215,16 @@ FSMETA_PORT_WRITER=1 bun test js       # also the writer tests, which fail until
 They are kept rather than deleted so that porting the writing side stays an option; the engine's own tests are what
 define the writer today. Extracting them into `js/writer.test.mjs` is worthwhile once a writer port is actually
 planned, because they share the reader suite's helpers.
+## Dependencies
+
+`gitignore` is consumed as a published artifact in every language it is available in:
+
+| language   | coordinate               | resolved from                               |
+| ---------- | ------------------------ | ------------------------------------------- |
+| Zig        | `gitignore` v0.3.0       | `build.zig.zon`, the tagged tarball         |
+| Java       | `hr.hrg:gitignore:0.3.0` | **Maven Central** — no local install needed |
+| JavaScript | `@hrg/gitignore@0.3.0`   | **npm**                                     |
+
+The Java artifact was verified the way a fresh machine would use it: the local copy was deleted and
+`mvn dependency:get -Dartifact=hr.hrg:gitignore:0.3.0` repopulated it from Central, then the test suite ran against that
+copy. Nothing here needs a checkout of the `gitignore` repository.
