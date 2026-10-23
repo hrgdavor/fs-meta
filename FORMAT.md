@@ -344,6 +344,17 @@ format as the main meta.
   `N`, and the main trio after that publish carries `"generation": N`.
 - Numbers are dense from 1. A gap or a duplicate is diagnosed (`batch-gap`), never skipped: a consumer that
   skipped a batch would silently miss a change.
+- **A merge of changes needs no baseline.** A consumer that recorded generation `4` reads batches `5`, `6`, `7` … and
+  those *are* the changes from `4`; the state at `4` is not needed in order to see them. `--baseline <root>` is
+  optional and secondary: it lets a merge drop a change whose identity has already returned to what the consumer holds,
+  which is useful when rebuilding a full state from a snapshot. That recovery case is **not the focus**. The usual
+  consumer keeps the latest state (sometimes the previous one as well), streams each change to its event listeners as
+  the batch arrives, and builds the next state from the current one — so the change stream, not the snapshot, is the
+  interface that matters.
+- A consumer reconciles from the generation it recorded: `fsmeta reconcile <root> <from> [to] [--json]` folds the batches
+  after `from` into one record of `added`, `changed` and `deleted`. Two refusals are **errors**, not empty answers:
+  **`batch-gap`** when a batch in the range is absent, and **`batch-too-old`** when `from` predates the oldest batch
+  still retained. Either means the consumer must rescan; neither may be reported as "nothing changed".
 - A pass that changes nothing writes **no** batch, so the sequence advances only when the tree does.
 - The first trio is generation `0` and may have no `batches/` folder at all.
 

@@ -25,6 +25,12 @@ possible. Do not add a writer to a port to make a test pass.
   `unsupported-hash`, `meta-size-mismatch`, `meta-hash-mismatch`, `txt-size-mismatch`, `txt-hash-mismatch`,
   `entry-out-of-range`, `name-hash-mismatch`, `invalid-flags`. A new verdict is a format change: it goes in `FORMAT.md`
   and in the conformance vectors first, then in every implementation.
+- **A merge of changes must not require a baseline.** Batches after the recorded generation *are* the changes from it.
+  `--baseline` is optional: it exists for rebuilding a full state from an old snapshot (dropping a change that has
+  already returned to the known identity), which is a secondary case. The normal shape is: keep the latest state,
+  stream each change to listeners, and build the new state from the old one. Do not make a consumer hold a snapshot in
+  order to read the change stream, and do not describe the baseline as required.
+
 - **A gap in the batch sequence is an error** (`batch-gap`), never skipped. `batch-too-old` means the consumer's baseline
   predates the oldest retained batch.
 

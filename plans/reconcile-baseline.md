@@ -1,5 +1,11 @@
 # The baseline option for `fsmeta reconcile`
 
+> **The baseline is optional and secondary.** Merging changes needs only the id the consumer recorded: batches after it
+> *are* the changes from it, and the recorded state is not needed to see them. This document describes the extra case —
+> rebuilding a full state from a snapshot — which is supported but not the focus. The normal shape keeps the latest
+> state (sometimes the previous one) and streams each change to its listeners while the next state is built from the
+> current one.
+
 Status: **implemented** (`BaselineStore` in `src/fsmeta.zig`), verified by hand on a change-and-change-back tree: without a baseline `reconcile` reports `changed a.txt`, with the baseline it reports `0 names`. The integration test described at the end is still to be added. Written after implementing `reconcile` (`94e503b`), because the facts below were
 established by reading the code and would otherwise have to be rediscovered — and because the last three edits near this
 path each broke the build, so the design is worth agreeing before it is written.
