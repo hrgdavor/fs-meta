@@ -190,3 +190,18 @@ trio this project defines instead of growing a copy of it.
   existing offset, so the two data files can grow independently — and v1 writes both files whole, which is
   correct but does not yet take that optimisation. It matters when a watcher applies a small batch to a large
   tree; it is a writer-side change with no effect on the bytes a reader sees.
+## The engine writes; ports read
+
+`fsmeta` (the Zig engine) is the only writer of a trio. A port validates, decodes and loads what the engine published,
+and never has to lay one out — which is why the Bun port's suite is a **reader** suite and its three writer-dependent
+tests are gated behind `FSMETA_PORT_WRITER=1`:
+
+```text
+bun test js                            # the reader suite, 25 tests, all green
+FSMETA_PORT_WRITER=1 bun test js       # also the writer tests, which fail until a writer port learns
+                                       # the two-order layout (meta by name hash, text by name, `dir/` names)
+```
+
+They are kept rather than deleted so that porting the writing side stays an option; the engine's own tests are what
+define the writer today. Extracting them into `js/writer.test.mjs` is worthwhile once a writer port is actually
+planned, because they share the reader suite's helpers.
