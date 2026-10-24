@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "@hrg/fs-meta",
     "version":  "0.3.1",
     "private":  true,
@@ -11,6 +11,6 @@
                     "conformance":  "bun js/conformance.mjs"
                 },
     "dependencies":  {
-                         "@hrg/gitignore":  "0.3.0"
+                         "@hrg/gitignore": "0.3.1"
                      }
 }
