@@ -5,7 +5,7 @@
     "": {
       "name": "@hrg/fs-meta",
       "dependencies": {
-        "@hrg/gitignore": "^0.3.0",
+        "@hrg/gitignore": "0.3.0",
       },
     },
   },
