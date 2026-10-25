@@ -57,7 +57,12 @@ class GitIgnoreFileTest {
         GitIgnoreFile rules = atRoot("out/\n");
         Assertions.assertTrue(rules.decide("out", true).orElseThrow(), "the directory is excluded");
         Assertions.assertFalse(rules.decide("out", false).orElse(false), "a file called out is not");
-        Assertions.assertTrue(rules.decide("out/x.txt", false).orElse(false),
+        // `GitIgnoreFile` is one file's rules, so it cannot answer about an ancestor; the walk's
+        // answer comes from the stack, which knows which directory is excluded — and that is what
+        // git reports for a file inside an excluded directory.
+        GitIgnoreRules stack = new GitIgnoreRules();
+        stack.push(rules);
+        Assertions.assertTrue(stack.isIgnored("out/x.txt", false),
                 "and git reports a file inside an excluded directory as ignored too");
     }
 

@@ -1,6 +1,6 @@
 .{
     .name = .watcher,
-    .version = "0.3.4",
+    .version = "0.3.5",
     .fingerprint = 0xb28fe6ac387cc966,
     .dependencies = .{
         .nightwatch = .{
@@ -8,8 +8,8 @@
             .hash = "nightwatch-1.0.0-uXzeH3sRAwAKA9P88WzhwSDZoDPdnHZLGaJcv_zvWxYu",
         },
         .gitignore = .{
-            .url = "https://github.com/hrgdavor/gitignore/archive/refs/tags/v0.3.3.tar.gz",
-            .hash = "gitignore-0.3.3--BNkLuzHAQA0AoNlkUS9kNp7f0ZzEN_RDOzs-HAwHnL0",
+            .url = "https://github.com/hrgdavor/gitignore/archive/refs/tags/v0.3.4.tar.gz",
+            .hash = "gitignore-0.3.4--BNkLo07AgC_9MjWnyGFPgeIrJVnT7HjqGqcC9PB_ST8",
         },
     },
     .paths = .{""},
