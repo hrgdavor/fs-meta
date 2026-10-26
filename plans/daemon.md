@@ -177,21 +177,42 @@ configuration and host state.
 **Claiming**: `<runtime>/roots/<id>.json` is created with `O_EXCL`, then the pid is written. A record whose pid is not alive
 is stale and reaped. This is what stops two daemons from serving one root.
 
-## 7. Consumer socket: unchanged protocol, one addition
+## 7. Consumer socket: one new frame, and the protocol moves to 0x0101
 
 Consumers keep using [`FORMAT.socket.md`](../FORMAT.socket.md): `HELLO`, `SUBSCRIBE`, `START_BATCH`/`CHANGE_ENTRY`/`END_BATCH`,
-`PING`/`PONG`, and the two refusals. **The daemon adds no semantics to those frames.**
+`PING`/`PONG`, and the two refusals. **The daemon adds no semantics to those frames.** The sleep feature adds exactly one,
+because it creates a question the wire could not ask before: *is this subscribe slow because the root is waking?*
 
-One additive frame is proposed, and it is the only protocol change:
+**There are no deployed clients**, so the protocol is bumped once — `protocol = 0x0101` — and every implementation is updated
+together. No capability bit, no dual-version branch, no "old client sees the same bytes" test: compatibility machinery for a
+client population of zero is complexity that would outlive its reason.
 
-| kind   | name    | payload                                                                           | why |
-| ------ | ------- | --------------------------------------------------------------------------------- | --- |
-| `0x09` | `STATE` | `u8 state` (`0`=off, `1`=asleep, `2`=waking, `3`=watching), `u32 idle_timeout_ms` | a client can tell "slow because waking" from "slow because big"; also what the CLI's diagnostics show |
+| kind   | name    | payload                                                                                          | why |
+| ------ | ------- | ------------------------------------------------------------------------------------------------ | --- |
+| `0x09` | `STATE` | `u8 state`, `u8 reason`, `u32 idle_timeout_ms`, `u64 head_batch`                                 | the client learns a wake is running, who caused it, when the root will sleep, and how far behind it will be |
 
-It rides the existing `protocol` handshake: bump the minor to `0x0101` and gate `STATE` behind a capability bit, so a
-client pinned to `0x0100` still works and simply never receives it. **Decide before implementing**: the alternative is to
-send nothing and let the first batch's latency speak for itself. My recommendation is the frame, because "why is this
-subscribe slow" is the exact question the sleep feature creates.
+`state`: `0` = off, `1` = asleep, `2` = waking, `3` = watching.
+`reason`: `0` = none, `1` = a client subscribed, `2` = idle timeout, `3` = control request, `4` = watcher event.
+`idle_timeout_ms`: the root's current setting, so a client can tell when it will next stop receiving events (`0` = never
+sleeps). `head_batch`: the newest batch the server considers published — a client comparing it with its own last applied batch
+knows whether a wake means "one small diff" or "a long catch-up", without the server estimating anything.
+
+**That is the whole frame.** No progress counters, no percentages, no files-scanned: on the measured workloads thousands of
+files are milliseconds (`doc/measurement.md`), so progress would flicker and then be gone, and it would turn a state
+notification into a telemetry channel that has to be kept honest. Generation numbers are enough to set expectations.
+
+**When it is sent**, always between batches and never inside one (`START_BATCH` … `END_BATCH` is a transaction):
+
+1. immediately after `HELLO`, so a fresh client knows what it joined;
+2. `state = waking` **before** the wake scan's first `START_BATCH` — the case the frame exists for;
+3. on every transition (`waking → watching`, `watching → asleep`, mode changes made through the control socket);
+4. a final `STATE` before the connection is closed on shutdown, so a client stops waiting rather than timing out.
+
+**Why not just let latency speak:** a consumer cannot distinguish "waking, 400 k files" from "big tree, first batch is slow"
+from "server stuck". The frame costs 14 bytes and answers exactly that, once.
+
+**What stays out of it:** the CLI's richer view (files scanned, elapsed, bytes) comes from `root status --json` over the
+control socket. The consumer frame carries state and generation, nothing the server would have to measure under a deadline.
 
 ## 8. Control socket and CLI
 
@@ -325,7 +346,7 @@ and `mvn -q test` for the Java port (which must keep building against the publis
 | ------ | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | **M0** | `paths.zig`, `registry.zig`, `state.zig` + the durable home list + control socket + `daemon start/stop/status` and `roots list`; no watching yet, roots are records only | unit tests; a root added, the daemon stopped and restarted, and the root still listed **without any filesystem search**; a deleted root path shows `missing`; second daemon refuses |
 | **M1** | one root served: `RootRuntime` owns a socket, answers `HELLO`, `SUBSCRIBE`, cold scan and a first batch; `server.zig` refactored into a per-root value | a real client gets a batch; parity with `fsmeta serve` on the same tree |
-| **M2** | the state machine wired: `off`/`always`/`auto`, idle timeout, sleep, wake with scan+diff; `STATE` frame if adopted | the sleep/wake integration tests; `wake` refused on `off` |
+| **M2** | the state machine wired: `off`/`always`/`auto`, idle timeout, sleep, wake with scan+diff; the `STATE` frame in `FORMAT.socket.md`, `protocol` pinned to `0x0101` in all three implementations | the sleep/wake integration tests; a client sees `STATE(waking, reason=client, head_batch)` before the wake batch, `watching` after it, and `asleep` when the idle timeout fires; `wake` refused on `off` |
 | **M3** | multi-root: N sockets, N watchers, add/remove at runtime, reaping | two roots, isolated batches; remove leaves no socket                                                |
 | **M4** | diagnostics: `root status --json`, scan counters, per-root log, `FORMAT.daemon.md` documenting control protocol, registry schema, naming, exit codes | docs reviewed; CLI JSON asserted in tests |
 | **M5** | the split seam exercised: a `child` `RootHost` behind a flag, one root served by a child, the main daemon aggregating | same consumer socket path; `roots list` shows `served_by`; killing the child is reported, not fatal |
@@ -347,8 +368,8 @@ possible. If M5 is dropped, nothing in the design is wasted.
 
 ## 16. Decisions to take in session 1, before coding
 
-1. **`STATE` frame: add it or not?** Recommendation: add (`0x09`, capability-gated). Without it, a slow subscribe is
-   indistinguishable from a slow tree.
+1. **`STATE` frame — decided, not open.** There are no deployed clients, so the protocol is bumped once to `0x0101`, the
+   frame carries state, reason, the idle timeout and the head batch, and there is no capability bit. No progress counters.
 2. **Default idle timeout**: 30 s proposed. Rationale: long enough that a developer's edit-run loop keeps the watcher warm,
    short enough that an abandoned root stops costing a thread.
 3. **`off` roots: bind a socket at all?** Recommendation: yes — `off` means "never watch", not "not served"; a consumer then
@@ -363,6 +384,9 @@ possible. If M5 is dropped, nothing in the design is wasted.
 
 ## 17. Documentation to write as part of the work
 
+- `FORMAT.socket.md` — the `STATE` frame (§ 7): kind `0x09`, the payload fields and their meaning, when it is sent, and the
+  `protocol = 0x0101` pin. This is a consumer-facing change and belongs in the consumer-facing document, not in the daemon
+  one.
 - `FORMAT.daemon.md` — control protocol (JSON lines, versioned), registry record schema, socket naming and base-dir rules,
   exit codes, and the state machine diagram from §5. This is the file a future session reads instead of this plan.
 - `README.md` — a "Daemon" section: what it does, the three modes, the sleep/wake trade-off stated in one paragraph.
