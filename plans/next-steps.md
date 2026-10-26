@@ -115,3 +115,7 @@ this plan keeps open on purpose.
 **G2. The POSIX-only socket assertion (1) — platform guard, no gap.** `test/socket.test.mjs` runs its four replay
 tests on Windows AF_UNIX; only `POSIX: the bound address is a socket node…` is skipped, with the reason "this host
 is win32; an S_ISSOCK node on the bound address is POSIX-only". Linux/macOS CI is what covers it.
+
+## The daemon
+
+A long-lived process that tracks several roots, keeps a Unix socket per root for consumers, and decides when each root is worth watching (`off` / `always` / `auto` with a per-root idle timeout, so a slept root wakes with one full scan and a diff). Planned in [daemon.md](daemon.md); Zig only, and shaped so a root can later be served by its own child daemon without changing the consumer socket.
