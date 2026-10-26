@@ -111,7 +111,12 @@ so an aggregated view can say which roots live where.
 
 ## 6. Paths and naming
 
-**Base directory** (host state, never in the trio):
+**Two directories, and the difference matters.** The **runtime** directory holds sockets and pids: it is ephemeral (a
+tmpfs at `$XDG_RUNTIME_DIR`, cleared at logout) and losing it is normal. The **home** directory holds the list of known
+roots and their configuration: it is durable, it is what makes a restart cheap, and it is the only thing that answers
+"what was I serving?" — see § 6a.
+
+**Runtime base directory** (host state, never in the trio):
 
 | platform                            | directory                   |
 | ----------------------------------- | --------------------------- |
@@ -136,7 +141,40 @@ limited to ~104–108 bytes and a hash is the only way to stay short for deep ro
 *root path*, which is what makes the short name resolvable; this is host state, and the trio itself still never contains an
 absolute path.
 
-**Claiming**: `<base>/roots/<id>.json` is created with `O_EXCL`, then the pid is written. A record whose pid is not alive
+### 6a. The root list lives in the user home, and a restart never searches
+
+**The invariant:** *the daemon never walks the filesystem to discover roots.* On start it reads the list, and the work is
+proportional to the number of recorded roots — one `stat` each to notice a disappeared root, nothing more. A daemon that
+searched for `.git` directories, or re-scanned `$HOME`, would make every restart unbounded and would find roots the user
+never asked for.
+
+| platform                | durable list (home)                  | ephemeral (runtime)          |
+| ----------------------- | ------------------------------------ | ---------------------------- |
+| `$XDG_CONFIG_HOME` set  | `$XDG_CONFIG_HOME/fsmeta/roots.json` | `$XDG_RUNTIME_DIR/fsmeta/`   |
+| otherwise (Linux/macOS) | `~/.config/fsmeta/roots.json`        | `~/.cache/fsmeta/run/`       |
+| Windows                 | `%APPDATA%\fsmeta\roots.json`        | `%LOCALAPPDATA%\fsmeta\run\` |
+
+`roots.json` is one document, written atomically (tmp + rename), holding every root's record from § 9. It is
+*configuration*: a choice about this machine, committed by a person through `fsmeta root add`, and it survives a reboot,
+a crashed daemon and an empty runtime directory. The runtime directory is rebuilt from it on every start.
+
+**Startup sequence, in order:**
+
+1. Read `roots.json`. A missing file is a valid state: no roots, no error.
+2. For each record: `stat` the root path. Present → create its runtime entry and bind its socket. Missing → the root
+   becomes `state = missing`, is reported by `roots list`, and is **not** silently dropped; `--prune` removes it.
+3. Only then bind the control socket and answer `status`, so a CLI never sees a half-loaded daemon.
+
+**Why a single file, not a directory of files:** the list is small (tens of roots), read once at start, written on every
+mutation; one atomic rename is easier to reason about than N files plus a directory scan — and a directory scan on a
+network home can be slow. If it ever grows past a few hundred roots, per-root files in `~/.config/fsmeta/roots/` are the
+documented alternative, read by `readdir` once (still not a filesystem search).
+
+**What is *not* in the user home:** sockets, pids, runtime state, per-root logs. Those are facts about a running process on
+one machine, and they belong in the runtime directory — the same distinction the jcodebuddy webview rules draw between
+configuration and host state.
+
+**Claiming**: `<runtime>/roots/<id>.json` is created with `O_EXCL`, then the pid is written. A record whose pid is not alive
 is stale and reaped. This is what stops two daemons from serving one root.
 
 ## 7. Consumer socket: unchanged protocol, one addition
@@ -194,7 +232,8 @@ Durations accept `500ms`, `30s`, `10m`, `0`.
 
 ## 9. Configuration
 
-Per-root config lives **in the registry**, not in the trio and not in a project's `.jcodebuddy`-style directory: it is a
+Per-root config lives **in the durable list in the user home** (§ 6a), not in the trio and not in a project's
+`.jcodebuddy`-style directory: it is a
 choice about this machine's daemon, not about the tree's contents. The record is the source of truth; CLI commands mutate
 it and the daemon writes it back atomically (write `<id>.json.tmp`, rename).
 
@@ -230,7 +269,8 @@ message naming the root instead of a hang; the root moves to `off` and the CLI s
 
 ## 11. Lifecycle, crash safety and reaping
 
-- **Start**: read `<base>/daemon.json`; if a live daemon holds it, refuse and say so. Reap stale `roots/*.json`
+- **Start**: read `roots.json` from the home directory (§ 6a) and the runtime `daemon.json`; if a live daemon holds the
+  runtime, refuse and say so. Reap stale `roots/*.json`
   (pid dead) and `*.sock` files with no live listener. Bind `daemon.sock` after unlinking a stale one.
 - **Stop**: publish a final `END_BATCH` to subscribers, close watchers, unlink sockets, remove `daemon.json`, exit `0`.
   `SIGTERM` and `SIGINT` take the same path; a `--force` second signal exits immediately.
@@ -283,7 +323,7 @@ and `mvn -q test` for the Java port (which must keep building against the publis
 
 | #      | deliverable                                                       | gate                                                                                                |
 | ------ | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| **M0** | `paths.zig`, `registry.zig`, `state.zig` + control socket + `daemon start/stop/status` and `roots list`; no watching yet, roots are records only | unit tests; CLI lists what was added; second daemon refuses |
+| **M0** | `paths.zig`, `registry.zig`, `state.zig` + the durable home list + control socket + `daemon start/stop/status` and `roots list`; no watching yet, roots are records only | unit tests; a root added, the daemon stopped and restarted, and the root still listed **without any filesystem search**; a deleted root path shows `missing`; second daemon refuses |
 | **M1** | one root served: `RootRuntime` owns a socket, answers `HELLO`, `SUBSCRIBE`, cold scan and a first batch; `server.zig` refactored into a per-root value | a real client gets a batch; parity with `fsmeta serve` on the same tree |
 | **M2** | the state machine wired: `off`/`always`/`auto`, idle timeout, sleep, wake with scan+diff; `STATE` frame if adopted | the sleep/wake integration tests; `wake` refused on `off` |
 | **M3** | multi-root: N sockets, N watchers, add/remove at runtime, reaping | two roots, isolated batches; remove leaves no socket                                                |
@@ -297,6 +337,7 @@ possible. If M5 is dropped, nothing in the design is wasted.
 
 | risk                                        | mitigation                                                                                        |
 | ------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| runtime dir cleared at logout/reboot        | the root list is in the user home (§ 6a); start rebuilds sockets from it, and a missing runtime directory is a normal first start |
 | AF_UNIX path limit on deep roots            | hashed `<id>.sock` (13 chars) under a short base dir; asserted in a path test                     |
 | a sleeping root's wake scan is expensive    | it is *one* scan, and it is what the user asked for; expose the cost in `--json` (files, bytes, ms) so it can be tuned via `idle` |
 | two daemons serving one root                | `O_EXCL` claim file + pid liveness; test it                                                       |
@@ -315,12 +356,18 @@ possible. If M5 is dropped, nothing in the design is wasted.
 4. **Where the base dir lives on Windows**: `%LOCALAPPDATA%\fsmeta\run` proposed; the format's own docs stay platform-neutral.
 5. **Does `root remove` delete the root's published batches?** Recommendation: no. They are the tree's data, not the
    daemon's.
+6. **One `roots.json` or per-root files in the home?** Recommendation: one file (§ 6a) until a few hundred roots, then
+   `roots/` read once by `readdir` — either way, never a filesystem search.
+7. **What happens to a root whose path disappears?** Recommendation: `state = missing` in `roots list`, no socket, no
+   scan, removed only by an explicit `remove` or `--prune` — never silently forgotten.
 
 ## 17. Documentation to write as part of the work
 
 - `FORMAT.daemon.md` — control protocol (JSON lines, versioned), registry record schema, socket naming and base-dir rules,
   exit codes, and the state machine diagram from §5. This is the file a future session reads instead of this plan.
 - `README.md` — a "Daemon" section: what it does, the three modes, the sleep/wake trade-off stated in one paragraph.
+- `FORMAT.daemon.md` must document the durable home list alongside the runtime layout: which file is configuration,
+  which is host state, and the startup sequence that reads the former to rebuild the latter.
 - `AGENTS.md` — one line under the invariants: **the registry, socket paths and pids are host state, never trio content**;
   the trio still contains no absolute path.
 - `doc/performance.md` or a note in `plans/next-steps.md` — the wake-scan cost, once measured, so the idle default has
