@@ -377,6 +377,9 @@ and `mvn -q test` for the Java port (which must keep building against the publis
 | **M4** | diagnostics: `root status --json`, scan counters, per-root log, `FORMAT.daemon.md` documenting control protocol, registry schema, naming, exit codes | docs reviewed; CLI JSON asserted in tests |
 | **M5** | the split seam exercised: a `child` `RootHost` behind a flag, one root served by a child, the main daemon aggregating | same consumer socket path; `roots list` shows `served_by`; killing the child is reported, not fatal |
 
+**Before M5: brainstorm nested roots in § 16a.** It is the one area the plan allows but does not settle, and the discussion needs
+M4's diagnostics to be worth having.
+
 M5 is deliberately last and optional: the point of M0–M4 is that it is *possible*, and the interface in §4 is what makes it
 possible. If M5 is dropped, nothing in the design is wasted.
 
@@ -411,10 +414,53 @@ Answered on 2026-10-26; a new session implements these rather than re-opening th
 
 **Two things this plan still leaves to the implementer, deliberately:**
 
-- **Nested roots** (a root inside another root) are allowed and documented, not refused: a monorepo and one of its packages are
-  a legitimate pair of roots, and the cost of two watchers is the user's to pay. No deduplication of events across roots.
+- **Nested roots** are **allowed for now** (a monorepo and one of its packages are a legitimate pair, and the cost of two
+  watchers is the user's to pay) and **deferred as a topic**: they are brainstormed at the end of the milestone work, in § 16a,
+  before the split and before anyone treats the current behaviour as a contract.
 - **Root-level config vs daemon config** is settled by § 9a: a global `defaults` block plus per-root records, and adding a root
   copies the current defaults, so a later change to a default never silently mutates an existing root.
+
+### 16a. Deferred: nested roots (brainstorm after M4, before M5)
+
+Allowed today, not settled. This section exists so the discussion happens deliberately — at the end of the milestone work,
+with all the measurements and the real CLI in hand — instead of being decided by whoever writes the add path.
+
+**Why it is not obvious.** Two roots, one inside the other, mean two watchers over overlapping trees. Everything that is
+cheap and correct for one root becomes a question for two:
+
+| question                    | today's behaviour                                                      | what needs deciding                                                               |
+| --------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| duplicate events            | the parent's watcher and the child's both fire for a file in the child | share a watcher and fan out, or accept duplicates and document it?                |
+| wake cost                   | each root scans its own tree, so the child's files are scanned twice   | skip a parent's subtree that is itself a root, or scan everything for simplicity? |
+| retention                   | two independent generation histories over overlapping content          | leave them independent (current), or let a child inherit/alias the parent's?      |
+| ignoring                    | the parent's `.gitignore` chain and the child's differ legitimately    | a child is its own chain — confirm rather than assume                             |
+| socket identity             | two sockets, two ids, both derived from their own paths                | does a consumer that knows both need a way to say "same tree"?                    |
+| per-root daemon split (§ 4) | two roots could be served by two children                              | is a nested pair a good first candidate for the split, or the worst?              |
+
+**What to bring to the brainstorm**, so it is not a matter of taste:
+
+1. the measured wake-scan cost of a root and of a nested pair (M4 exposes files/bytes/ms per root);
+2. whether duplicate events actually arrive in practice — a small experiment with a parent and child watcher on one tree,
+   counting duplicates per edit — before designing dedup;
+3. the retention numbers from § 9a: what a nested pair costs on disk versus a single root;
+4. one real example of the user's own usage (a monorepo plus a package is the motivating case).
+
+**Options to weigh, not to pick now:**
+
+- **A. Keep it simple:** allow nesting, document duplicate events, no dedup, no scan skipping. Everything works; some work is
+  duplicated.
+- **B. Detect and warn at add time:** `root add` notices the path is inside an existing root (or contains one) and prints what
+  the cost will be, then proceeds. Cheap, no semantics change, and it teaches the user the trade-off.
+- **C. Share a watcher:** one watcher on the outermost root, events filtered per root by path prefix. Efficient, but couples the
+  roots' lifetimes — the parent cannot sleep while the child is watching, which contradicts the per-root idle model.
+- **D. Prune child subtrees from the parent's scan:** less duplicate scanning, but the parent's generation then no longer
+  describes its whole tree, which breaks the trio's meaning.
+
+My expectation, to be tested rather than assumed: **B now, A as the semantics**, with C only if duplicate events prove
+expensive — and D rejected, because a generation that skips part of its tree is not a state description.
+
+**Output of the brainstorm:** a short decision note appended here (chosen option, the measurements behind it, and what the code
+already guarantees), and — if B is chosen — one paragraph in `README.md` under the daemon section. Then M5.
 
 ## 17. Documentation to write as part of the work
 
