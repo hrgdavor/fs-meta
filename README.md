@@ -221,10 +221,10 @@ planned, because they share the reader suite's helpers.
 
 | language   | coordinate               | resolved from                               |
 | ---------- | ------------------------ | ------------------------------------------- |
-| Zig        | `gitignore` v0.3.4       | `build.zig.zon`, the tagged tarball         |
-| Java       | `hr.hrg:gitignore:0.3.4` | **Maven Central** — no local install needed |
-| JavaScript | `@hrg/gitignore@0.3.4`   | **npm**                                     |
+| Zig        | `gitignore` v0.3.5       | `build.zig.zon`, the tagged tarball         |
+| Java       | `hr.hrg:gitignore:0.3.5` | **Maven Central** — no local install needed |
+| JavaScript | `@hrg/gitignore@0.3.5`   | **npm**                                     |
 
 The Java artifact was verified the way a fresh machine would use it: the local copy was deleted and
-`mvn dependency:get -Dartifact=hr.hrg:gitignore:0.3.4` repopulated it from Central, then the test suite ran against that
+`mvn dependency:get -Dartifact=hr.hrg:gitignore:0.3.5` repopulated it from Central, then the test suite ran against that
 copy. Nothing here needs a checkout of the `gitignore` repository.
