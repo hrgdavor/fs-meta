@@ -230,7 +230,8 @@ fsmeta daemon start [--base <dir>] [--foreground]     # daemonize by default; --
 fsmeta daemon stop                                    # asks politely, then reports
 fsmeta daemon status [--json]                         # pid, base dir, roots count, uptime
 fsmeta roots list [--json] [--state watching,asleep]  # per root: id, path, mode, state, clients, idle timeout
-fsmeta root add <path> [--mode off|always|auto] [--idle 30s] [--retention 32]
+fsmeta root add <path> [--mode off|always|auto] [--idle 5m] [--keep-batches 32] [--max-bytes 64M]
+                     [--on-remove keep|delete]
 fsmeta root remove <id|path> [--force]
 fsmeta root set <id> mode off|always|auto
 fsmeta root set <id> idle <duration>                  # 0 = never sleep
@@ -263,16 +264,41 @@ it and the daemon writes it back atomically (write `<id>.json.tmp`, rename).
   "id": "a1b2c3d4",
   "root": "/home/u/projects/app",
   "mode": "auto",
-  "idle_timeout_ms": 30000,
-  "retention": 32,
+  "idle_timeout_ms": 300000,
+  "retention": { "max_batches": 32, "max_bytes": 67108864 },
+  "on_remove": "keep",
   "socket": "/run/user/1000/fsmeta/roots/a1b2c3d4.sock",
   "served_by": "inproc",
   "created_at": "2026-10-26T06:50:00Z"
 }
 ```
 
-Defaults: `mode = auto`, `idle_timeout_ms = 30000`, `retention = 32` (the format's documented default). The daemon reads
+Defaults: `mode = auto`, `idle_timeout_ms = 300000` (five minutes — long enough that a working session never wakes, short enough
+that an abandoned root stops costing a watcher), `retention = { max_batches: 32, max_bytes: 64 MiB }`, `on_remove = keep`.
+Every one of those is a global default in the daemon's own config, overridable per root. The daemon reads
 the files on start; a malformed record is reported and skipped, not fatal to the other roots.
+
+### 9a. Retention and removal are per-root policy
+
+A root's batches are bounded by **two** limits, not one, because either alone is a poor ceiling:
+
+| limit                   | what it prevents                                            | default |
+| ----------------------- | ----------------------------------------------------------- | ------- |
+| `retention.max_batches` | unbounded generation count (the format's own default is 32) | 32      |
+| `retention.max_bytes`   | 32 generations of a huge tree filling the disk              | 64 MiB  |
+
+After every publish the daemon rotates oldest-first until **both** hold — the same order the format already requires (rename to
+`.trash-<id>`, then delete), so a reader never sees a half-removed generation. A batch that alone exceeds `max_bytes` is
+kept anyway: refusing to write it would break the commit that just happened, and one oversized generation is better than a
+missing one. The CLI reports both current values and what rotation removed, so the trade-off is visible rather than silent.
+
+**Removal is its own choice**, because "stop serving" and "delete my history" are different intents:
+
+- `on_remove = keep` (default) — the socket, record and log go; the batches stay, so a later `root add` resumes from history.
+- `on_remove = delete` — the daemon also removes the generations, honouring the same two limits as a final rotation.
+
+Global defaults live in the daemon's config (`{ "defaults": { "idle_timeout_ms": …, "mode": …, "retention": {…}, "on_remove": … } }`)
+and are copied into a root's record when it is added, so changing a global default never silently changes an existing root.
 
 ## 10. The wake path, precisely
 
@@ -347,7 +373,7 @@ and `mvn -q test` for the Java port (which must keep building against the publis
 | **M0** | `paths.zig`, `registry.zig`, `state.zig` + the durable home list + control socket + `daemon start/stop/status` and `roots list`; no watching yet, roots are records only | unit tests; a root added, the daemon stopped and restarted, and the root still listed **without any filesystem search**; a deleted root path shows `missing`; second daemon refuses |
 | **M1** | one root served: `RootRuntime` owns a socket, answers `HELLO`, `SUBSCRIBE`, cold scan and a first batch; `server.zig` refactored into a per-root value | a real client gets a batch; parity with `fsmeta serve` on the same tree |
 | **M2** | the state machine wired: `off`/`always`/`auto`, idle timeout, sleep, wake with scan+diff; the `STATE` frame in `FORMAT.socket.md`, `protocol` pinned to `0x0101` in all three implementations | the sleep/wake integration tests; a client sees `STATE(waking, reason=client, head_batch)` before the wake batch, `watching` after it, and `asleep` when the idle timeout fires; `wake` refused on `off` |
-| **M3** | multi-root: N sockets, N watchers, add/remove at runtime, reaping | two roots, isolated batches; remove leaves no socket                                                |
+| **M3** | multi-root: N sockets, N watchers, add/remove at runtime, reaping; retention enforcement by count **and** bytes with per-root overrides of the global defaults | two roots, isolated batches; remove leaves no socket; a small `max_bytes` rotates early and the reported numbers match; `on_remove=delete` removes generations, `keep` leaves them |
 | **M4** | diagnostics: `root status --json`, scan counters, per-root log, `FORMAT.daemon.md` documenting control protocol, registry schema, naming, exit codes | docs reviewed; CLI JSON asserted in tests |
 | **M5** | the split seam exercised: a `child` `RootHost` behind a flag, one root served by a child, the main daemon aggregating | same consumer socket path; `roots list` shows `served_by`; killing the child is reported, not fatal |
 
@@ -366,21 +392,29 @@ possible. If M5 is dropped, nothing in the design is wasted.
 | Zig 0.17 API drift for sockets/watch        | all socket code stays behind `wire.zig`/`server.zig`; the daemon never calls `std.posix` directly |
 | `STATE` frame breaks an old client          | capability bit + minor bump; a `0x0100` client never sees it                                      |
 
-## 16. Decisions to take in session 1, before coding
+## 16. Decisions taken before implementation
 
-1. **`STATE` frame — decided, not open.** There are no deployed clients, so the protocol is bumped once to `0x0101`, the
-   frame carries state, reason, the idle timeout and the head batch, and there is no capability bit. No progress counters.
-2. **Default idle timeout**: 30 s proposed. Rationale: long enough that a developer's edit-run loop keeps the watcher warm,
-   short enough that an abandoned root stops costing a thread.
-3. **`off` roots: bind a socket at all?** Recommendation: yes — `off` means "never watch", not "not served"; a consumer then
-   gets a scan-based answer and the CLI reports `state=off`, which is more useful than `ENOENT`.
-4. **Where the base dir lives on Windows**: `%LOCALAPPDATA%\fsmeta\run` proposed; the format's own docs stay platform-neutral.
-5. **Does `root remove` delete the root's published batches?** Recommendation: no. They are the tree's data, not the
-   daemon's.
-6. **One `roots.json` or per-root files in the home?** Recommendation: one file (§ 6a) until a few hundred roots, then
-   `roots/` read once by `readdir` — either way, never a filesystem search.
-7. **What happens to a root whose path disappears?** Recommendation: `state = missing` in `roots list`, no socket, no
-   scan, removed only by an explicit `remove` or `--prune` — never silently forgotten.
+Answered on 2026-10-26; a new session implements these rather than re-opening them.
+
+| #   | question                    | decision                                                                            |
+| --- | --------------------------- | ----------------------------------------------------------------------------------- |
+| 1   | `STATE` frame?              | **Yes** — `0x09`, `protocol = 0x0101`, no capability gating (no deployed clients), state + reason + idle timeout + head batch, no progress counters (§ 7) |
+| 2   | default idle timeout        | **5 minutes** (`300000`), per-root overridable; `0` = never sleep                   |
+| 3   | does `off` bind a socket?   | **Yes** — `off` means never *watch*, not never *serve*; the socket answers from a scan and reports `state=off` |
+| 4   | `root remove` and batches   | **Per-root policy** (`on_remove`): `keep` by default, `delete` on request; retention is bounded by **both** `max_batches` and `max_bytes`, per root, defaulted globally (§ 9a) |
+| 5   | durable root list           | **One `roots.json`** in the user home, written atomically (§ 6a)                    |
+| 6   | vanished root               | **`state = missing`**, reported, removed only by explicit `remove`/`--prune`        |
+| 7   | Windows detaching           | **Spawn itself detached** (`DETACHED_PROCESS`, no console) with a pid file; `--foreground` for tests |
+| 8   | unknown root on `SUBSCRIBE` | **Refuse** with `ERROR` naming `fsmeta root add`; no implicit registration          |
+| 9   | two writers for one root    | **The daemon owns it**; a CLI publish refuses with a message pointing at the daemon |
+| 10  | wake diff of 80 000 entries | **Normal batching** — a chain of hex-numbered batches, no special case              |
+
+**Two things this plan still leaves to the implementer, deliberately:**
+
+- **Nested roots** (a root inside another root) are allowed and documented, not refused: a monorepo and one of its packages are
+  a legitimate pair of roots, and the cost of two watchers is the user's to pay. No deduplication of events across roots.
+- **Root-level config vs daemon config** is settled by § 9a: a global `defaults` block plus per-root records, and adding a root
+  copies the current defaults, so a later change to a default never silently mutates an existing root.
 
 ## 17. Documentation to write as part of the work
 
