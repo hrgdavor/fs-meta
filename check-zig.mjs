@@ -42,7 +42,7 @@ export function requireZig(explicit) {
   }
   const majorMinor = found.version.split(".").slice(0, 2).join(".");
   if (majorMinor !== REQUIRED) {
-    console.error(`unsupported Zig ${found.version} at ${found.path} — this project requires ${REQUIRED}`);
+    console.error(`unsupported Zig ${found.version} at ${found.path} — fs-meta requires ${REQUIRED}`);
     console.error(`use ${RECORDED}, or set ZIG to a Zig ${REQUIRED} binary`);
     process.exit(1);
   }
