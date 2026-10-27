@@ -1,7 +1,8 @@
 # Next steps — fs-meta
 
-Runnable plan, in order, **after** the `gitignore` extraction. The first section is what the move changed and how to
-keep it in sync; the second is the work that was already planned and is unaffected; the third is the ports.
+Status and remaining plan for `fs-meta`, in the order the work happened. The sections below are kept as the record:
+A–E and J are **done** (with their acceptance evidence), § F is the one deliberate open decision, and § K names what is
+actually left. G counts the platform skips, H is a fixed defect's history, and I records two decisions about output.
 
 Toolchain: `D:\wrk\zig\17\zig.exe` (0.17). Gate:
 
@@ -11,11 +12,13 @@ D:\wrk\zig\17\zig.exe build test --cache-dir .zig-cache\local --summary all
 ```
 
 Today: **50/50 steps, 755/763 tests** (8 skipped — **two** platform guards, each counted in four test binaries; see
-§ G). The jump from 40/41 steps is the worktrees plan ([`worktrees.md`](worktrees.md)): it added `boundary`,
-`gitdir`, `ignores`, `nesting` and `seed` as modules, the daemon's `gitwatch`/`hooks`, and their tests.
+§ G). The growth from the 40 steps / 431 tests this file used to record is the daemon and the worktrees plan
+([`worktrees.md`](worktrees.md)): the latter added `boundary`, `gitdir`, `ignores`, `nesting` and `seed` as modules,
+the daemon's `gitwatch`/`hooks`, and their tests.
 
-The Bun gate (`bun test`, which runs `js/` and `test/`) is **130 pass, 4 skip, 0 fail** across 134 tests: three
-writer-scope tests (§ G1), one POSIX-only socket assertion (§ G2), and the suites the daemon and worktrees work added
+The Bun gate (`bun test`, which runs `js/` and `test/`) is **130 pass, 5 skip, 0 fail** across 135 tests: three
+writer-scope tests (§ G1), one POSIX-only socket assertion (§ G2), one Linux-only watch-bound measurement (§ G3, new
+with the worktrees plan), and the suites the daemon and worktrees work added
 (`test/daemon.test.mjs`, `test/daemon-parity.test.mjs`, `test/query-cli.test.mjs`, `test/ignored-cli.test.mjs`).
 
 **Status of the sections below, verified against the code:** A (the gitignore move) is done — the dependency is a
@@ -25,21 +28,23 @@ D (the socket server, live included) is done — `fsmeta serve`, `test/socket.te
 matchers on the vendored vectors) are done; **J (the worktrees plan) is done** — M0–M7 plus the gap-closure batch.
 **F remains deliberately open**, § H was a real defect and is fixed, and § I records two small warts.
 
-## A. Sync with the gitignore move
+## A. Sync with the gitignore move (done)
 
-**A1. Keep the dependency sane until it is published.**
+**A1. The dependency is published and pinned (done).**
 
-- `fs-meta/build.zig.zon` has `.gitignore = .{ .path = "../gitignore" }` — a **path dependency**, so the two projects
-  must stay in the same checkout until the matcher is tagged.
+- `fs-meta/build.zig.zon` pins `.gitignore` to `github.com/hrgdavor/gitignore` tag **v0.3.5** by URL and hash, and
+  `nightwatch` the same way; there is no `../gitignore` path left, so the two projects no longer have to share a
+  checkout.
 - `fs-meta/build.zig` mounts the dependency's files as modules **under their file names**
-  (`gitignore.zig`, `ignore.zig`) via `basis_imports`, which is why no `@import` in `fs-meta` changed. If the
-  dependency is ever restructured, this is the one place to edit.
-- When `gitignore` publishes: replace the path with a version range, delete `../gitignore` from the build's reach, and
-  re-run the gate. Acceptance: same test count, no path reference left (`grep -r "\.\./gitignore" fs-meta`).
+  (`gitignore.zig`, `ignore.zig`), which is why no `@import` in `fs-meta` changed. If the dependency is ever
+  restructured, this is the one place to edit.
+- A version bump means editing the URL and hash in `build.zig.zon`, then re-running the gate: same test count, no path
+  reference left (`grep -r "\.\./gitignore" fs-meta`).
 
-**A2. Do not re-add the moved files.** `.gitignore` parsing, the chain and `globMatch` live in
-[`../../gitignore/`](../../gitignore/README.md); a change to matching behaviour belongs there, with a vector and a bench row,
-not in `fs-meta`. The practical test: if a change needs `src/gitignore.zig`, it is a change to the other project.
+**A2. Do not re-add the moved files.** `.gitignore` parsing, the chain and `globMatch` live in the
+[`gitignore` project](https://github.com/hrgdavor/gitignore) (pinned as an artifact, v0.3.5); a change to matching
+behaviour belongs there, with a vector and a bench row, not in `fs-meta`. The practical test: if a change needs
+`src/gitignore.zig`, it is a change to the other project.
 
 **A3. Measure through the other project from now on.** `fs-meta`'s own numbers (`doc/benchmark.md`,
 `doc/gitignore-and-optimisations.md`) now describe a matcher it does not own; when the matcher changes, the numbers are
@@ -61,26 +66,32 @@ live path). Summary of what landed:
 - **B4 (done).** Gate green, and on a scratch tree `files.txt` is name-ordered with slashed directories while
   `files.json` carries `roots`.
 
-## C. The batches' consumer entry point
+## C. The batches' consumer entry point (done)
 
-- **C1.** `fsmeta reconcile <dir> --from N [--to M] [--format json|lines] [--baseline <file>]`:
-  read the main trio's `generation`, `batch.decode` each `batches/<g>` for `g` in `N+1..=M`, `batch.toEvents`,
-  `reconcile.collapse` with the optional baseline, print `+`/`~`/`-` lines or the JSON.
-- **C2.** The two refusals: `batch-gap` (a missing generation in the range) and `batch-too-old` (`--from` below the
-  oldest retained batch). Both are named in `FORMAT.md` § 17.5 and neither may fall back to a partial reconcile.
-- **C3.** Acceptance: a two-change scratch tree, `reconcile --from 1` returns exactly the added file; `--from 0` returns
-  the whole tree as added (a first sync), and the same window with a baseline returns no changes.
+- **C1 (done).** `fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]` reads the main trio's
+  `generation`, `batch.decode`s each `batches/<g>` for `g` in `from+1..=to`, calls `batch.toEvents`, collapses with
+  the optional baseline, and prints `+`/`~`/`-` lines or the JSON. (`merge` is the deprecated alias; there is no
+  `--from`/`--to`/`--format` — those were the design sketch, the CLI settled on positional bounds plus `--json`.)
+- **C2 (done).** The two refusals are implemented: `batch-gap` (a missing generation in the range) and `batch-too-old`
+  (`from` below the oldest retained batch). Both are named in `FORMAT.md` § 17.5 and neither falls back to a partial
+  reconcile.
+- **C3 (done).** Covered by `test/reconcile.test.mjs`: a two-change scratch tree, `reconcile 1` returns exactly the
+  added file; `0` returns the whole tree as added (a first sync), and the same window with a baseline returns no
+  changes.
 
-## D. The socket server
+## D. The socket server (done)
 
-`FORMAT.socket.md` and `src/wire.zig` define the bytes; the missing piece is the transport.
+`FORMAT.socket.md` and `src/wire.zig` define the bytes; `src/server.zig` is the transport, and `fsmeta serve` is the
+command. What exists:
 
-- **D1.** Accept on a unix socket, exchange `HELLO` both directions at once, check it with `wire.checkHello`.
-- **D2.** `SUBSCRIBE{from}` → for each generation, `batch.decode` + `writeChangeEntry` per entry + `END_BATCH`; the
-  two `ERROR`s are `batch-too-old` and `batch-gap`.
-- **D3.** The live path: a pass that publishes generation `g` sends the same three message kinds to subscribers sitting
-  at `g-1`.
-- **D4.** Acceptance: a client written in Bun (or curl-like) receives a replay identical to reading the batch folder.
+- **D1 (done).** Accepts on a Unix socket and exchanges `HELLO` both directions at once, checked with
+  `wire.checkHello`.
+- **D2 (done).** `SUBSCRIBE{from}` replays each generation as `START_BATCH` + `CHANGE_ENTRY`* + `END_BATCH`; the two
+  `ERROR`s are `batch-too-old` and `batch-gap`.
+- **D3 (done).** The live path sends the same three message kinds to subscribers at `g-1`; the daemon adds `STATE` and
+  (under `gitwatch`) `GIT_EVENT` between batches.
+- **D4 (done).** `test/socket.test.mjs` asserts a Bun client's replay is identical to reading the batch folder; the
+  daemon's consumer path is covered by `test/daemon.test.mjs`.
 
 ## E. Ports — done
 
@@ -128,6 +139,12 @@ this plan keeps open on purpose.
 **G2. The POSIX-only socket assertion (1) — platform guard, no gap.** `test/socket.test.mjs` runs its four replay
 tests on Windows AF_UNIX; only `POSIX: the bound address is a socket node…` is skipped, with the reason "this host
 is win32; an S_ISSOCK node on the bound address is POSIX-only". Linux/macOS CI is what covers it.
+
+**G3. The Linux watch-bound measurement (1) — platform guard, no gap.** `test/watch-bound.test.mjs` asserts that
+both watcher arms register only what they may watch, using a repository with 120 `objects/` directories, a linked
+worktree and a 40-directory nested clone. A per-directory count only exists on inotify/kqueue, so on Windows (one
+recursive registration) the test skips with its reason; Linux CI produces the number
+([`worktrees.md`](worktrees.md) § 5b).
 
 ## The daemon
 

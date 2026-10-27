@@ -27,8 +27,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The matcher and the chain come from the sibling `gitignore` project. They are mounted under their file
-    // names, so every `@import("gitignore.zig")` in this tree keeps working: the move is build-level.
+    // The matcher and the chain come from the pinned `gitignore` dependency (v0.3.5 in build.zig.zon), not from a
+    // sibling checkout. They are mounted under their file names, so every `@import("gitignore.zig")` in this tree
+    // keeps working: the move is build-level.
     const gitignore_dep = b.dependency("gitignore", .{ .target = target, .optimize = optimize });
     const gitignore_module = b.createModule(.{
         .root_source_file = gitignore_dep.path("src/gitignore.zig"),
