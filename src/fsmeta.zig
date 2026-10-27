@@ -35,6 +35,7 @@ const boundary_mod = @import("boundary.zig");
 const gitdir = @import("gitdir.zig");
 const ignores = @import("ignores.zig");
 const daemon_cli = @import("daemon/cli.zig");
+const socutil = @import("socutil");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -57,8 +58,9 @@ const usage =
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   deprecated: an alias of reconcile, kept for scripts
-    \\  fsmeta serve   <root> [--live]
-    \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md
+    \\  fsmeta serve   <root> [--live] [--http]
+    \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md;
+    \\                               --http also exposes an optional HTTP endpoint via the socutil library (port 8765)
     \\  fsmeta daemon  start [--base <dir>] [--foreground]
     \\  fsmeta daemon  stop | status [--json]
     \\                               the background daemon: one socket per root, sleep and wake (FORMAT.daemon.md)
@@ -72,6 +74,7 @@ const usage =
     \\  --updated <ISO-8601>         the pass timestamp; the engine has no clock of its own
     \\  --per-file                   naive listing (stat per entry) instead of the batched one
     \\  --live                       serve: keep subscribers connected and publish a pass every 250 ms
+    \\  --http                       serve: also expose an HTTP endpoint via the socutil library (port 8765)
     \\  --stats                      print where the pass spent its time
     \\  --since <timestamp>          mtime filter for glob (ISO-8601 or relative: 1h, 30m, 2d)
     \\  --keep-batches <n>           how many generations of batch history to retain (default 32)
@@ -111,6 +114,7 @@ pub fn main(init: std.process.Init) !void {
     var json_output = false;
     var baseline_root: ?[]const u8 = null;
     var live = false;
+    var http_port: ?u16 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--no-gitignore")) {
             respect_gitignore = false;
@@ -141,6 +145,11 @@ pub fn main(init: std.process.Init) !void {
             options.keep_batches = std.fmt.parseInt(usize, value, 10) catch return fail(io, gpa, "--keep-batches needs a count");
         } else if (std.mem.eql(u8, arg, "--live")) {
             live = true;
+        } else if (std.mem.eql(u8, arg, "--http")) {
+            // The HTTP endpoint belongs to `serve` alone. Parsed globally, `refresh --http` would be accepted and
+            // do nothing, so refuse it for every other command rather than ignore it.
+            if (!std.mem.eql(u8, command, "serve")) return fail(io, gpa, "--http is only valid for the serve command");
+            http_port = 8765;
         } else if (arg.len > 0 and arg[0] == '-') {
             return fail(io, gpa, "unknown option");
         } else if (root == null) {
@@ -225,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
         // user gave the command (`--hash`, `--no-gitignore`, `--per-file`).
         options.respect_gitignore = respect_gitignore;
         options.hash_mode = hash_mode;
-        return runServe(io, arena, gpa, target, options, live);
+        return runServe(io, arena, gpa, target, options, live, http_port);
     }
     return fail(io, gpa, "unknown command");
 }
@@ -238,6 +247,10 @@ pub fn main(init: std.process.Init) !void {
 /// With `live`, the server also publishes: it runs one `engine.refresh` pass every
 /// `server.poll_interval_ms` and streams each new batch to the clients that are already connected. The
 /// pass is the engine's, not the server's — `serve` calls it and never writes a batch itself.
+///
+/// With `http_port`, the server also exposes an optional HTTP endpoint via the socutil library: a browser
+/// UI that can connect to the fs-meta unix socket and relay bytes. The HTTP server runs in its own thread
+/// with its own I/O context, so it does not interfere with the unix socket server's I/O.
 fn runServe(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -245,6 +258,7 @@ fn runServe(
     root: []const u8,
     options: engine.Options,
     live: bool,
+    http_port: ?u16,
 ) !void {
     var cache = loadCache(arena, io, root) catch |err| {
         const message = switch (err) {
@@ -256,7 +270,36 @@ fn runServe(
     };
     defer cache.deinit();
     const live_options: ?server.LiveOptions = if (live) .{ .engine = options } else null;
+
+    // The optional HTTP endpoint: a socutil server that exposes the fs-meta unix socket through a browser
+    // UI. It runs in its own thread with its own I/O context, so it does not share the unix socket server's
+    // I/O. The socket directory is `<root>/.fs-meta`, which is where the fs-meta socket lives.
+    if (http_port) |port| {
+        const socket_dir = try std.fmt.allocPrint(arena, "{s}/.fs-meta", .{root});
+        // The list is kept by the HTTP thread for the life of the process, so it belongs to the arena that
+        // outlives this function rather than to an untracked gpa allocation.
+        var dirs = try std.ArrayList(socutil.sockets.Dir).initCapacity(arena, 1);
+        try dirs.append(arena, .{ .path = socket_dir, .name = "fs-meta" });
+        const config = socutil.Config{
+            .port = port,
+            .dirs = dirs,
+        };
+        _ = std.Thread.spawn(.{}, httpThread, .{ gpa, config }) catch {
+            std.debug.print("fsmeta: cannot start the HTTP thread\n", .{});
+        };
+    }
+
     return server.run(io, arena, root, &cache, live_options);
+}
+
+/// The HTTP server thread: creates its own I/O context and runs the socutil HTTP server.
+fn httpThread(gpa: std.mem.Allocator, config: socutil.Config) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    socutil.run(io, gpa, config) catch |err| {
+        std.debug.print("fsmeta: HTTP server error: {s}\n", .{@errorName(err)});
+    };
 }
 
 /// Load the trio, run a match/glob query, and print one line per match (or a JSON array with --json).

@@ -49,10 +49,16 @@ pub fn build(b: *std.Build) void {
     const nightwatch_dep = b.dependency("nightwatch", .{ .target = target, .optimize = optimize });
     const nightwatch_module = nightwatch_dep.module("nightwatch");
 
+    // The socutil library: the web part (HTTP server + socket discovery) that `fsmeta serve` can optionally
+    // expose alongside its own unix socket. It is a sibling checkout, wired as a path dependency.
+    const socutil_dep = b.dependency("socutil", .{ .target = target, .optimize = optimize });
+    const socutil_module = socutil_dep.module("socutil");
+
     const engine_imports = [_]std.Build.Module.Import{
         .{ .name = "gitignore.zig", .module = gitignore_module },
         .{ .name = "ignore.zig", .module = ignore_module },
         .{ .name = "nightwatch", .module = nightwatch_module },
+        .{ .name = "socutil", .module = socutil_module },
     };
 
     // The engine, and the daemon with it.

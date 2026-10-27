@@ -371,3 +371,11 @@ The rules for today, so the reservation is enforceable rather than decorative:
 | senders    | write `flags` as `0`                                                |
 | receivers  | `flags != 0` → `unsupported-flags`, close, resume from `from_batch` |
 | bits 1..15 | reserved on the same terms as bit 0                                 |
+
+### Optional HTTP endpoint
+
+`fsmeta serve <root> --http` also exposes the socket through an HTTP endpoint (port 8765) via the
+[socutil](../socutil/) library. The HTTP endpoint is a front for the same Unix socket: the socutil UI lists
+the socket by name (`fs-meta.socket`) and relays it over a WebSocket byte tunnel or an SSE tail. The binary
+protocol on the Unix socket is unchanged; the HTTP endpoint is an optional convenience for browsers and
+tools that cannot open a Unix socket directly.
