@@ -41,8 +41,8 @@
 //!
 //! The one thing that is *not* independent is the diagnostic path: `roots list` takes every root's lock in turn
 //! (a snapshot has to be consistent), so it waits for a stuck root. That is a deliberate shape — the consumer
-//! sockets are the real path and they stay up — and `plans/next-steps.md` records the option of a `busy` flag
-//! when blocking a listing becomes annoying.
+//! sockets are the real path and they stay up — and a `busy` flag reported instead of waiting is the natural next
+//! diagnostic step, not something this file promises today.
 
 const std = @import("std");
 const nightwatch = @import("nightwatch");

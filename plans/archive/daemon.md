@@ -516,8 +516,8 @@ child's names. That last point is the legitimate reason to nest at all: a consum
   which is host state, and the startup sequence that reads the former to rebuild the latter.
 - `AGENTS.md` — one line under the invariants: **the registry, socket paths and pids are host state, never trio content**;
   the trio still contains no absolute path.
-- `doc/performance.md` or a note in `plans/next-steps.md` — the wake-scan cost, once measured, so the idle default has
-  evidence rather than taste.
+- `doc/performance.md` or a note in the next-steps record (now [`next-steps-done.md`](next-steps-done.md)) — the
+  wake-scan cost, once measured, so the idle default has evidence rather than taste.
 
 ## 18. Status after implementation
 

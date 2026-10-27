@@ -270,8 +270,9 @@ child process later (§ 7).
 
 **The one exception is the diagnostic path.** `roots list` and `root status` take each root's lock to produce a
 consistent snapshot, so a root stuck in a write delays a listing of *itself* (and, because the listing walks every
-root, the listing as a whole). The consumer sockets are unaffected; `plans/next-steps.md` records the option of a
-`busy` flag reported instead of waiting.
+root, the listing as a whole). The consumer sockets are unaffected. A `busy` flag reported instead of waiting is the
+natural next diagnostic step; it is not scheduled (`plans/next-steps.md` is the open-work file, and it does not carry
+an entry for it).
 
 ---
 

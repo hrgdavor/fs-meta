@@ -2,7 +2,7 @@
 
 **Status: implemented.** `publish` lays its pair out through `pair.layout` with the count assertion in place, and
 `files.json` carries § 18's `roots`; `engine`'s walker-agreement test compares names as a set. The document below is
-the plan that was followed, kept for the record; `plans/next-steps.md` § B is the summary and is now closed.
+the plan that was followed, kept for the record; `plans/archive/next-steps-done.md` § B is the summary and is now closed.
 
 **Goal in one line.** Make `publish` lay out its pair through `pair.layout` — the function `batch.encode` already
 uses — so the main trio and a batch have one ordering rule between them, and emit § 18's `roots` from the same layout.
