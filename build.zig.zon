@@ -2,6 +2,7 @@
     .name = .watcher,
     .version = "0.3.6",
     .fingerprint = 0xb28fe6ac387cc966,
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .nightwatch = .{
             .url = "https://github.com/neurocyte/nightwatch/archive/8a96456e58035128dc2944b1c689c8f778927469.tar.gz",
