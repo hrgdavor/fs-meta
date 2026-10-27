@@ -50,6 +50,28 @@ const valid = {
   json: readFileSync(join(tree, ".fs-meta", "files.json"), "utf8"),
 };
 
+// ---- the boundary rule (FORMAT.md § 16): a nested repository is not described
+// A second real generation, from a tree that contains a clone. The trio must validate `ok` *and* the clone's name
+// must be absent from it — a vector that only checked the verdict would not distinguish "the rule ran" from "the
+// tree happened to have nothing nested".
+const nested_tree = join(scratch, "nested-repository");
+mkdirSync(join(nested_tree, "clone", ".git", "objects"), { recursive: true });
+writeFileSync(join(nested_tree, "visible.txt"), "hello\n");
+writeFileSync(join(nested_tree, "clone", ".git", "HEAD"), "ref: refs/heads/main\n");
+writeFileSync(join(nested_tree, "clone", "secret.txt"), "not described\n");
+must(["refresh", nested_tree, "--updated", "2026-10-19T00:00:01Z", "--hash", "text"], module_dir);
+const nested = {
+  meta: readFileSync(join(nested_tree, ".fs-meta", "files.meta")),
+  txt: readFileSync(join(nested_tree, ".fs-meta", "files.txt")),
+  json: readFileSync(join(nested_tree, ".fs-meta", "files.json"), "utf8"),
+};
+if (nested.txt.includes("clone") || nested.txt.includes("secret.txt")) {
+  throw new Error(`the boundary rule did not hold: ${nested.txt}`);
+}
+if (!nested.json.includes('"nestedRepos": true')) {
+  throw new Error(`the boundary rule was not recorded in files.json: ${nested.json}`);
+}
+
 const cases = [];
 function add(name, expect, files) {
   const dir = join(scratch, name);
@@ -96,6 +118,9 @@ const withJson = (mutate) => {
 
 console.log("verifying the cases against the reference:");
 add("ok", "ok", mutated({}));
+// The boundary rule's vector: a real generation from a tree with a nested clone. `ok` plus the absence of the
+// clone's names is the pair a reader can check; the `nestedRepos` record is in the json bytes.
+add("ok-nested-repository", "ok", { meta: nested.meta, txt: nested.txt, json: nested.json });
 add("unsupported-format", "unsupported-format", mutated({ json: withJson((value) => (value.format = "other")) }));
 add("unsupported-version", "unsupported-version", mutated({ json: withJson((value) => (value.version = 2)) }));
 add("unsupported-entry-size", "unsupported-entry-size", mutated({ json: withJson((value) => (value.entrySize = 48)) }));

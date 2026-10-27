@@ -55,10 +55,10 @@ const batch = @import("batch.zig");
 const wire = @import("wire.zig");
 const engine = @import("engine.zig");
 
-/// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`).
-/// 1.0 is the layout the document describes; `FORMAT.socket.md` § Values this implementation pins states the
-/// value, and `wire.zig`'s tests use it too.
-pub const protocol: u16 = 0x0100;
+/// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`). It is `wire.zig`'s
+/// constant, not a second copy: the daemon's `STATE` frame moved it to 1.1, and a value written in two places
+/// is a value that drifts. `FORMAT.socket.md` § Values this implementation pins states the number.
+pub const protocol: u16 = wire.protocol;
 
 /// The socket's name inside `<root>/.fs-meta`.
 pub const socket_name = "socket";
@@ -446,9 +446,9 @@ fn rfc3339Utc(io: std.Io, buffer: *[32]u8) []const u8 {
 
 /// The change counts `END_BATCH` must agree with (FORMAT.socket.md: "the counts must equal the entries
 /// counted by change bit, or the batch is discarded").
-const Counts = struct { added: u64 = 0, changed: u64 = 0, deleted: u64 = 0 };
+pub const Counts = struct { added: u64 = 0, changed: u64 = 0, deleted: u64 = 0 };
 
-fn counts(plan: batch.Plan) Counts {
+pub fn counts(plan: batch.Plan) Counts {
     var result = Counts{};
     for (plan.entries) |entry| switch (batch.kindOf(entry) orelse continue) {
         .added => result.added += 1,
@@ -460,7 +460,7 @@ fn counts(plan: batch.Plan) Counts {
 
 // ---------------------------------------------------------------- frames out
 
-fn sendStartBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, parent: u64) !void {
+pub fn sendStartBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, parent: u64) !void {
     var payload: [24]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], number, .little);
     std.mem.writeInt(u64, payload[8..16], parent, .little);
@@ -470,7 +470,7 @@ fn sendStartBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, parent: u6
     try writeFrame(io, stream, .start_batch, &payload);
 }
 
-fn sendEndBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, counted: Counts) !void {
+pub fn sendEndBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, counted: Counts) !void {
     var payload: [40]u8 = undefined;
     std.mem.writeInt(u64, payload[0..8], number, .little);
     std.mem.writeInt(u64, payload[8..16], counted.added, .little);
@@ -481,7 +481,7 @@ fn sendEndBatch(io: std.Io, stream: std.Io.net.Stream, number: u64, counted: Cou
     try writeFrame(io, stream, .end_batch, &payload);
 }
 
-fn sendChangeEntry(
+pub fn sendChangeEntry(
     io: std.Io,
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
@@ -493,7 +493,7 @@ fn sendChangeEntry(
     try writeBytes(io, stream, frame);
 }
 
-fn writeFrame(io: std.Io, stream: std.Io.net.Stream, kind: wire.Kind, payload: []const u8) !void {
+pub fn writeFrame(io: std.Io, stream: std.Io.net.Stream, kind: wire.Kind, payload: []const u8) !void {
     var prefix: [wire.prefix_size]u8 = undefined;
     wire.writePrefix(&prefix, kind, 0, @intCast(payload.len));
     var writer_buffer: [4096]u8 = undefined;
@@ -503,14 +503,14 @@ fn writeFrame(io: std.Io, stream: std.Io.net.Stream, kind: wire.Kind, payload: [
     try writer.interface.flush();
 }
 
-fn writeBytes(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
+pub fn writeBytes(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
     var writer_buffer: [4096]u8 = undefined;
     var writer = std.Io.net.Stream.Writer.init(stream, io, &writer_buffer);
     try writer.interface.writeAll(bytes);
     try writer.interface.flush();
 }
 
-fn refuse(io: std.Io, stream: std.Io.net.Stream, code: ErrorCode, comptime wording: []const u8, args: anytype) void {
+pub fn refuse(io: std.Io, stream: std.Io.net.Stream, code: ErrorCode, comptime wording: []const u8, args: anytype) void {
     var code_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &code_bytes, @intFromEnum(code), .little);
 
@@ -560,6 +560,8 @@ fn frameErrorWord(err: wire.ReadError) []const u8 {
         error.FrameTooLarge => "frame-too-large",
         error.LengthMismatch => "length-mismatch",
         error.InvalidEntry => "invalid-entry",
+        error.InvalidState => "invalid-state",
+        error.InvalidGitEvent => "invalid-git-event",
     };
 }
 
@@ -593,9 +595,23 @@ pub fn openBatchWindow(io: std.Io, root: []const u8) !BatchWindow {
     return .{ .dir = batches, .first = first, .last = last };
 }
 
+/// The largest batch *file* this reader will load. It is deliberately not `wire.max_frame`.
+///
+/// `max_frame` bounds one frame on the wire, and a `CHANGE_ENTRY` is 64 bytes plus a name — a batch is a *chain* of
+/// frames, so a large generation is many small frames and is fine on the wire. Reusing the frame limit here meant a
+/// batch whose `files.meta` or `files.txt` exceeded 1 MiB (about 16 384 names) could not be read back at all: the
+/// generation was published, the consumer got `STATE(waking)` → `STATE(watching)` and no batch, and the daemon only
+/// reported `StreamTooLong`. A first batch of a 20 000-name tree is exactly that case, which is why this is a
+/// separate limit rather than a comment on the old one.
+pub const max_batch_file_bytes: u64 = 1 << 28;
+
 /// Read and decode `batches/<generation>`; a missing directory is `BatchGap`, which the replay turns
 /// into the document's `ERROR {batch-gap}` rather than skipping the generation.
-fn loadBatch(allocator: std.mem.Allocator, io: std.Io, batches: std.Io.Dir, generation: u64) !batch.Plan {
+///
+/// The returned plan's names point into the `files.txt` bytes, which this function does not free: the caller
+/// supplies an arena that outlives the plan (a per-connection or per-pass arena in every caller). A general-purpose
+/// allocator would leak the two file buffers, which is why the tests pass one too.
+pub fn loadBatch(allocator: std.mem.Allocator, io: std.Io, batches: std.Io.Dir, generation: u64) !batch.Plan {
     const name = try std.fmt.allocPrint(allocator, "{x:0>8}", .{generation});
     var dir = batches.openDir(io, name, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.BatchGap,
@@ -603,8 +619,8 @@ fn loadBatch(allocator: std.mem.Allocator, io: std.Io, batches: std.Io.Dir, gene
     };
     defer dir.close(io);
 
-    const meta = try dir.readFileAlloc(io, format.meta_file, allocator, std.Io.Limit.limited(wire.max_frame));
-    const txt = try dir.readFileAlloc(io, format.txt_file, allocator, std.Io.Limit.limited(wire.max_frame));
+    const meta = try dir.readFileAlloc(io, format.meta_file, allocator, std.Io.Limit.limited(max_batch_file_bytes));
+    const txt = try dir.readFileAlloc(io, format.txt_file, allocator, std.Io.Limit.limited(max_batch_file_bytes));
     return batch.decode(allocator, meta, txt);
 }
 
@@ -623,7 +639,7 @@ fn absoluteSocketPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8
     return std.fs.path.resolveAlloc(allocator, &.{ absolute_root, format.directory_name, socket_name });
 }
 
-fn helloVerdictWord(verdict: wire.HelloVerdict) []const u8 {
+pub fn helloVerdictWord(verdict: wire.HelloVerdict) []const u8 {
     return switch (verdict) {
         .ok => "ok",
         .unsupported_version => "unsupported-version",
@@ -656,7 +672,7 @@ test "the greeting is the document's fixed 24-byte payload, not the kind table's
     try std.testing.expectEqual(@as(usize, 32), bytes.len);
     try std.testing.expectEqual(@as(u8, 0x01), bytes[0]);
     try std.testing.expectEqual(@as(u32, wire.hello_size), std.mem.readInt(u32, bytes[4..8], .little));
-    try std.testing.expectEqual(@as(u16, 0x0100), std.mem.readInt(u16, bytes[8..10], .little));
+    try std.testing.expectEqual(@as(u16, 0x0102), std.mem.readInt(u16, bytes[8..10], .little));
     try std.testing.expectEqual(@as(u16, 64), std.mem.readInt(u16, bytes[10..12], .little));
     try std.testing.expectEqual(@as(u8, 0), bytes[14]); // role = server
     try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, bytes[16..24], .little));
@@ -680,4 +696,58 @@ test "the live pass timestamp is an RFC3339 instant, not a bare word" {
     try std.testing.expectEqual(@as(u8, ':'), text[13]);
     try std.testing.expectEqual(@as(u8, ':'), text[16]);
     try std.testing.expectEqual(@as(u8, 'Z'), text[19]);
+}
+
+test "a batch bigger than one frame is loaded, not refused" {
+    // The bug this pins: `loadBatch` used to read with `wire.max_frame` (1 MiB), so a genesis batch of more than
+    // ~16 384 names could not be read back — the root published its first generation and every consumer got no
+    // batch at all. A batch is many small frames on the wire; only the *files* on disk can be large.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const count: usize = 16_500; // 16 500 * 64 B = 1 056 000 B of meta, over the old limit
+    const items = try std.testing.allocator.alloc(batch.Item, count);
+    defer std.testing.allocator.free(items);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |name| std.testing.allocator.free(name);
+        names.deinit(std.testing.allocator);
+    }
+    var entry = std.mem.zeroes(format.Entry);
+    entry.flags_word = format.flags.regular_file | format.flags.content_known;
+    entry.size_bytes = 1;
+    for (items, 0..) |*item, index| {
+        const name = try std.fmt.allocPrint(std.testing.allocator, "file-{d:0>5}.txt", .{index});
+        try names.append(std.testing.allocator, name);
+        var named = entry;
+        named.name_hash = format.wyhash(name);
+        item.* = .{ .name = name, .entry = named };
+    }
+
+    const plan = try batch.diff(std.testing.allocator, &.{}, items);
+    defer {
+        std.testing.allocator.free(plan.entries);
+        std.testing.allocator.free(plan.names);
+    }
+    try batch.write(std.testing.allocator, io, tmp.dir, plan, .{
+        .generation = 1,
+        .parent = 0,
+        .created = "2026-10-26T00:00:00Z",
+        .updated = "2026-10-26T00:00:00Z",
+    });
+
+    var batches = try tmp.dir.openDir(io, "batches", .{ .iterate = true });
+    defer batches.close(io);
+    var meta_dir = try batches.openDir(io, "00000001", .{});
+    defer meta_dir.close(io);
+    const meta_bytes = (try meta_dir.statFile(io, format.meta_file, .{})).size;
+    try std.testing.expect(meta_bytes > wire.max_frame); // this test is only meaningful above the old limit
+
+    // `loadBatch` borrows its file buffers from the allocator it is given and never frees them (they hold the name
+    // slices), so a general-purpose allocator would report them as leaks. Every real caller passes an arena.
+    var load_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer load_arena_state.deinit();
+    const loaded = try loadBatch(load_arena_state.allocator(), io, batches, 1);
+    try std.testing.expectEqual(count, loaded.entries.len);
 }

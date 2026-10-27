@@ -11,9 +11,10 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The binary under test: `zig-out/` by default, `FSMETA_BIN` when several builds share this checkout.
+import { binary } from './binary.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const binary = join(here, '..', 'zig-out', 'bin', process.platform === 'win32' ? 'fsmeta.exe' : 'fsmeta');
 if (!existsSync(binary)) {
   throw new Error(`build the engine first: zig build (expected ${binary})`);
 }

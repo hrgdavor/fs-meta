@@ -32,6 +32,13 @@ Every message is an 8-byte prefix followed by `length` payload bytes, all intege
 what makes the JSON-RPC side of the socket recognisable from its first byte, as the notes ask: a JSON object starts
 `{"` = `0x7B 0x22`, and a binary message starts with a small kind byte followed by `0x00`.
 
+**The 1 MiB limit is per frame, not per batch.** A batch is a *chain* of frames — `START_BATCH`, one `CHANGE_ENTRY`
+per entry (64 bytes plus a name), `END_BATCH` — so a generation of any size is delivered as many small frames. A server
+must therefore not bound a batch by the frame limit when it reads that batch back from disk: `server.zig` keeps a
+separate `max_batch_file_bytes` for it, with a test that loads a batch larger than one frame. This was a real defect,
+not a hypothetical: a first batch of more than ~16 384 names (64 B per entry) could not be read back, so the consumer
+of a large tree received no batch at all and only the daemon's `last_error` said why.
+
 ### Messages
 
 | `kind` | Name           | Payload                                                                                |
@@ -44,6 +51,8 @@ what makes the JSON-RPC side of the socket recognisable from its first byte, as 
 | `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing)               |
 | `0x07` | `PING`         | empty                                                                                  |
 | `0x08` | `PONG`         | empty                                                                                  |
+| `0x09` | `STATE`        | `u8 state`, `u8 reason`, `u32 idle_timeout_ms`, `u64 head_batch` — see § STATE         |
+| `0x0a` | `GIT_EVENT`    | `u8 phase`, `u8 kind`, `u8 source`, `u8 status`, `u64 head_batch`, `u64 at_ms`, then for `kind = worktree` only `u32 path_len` + path — see § GIT_EVENT |
 
 **`HELLO` is defined once**, in § Handshake; the row above is a pointer that keeps the kind numbering in one place,
 not a second payload layout.
@@ -78,6 +87,109 @@ off-line.
 Live updates are the same messages: when a pass publishes generation `g`, the server sends its `START_BATCH`,
 `CHANGE_ENTRY` messages and `END_BATCH` to every subscribed client whose `from_batch` is `g - 1`. A client that was
 asleep gets the replay path instead, which is why replay and live streaming are one protocol rather than two.
+
+### STATE
+
+`STATE` (kind `0x09`) exists because a daemon can put a root to sleep, and that creates a question the wire could
+not ask before: **is this subscribe slow because the root is waking?** A consumer cannot tell "waking, 400 k files"
+from "big tree, first batch is slow" from "server stuck", and the answer costs fourteen bytes.
+
+```
+u8   state            0 = off, 1 = asleep, 2 = waking, 3 = watching
+u8   reason           0 = none, 1 = a client subscribed, 2 = idle timeout, 3 = control request, 4 = watcher event
+u32  idle_timeout_ms  the root's current setting; 0 = it never sleeps
+u64  head_batch       the newest batch the server considers published
+```
+
+`head_batch` is the whole progress story. A client compares it with its own last applied batch and knows whether a
+wake means "one small diff" or "a long catch-up" — and the server estimates nothing. There are deliberately no
+progress counters, no percentages and no files-scanned: on the measured workloads thousands of files are
+milliseconds, so progress would flicker and then be gone, and it would turn a state notification into a telemetry
+channel that has to be kept honest under a deadline. A richer view (passes, bytes, elapsed) belongs to the CLI's
+`root status --json`, which no consumer waits on.
+
+**When a server sends it** — always between batches, never inside one (`START_BATCH` … `END_BATCH` is a
+transaction, and a `STATE` there would be a protocol violation; the suite asserts it):
+
+1. immediately after `HELLO`, so a fresh client knows what it joined;
+2. `state = waking` **before** the wake scan's first `START_BATCH` — the case the frame exists for;
+3. on every transition (`waking → watching`, `watching → asleep`, a mode change made through the control socket);
+4. a final `STATE` before the connection is closed on shutdown, so a client stops waiting rather than timing out.
+
+A server that does not implement `STATE` never sends kind `0x09`, and a client that does not understand it must
+refuse the frame rather than skip it (the framing rule above: an unknown kind closes the connection).
+
+**A pass that changed nothing sends no `STATE`.** The frame announces transitions, not a heartbeat; one every pass
+interval would be a telemetry stream, not a state notification.
+
+`FORMAT.daemon.md` documents the state machine these four fields describe.
+
+### GIT_EVENT
+
+`GIT_EVENT` (kind `0x0a`, protocol `0x0102`) is the daemon's second addition: a git operation's **start** or **finish**,
+interleaved between batches and never inside one. It exists because a checkout changes two things a consumer cannot
+correlate otherwise — the files, which arrive as an ordinary batch, and the fact that a git operation produced them.
+
+```
+u8   phase       0 = start, 1 = finish, 2 = aborted
+u8   kind        0 = branch, 1 = checkout, 2 = commit, 3 = merge, 4 = rebase, 5 = index, 6 = worktree, 7 = other
+u8   source      0 = metadata (the file timeline), 1 = hook (a `post-checkout`/`reference-transaction`, M5)
+u8   status      0 = ok, 1 = our pass failed, 2 = timed out
+u64  head_batch  the receiving root's head; for a `finish`, the batch the finish waited for
+u64  at_ms       epoch milliseconds, the daemon's own clock
+```
+
+A payload is **exactly 20 bytes**, except for `kind = worktree`, which appends `u32 path_len` and the UTF-8 path, so its
+length is `24 + path_len`. `path_len = 0` is valid and means "the path is no longer knowable" — a `git worktree remove`
+deletes the metadata that named it, so a consumer must read an empty path as *a worktree left this repository*, not as a
+malformed frame. A reader checks `path_len <= length - 24` before slicing the path, and a non-`worktree` kind with any
+length but 20 is a `LengthMismatch`; a value outside a table is refused rather than guessed at. The two tables that
+matter for compatibility:
+
+- **`kind = worktree` is the only variable-length event and the only one that names a path.** A branch event is about
+  *this root's* working tree, and the connection is the attribution; a worktree appearing or leaving is a fact about the
+  repository, which the root's stream cannot name otherwise.
+- **`head_batch` is the root's head, not a promise of a fetchable batch.** For a tree-changing operation it is the
+  generation the finish waited for. For a **repo-wide** event (`refs/`, `packed-refs`, a worktree) no batch was
+  published for that root — its tree did not change — so its `head_batch` is the head the root already had, and a
+  consumer must not read it as "a batch you can fetch".
+
+**`source = hook` is the same contract from a precise signal.** When the repository's hooks are installed
+(`FORMAT.daemon.md` § 6a), `reference-transaction` reports a ref update's start (`prepared`) and its finish
+(`committed` or `aborted`) per transaction, and the specific hooks supply the kind: `post-checkout`'s flag is `branch`
+(1) or `checkout` (0), `post-merge` is `merge`, `post-rewrite` is `rebase` (or `other` for an amend), `post-index-change`
+is `index` and `post-commit` is `commit`. A `reference-transaction` event without such a companion is `other`: the spool
+line records the phase, not the ref names, and a kind is never guessed. A start is written as soon as the hook fires
+(so it may precede the batch or follow it — rule 1 is unchanged), a `committed` finish waits for the pass exactly as a
+metadata finish does, and an `aborted` finish is written at once (rule 6). With hooks installed **both sources may
+report one operation** — a checkout produces hook frames and the timeline's — and `source` is how a consumer tells them
+apart; coalescing is per `(kind, phase)` per pass, not per operation.
+
+**The ordering contract**, which is the point of the frame:
+
+1. **Start has no constraint.** It may come before or after the `START_BATCH` of the pass that is running; a consumer
+   that queries on start may see a half-written tree, and that is what "start" means. The metadata timeline's starts are
+   notices ("the tree is about to be rewritten"), a hook's are precise (`source = hook`).
+2. **Finish is written only after the pass that reflects it has been published** — per connection. The pass commits the
+   trio, the daemon writes `START_BATCH` … `END_BATCH` (and a `STATE` if the pass emits one), and only then
+   `GIT_EVENT(finish)`. A consumer that reacts to "finished" with a query therefore finds the work done and has its
+   batch first.
+3. **A pass that publishes nothing still precedes its finish.** If a checkout lands on identical content there is no
+   batch to precede it; the guarantee is "never before the pass", not "always a batch".
+4. **Batched operations finish in order, coalesced by kind.** One pass may cover several metadata changes; at most one
+   event per `(kind, phase)` is emitted for it, in the order the kinds were first seen. A `git fetch` that moves many
+   refs is one `commit` event for that root's flush, not one per ref.
+5. **A failed pass is reported, not hidden:** the finish carries `status = failed` (its `head_batch` is the head the
+   root had). Silence would be the one outcome that makes a consumer believe a state it never received.
+6. **`aborted` is sent without waiting for a pass**, because nothing was published, and a start whose finish never
+   arrives is closed after a bounded time with `status = timed_out`.
+7. **Only a root with `gitwatch` on emits.** A root whose flag is off receives no `GIT_EVENT` at all — its flag says it
+   asked for no git handling — and a sleeping root sends none because it has no watcher (§ 5h).
+8. **A late subscriber is not replayed a finish.** Git events are a live signal, not a log: a client that subscribes
+   after one was flushed learns the state from the batch. The history of git operations is `root status`'s job.
+
+**Git events are a daemon feature.** `fsmeta serve` announces `0x0102` and never emits `0x0a` (or `0x09`): it has no
+scheduler and no git handling, so a consumer of `serve` gets batches only — the same asymmetry `STATE` already has.
 
 ### What the wire deliberately does not carry
 
@@ -169,8 +281,12 @@ greet at once, and no state machine whose order can deadlock.
 The layout above is the format. Three of its values are this implementation's choice, and they are pinned here so a
 client author reads them instead of inferring them from the server's bytes.
 
-**`protocol` is `0x0100`** — major 1, minor 0. A client must use major 1; a different major is `unsupported-version`.
-The minor is negotiated by allowance, as above.
+**`protocol` is `0x0102`** — major 1, minor 2. A client must use major 1; a different major is `unsupported-version`.
+The minor is negotiated by allowance, as above. Minor 1 is the `STATE` frame (§ STATE) and minor 2 is `GIT_EVENT`
+(§ GIT_EVENT); there are no deployed clients, so each bump was made once and every implementation was updated
+together — no capability bit gates either, and a `0x0100` or `0x0101` caller is still accepted because the major
+matches. A minor-2 client that does not know `0x0a` must refuse it rather than skip it (an unknown kind closes the
+connection), which is why the bump is a bump: a reader must be able to say "I do not know this frame".
 
 **`ERROR` codes** are the `u16 code` at offset 0 of the payload (kind `0x05`). The number is the contract: the UTF-8
 message that follows begins with the code's word and `: `, then detail for a human, so a client branches on the number

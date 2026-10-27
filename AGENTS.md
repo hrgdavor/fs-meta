@@ -49,6 +49,27 @@ possible. Do not add a writer to a port to make a test pass.
 - **A gap in the batch sequence is an error** (`batch-gap`), never skipped. `batch-too-old` means the consumer's baseline
   predates the oldest retained batch.
 
+- **The registry, socket paths and pids are host state, never trio content.** The daemon's `roots.json`, its
+  `<id>.sock` names and its claims describe a machine and a running process; the trio keeps containing no absolute
+  path (`FORMAT.md` § 3.1). A change that would put a path into a stored byte needs a format change, not a daemon one.
+
+- **A boundary is ignored, not scanned twice.** A directory whose `.git` entry confirms is another repository — a
+  clone, a submodule checkout or a linked worktree — and the walk neither lists nor enters it. A served nested root is
+  hidden from its parent by the managed ignore block, so one tree is never described by two trios. This is a property
+  of the trio (`scan.nestedRepos` records it), not a worktree feature: no switch turns it off (`FORMAT.md` § 16,
+  `plans/worktrees.md` § 5 and § 5h, `src/boundary.zig`).
+
+- **Finish never precedes its batch.** A `GIT_EVENT(finish)` is written only after the pass that reflects it has
+  committed the trio and broadcast `START_BATCH … END_BATCH` to that client (a pass that published nothing still comes
+  first). A consumer that reacts to "finished" by querying must find the work done and have its batch already; do not
+  move the flush before `broadcastBatchLocked` or make a finish wait on nothing (`FORMAT.socket.md` § GIT_EVENT).
+
+- **Every worktree/git feature is behind a switch and tested in both states — and the boundary rule is not a
+  feature.** `worktrees` and `gitwatch` gate adoption, seeding, worktree events, the metadata watch, hooks and the
+  removal reaction; `FSMETA_WORKTREES=0` / `FSMETA_GITWATCH=0` override both at daemon start. What they never touch:
+  the boundary rule, `scan.nestedRepos`, `info/exclude` reading and the nested-root guard. A change to a gated path
+  lands with a test that runs it on **and** off (`plans/worktrees.md` § 5h).
+
 ## 3. Conformance vectors are the definition
 
 `conformance/fsmeta-vectors-v2.json` is generated **from the engine** by `conformance/gen-vectors-v2.mjs`, and every

@@ -5,10 +5,8 @@ current § 5 layout, and `FsMetaConformanceTest` passes **14/14** cases of `conf
 the module's suite is **62 tests, 0 failures, 1 skipped** (a symlink privilege). Writing stays with the Zig engine,
 which is the only writer; what is described below is the plan that was followed, kept for the record.
 
-**Status: not ported.** The Zig reference is complete and the Bun reader now passes all fourteen conformance vectors
-(see [`benchmark.md`](benchmark.md) and [`../conformance/gen-vectors-v2.mjs`](../conformance/gen-vectors-v2.mjs)).
-The Java module predates the format it is supposed to implement, and this document is the plan for closing that, so
-the next session is bounded and testable rather than exploratory.
+*Historical note: this document was written when the Java module predated the format, so its original status line read
+"not ported". The plan below is kept as the record of what was followed, not as pending work.*
 
 ## What exists, and what it is
 

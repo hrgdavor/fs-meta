@@ -28,6 +28,8 @@ const scan = @import("scan.zig");
 const coldstart = @import("coldstart.zig");
 const cache_mod = @import("cache.zig");
 const ignore_mod = @import("ignore.zig");
+const ignores = @import("ignores.zig");
+const boundary_mod = @import("boundary.zig");
 
 const w = std.os.windows;
 
@@ -35,18 +37,39 @@ const w = std.os.windows;
 /// from `coldstart.coldStart`, which joined them with the root it was given.
 pub const Tree = struct {
     io: std.Io,
+    /// The scan root as the caller passed it (a locator). Only used to turn an OS path back into a
+    /// workspace-relative boundary path for the log and `scan --json`; it is never stored in a trio.
+    root: []const u8 = "",
     /// Names never listed, whatever their kind (§ 16: `.git` and `.fs-meta` are unconditional).
     reserved: []const []const u8 = &.{ ".git", ".fs-meta" },
     /// Directory names never entered, on top of `reserved`.
     ignored_dir_names: []const []const u8 = &.{},
     /// The `.gitignore` stack of this pass; `null` lists without consulting rules.
     ignore: ?*ignore_mod.Stack = null,
+    /// The two root-level sources (`info/exclude` and `.fs-meta/ignore`). Read for every pass by the engine; a tree
+    /// built without them lists exactly as it did before M1.
+    sources: ?*ignores.Sources = null,
     /// Force the naive listing — a readdir plus a `stat` (and an identity handle) per entry — instead of the
     /// platform bulk call. It exists to be measured against, not to be used.
     per_file: bool = false,
     /// The volume serial number of this tree's volume, looked up at most once per pass: every entry in every
     /// directory shares it, so fetching it per directory costs a handle open for no information.
     volume_serial: ?u64 = null,
+    /// The nested repositories this pass refused to cross (`boundary.zig`). Owned by the pass arena; the engine
+    /// logs them and the CLI reports them, and nothing here is written into the trio.
+    boundaries: std.ArrayListUnmanaged(boundary_mod.Boundary) = .empty,
+
+    /// The four-source decision of `plans/worktrees.md` § 5, asked about one child of `dir_path`. The `.gitignore`
+    /// stack is the first source; `info/exclude` and `.fs-meta/ignore` follow through `Sources`, whose `decide`
+    /// stops at the first exclusion and therefore cannot re-open an earlier one with a `!`.
+    fn isIgnored(self: *const Tree, allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, is_dir: bool) !bool {
+        if (self.ignore) |stack| {
+            if (try stack.ignored(dir_path, name, is_dir)) return true;
+        }
+        const sources = self.sources orelse return false;
+        const rel_path = try relativePath(self, allocator, dir_path, name);
+        return sources.decide(rel_path, is_dir) != null;
+    }
 
     /// Whether a child is visible to the engine. Applied in the listing, so an excluded directory is never
     /// queued and never listed — git's rule, and the reason the engine cannot describe its own output.
@@ -83,16 +106,40 @@ pub fn list(self: *Tree, allocator: std.mem.Allocator, dir_path: []const u8) ![]
     // — because the two paths must never disagree about which names exist.
     // Resolved once for the whole directory; with no rule anywhere above it, the matcher is never entered.
     const check_rules = if (self.ignore) |stack| try stack.hasRules(dir_path) else false;
+    const check_sources = if (self.sources) |sources| sources.hasRules() else false;
     var kept: usize = 0;
     for (entries) |entry| {
+        // A confirmed nested repository is a boundary: it is not listed and not queued, because a trio
+        // describes one tree (`plans/worktrees.md` § 4). The detection happened inside the listing, where the
+        // child's parent handle was already open.
+        if (entry.kind == .dir and entry.boundary != .none) {
+            try self.boundaries.append(allocator, .{
+                .path = try relativePath(self, allocator, dir_path, entry.name),
+                .kind = entry.boundary,
+            });
+            continue;
+        }
         if (!self.visible(entry.name, entry.kind == .dir)) continue;
-        if (check_rules) {
-            if (try self.ignore.?.ignored(dir_path, entry.name, entry.kind == .dir)) continue;
+        if (check_rules or check_sources) {
+            if (try self.isIgnored(allocator, dir_path, entry.name, entry.kind == .dir)) continue;
         }
         entries[kept] = entry;
         kept += 1;
     }
     return entries[0..kept];
+}
+
+/// The workspace-relative path of `dir_path/name`: `dir_path` arrives from `coldstart` joined with the root, and
+/// the root is stripped back off so nothing absolute reaches a report or an ignore decision (never a trio).
+fn relativePath(self: *const Tree, allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) ![]const u8 {
+    var prefix_len: usize = 0;
+    if (self.root.len > 0 and std.mem.startsWith(u8, dir_path, self.root)) {
+        prefix_len = self.root.len;
+        if (prefix_len < dir_path.len and dir_path[prefix_len] == '/') prefix_len += 1;
+    }
+    const rel_dir = dir_path[prefix_len..];
+    if (rel_dir.len == 0 or std.mem.eql(u8, rel_dir, ".")) return allocator.dupe(u8, name);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, name });
 }
 
 fn listFn(ctx: *anyopaque, allocator: std.mem.Allocator, dir_path: []const u8) anyerror![]coldstart.EntryInfo {
@@ -138,6 +185,9 @@ fn listPortable(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) 
         const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch continue;
         const kind = kindOf(stat.kind) orelse continue;
         const id = scan.fileIdAt(dir, io, entry.name);
+        // Confirmation while the parent handle is open: one stat for the common case, and a child open only for a
+        // directory that actually carries a `.git` entry.
+        const nested = if (kind == .dir) boundary_mod.confirm(allocator, io, dir, entry.name) else .none;
         try out.append(allocator, .{
             .name = try allocator.dupe(u8, entry.name),
             .kind = kind,
@@ -145,6 +195,7 @@ fn listPortable(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) 
             .size_bytes = if (kind == .regular_file) stat.size else 0,
             .file_id_lo = id.lo,
             .file_id_hi = id.hi,
+            .boundary = nested,
         });
     }
     return out.toOwnedSlice(allocator);
@@ -258,13 +309,15 @@ fn listWindows(tree: *Tree, allocator: std.mem.Allocator, dir_path: []const u8) 
             const name_utf8 = try std.unicode.utf16LeToUtf8Alloc(allocator, name_utf16);
             errdefer allocator.free(name_utf8);
             if (!std.mem.eql(u8, name_utf8, ".") and !std.mem.eql(u8, name_utf8, "..")) {
+                const kind = kindOfWindows(info.FileAttributes);
                 try out.append(allocator, .{
                     .name = name_utf8,
-                    .kind = kindOfWindows(info.FileAttributes),
+                    .kind = kind,
                     .mtime_ns = filetimeToNs(info.LastWriteTime),
-                    .size_bytes = if (kindOfWindows(info.FileAttributes) == .regular_file) @intCast(info.EndOfFile) else 0,
+                    .size_bytes = if (kind == .regular_file) @intCast(info.EndOfFile) else 0,
                     .file_id_lo = @as(u64, @bitCast(info.FileId)),
                     .file_id_hi = 0, // filled from the volume serial below
+                    .boundary = if (kind == .dir) boundary_mod.confirm(allocator, io, dir, name_utf8) else .none,
                 });
             } else {
                 allocator.free(name_utf8);

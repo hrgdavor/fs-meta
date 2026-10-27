@@ -4,7 +4,10 @@
 //! Query the loaded cache: glob-search entries by name and filter by mtime.
 //!
 //! This is the read-side API the CLI uses. It takes a `*const Cache` (the engine's
-//! in-memory state, FORMAT.md § 7) and returns matching entries with their full 64-byte metadata.
+//! in-memory state, FORMAT.md § 7) and returns matching entries with the trio's metadata, rebuilt from that state:
+//! `nameHash` is recomputed from the name, `nameOffset` is `0` because the cache is keyed by name rather than by
+//! an offset into `files.txt`, and every other field (times, sizes, the content hash, the flags word including
+//! `HASH_LF`) is the one the trio records. A consumer that needs the real offset reads the trio itself.
 //!
 //! ## Query patterns (the `glob` command)
 //!
@@ -100,7 +103,8 @@ fn baseName(path: []const u8) []const u8 {
 // Query
 // ──────────────────────────────────────────────
 
-/// One matching entry: the name (borrowed from the cache) and its full 64-byte metadata.
+/// One matching entry: the name (borrowed from the cache) and the entry rebuilt from the cache's state.
+/// `nameOffset` is always `0` (the cache does not keep the trio's offsets); the other fields are the trio's.
 pub const Match = struct {
     name: []const u8,
     entry: format.Entry,
@@ -158,17 +162,19 @@ pub fn run(allocator: std.mem.Allocator, q: Query) ![]Match {
 }
 
 fn entryFromFileState(name: []const u8, state: cache_mod.FileState) format.Entry {
+    // Every bit the cache can answer is set: `hash_lf` is a property of the *content hash* (§ 12), so a query
+    // that dropped it would tell a consumer "not LF-normalised" about a file the trio records as normalised.
+    const known = state.content_hash != null;
     return .{
         .mtime_ns = state.mtime_ns,
         .size_bytes = state.size_bytes,
         .content_hash = state.content_hash orelse 0,
         .name_hash = format.wyhash(name),
-        .name_offset = 0,
+        .name_offset = 0, // the cache is keyed by name; it keeps no offset into files.txt (§ `Match`)
         .name_length = @intCast(name.len),
-        .flags_word = if (state.kind == .symlink)
-            format.flags.symlink | (if (state.content_hash != null) format.flags.content_known else @as(u32, 0))
-        else
-            format.flags.regular_file | (if (state.content_hash != null) format.flags.content_known else @as(u32, 0)),
+        .flags_word = (if (state.kind == .symlink) format.flags.symlink else format.flags.regular_file) |
+            (if (known) format.flags.content_known else @as(u32, 0)) |
+            (if (known and state.hash_lf) format.flags.hash_lf else @as(u32, 0)),
         .file_id_lo = state.file_id_lo,
         .file_id_hi = state.file_id_hi,
     };

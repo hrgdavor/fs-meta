@@ -42,6 +42,8 @@ const builtin = @import("builtin");
 
 const format = @import("format.zig");
 const gitignore = @import("gitignore.zig");
+const boundary_mod = @import("boundary.zig");
+const ignores = @import("ignores.zig");
 
 pub const HashMode = enum { none, lf, text };
 
@@ -71,9 +73,20 @@ pub const Fact = struct {
     file_id_hi: u64,
 };
 
+/// One directory the walk did not enter, with the answer to "why": an ignore source's name, `boundary`, or
+/// `reserved` (a name the format reserves or the caller configured). `path` is workspace-relative.
+pub const Pruned = struct { path: []const u8, source: []const u8 };
+
 /// `scan` plus the things a writer may want to report but the trio does not store.
 pub const Result = struct {
     facts: []Fact,
+    /// Nested repositories the walk refused to cross (`plans/worktrees.md` § 4). Empty when there are none.
+    boundaries: []const boundary_mod.Boundary,
+    /// Every directory that was pruned rather than entered, with the deciding source (§ 5g). The `ignored`
+    /// diagnostic prints this; the trio records only the sources that were in effect, in `ignore_sources`.
+    pruned: []const Pruned,
+    /// The root-level ignore sources actually in effect, in precedence order (`scan.ignoreSources`).
+    ignore_sources: []const []const u8,
     /// Names skipped because they are not valid `FORMAT.md` § 3 names (a newline, a backslash, invalid
     /// UTF-8, ...). The format requires them to be absent; being silent about *why* a file is missing would
     /// make the trio a wrong answer rather than an incomplete one.
@@ -89,17 +102,27 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, root_path: []const u8, options
 
 /// `scan`, plus the count of names the walk had to skip. Same allocation contract.
 pub fn scanDetailed(arena: std.mem.Allocator, io: std.Io, root_path: []const u8, options: Options) !Result {
-    var walker = Walker{ .arena = arena, .io = io, .options = options };
+    // The two root-level sources are re-read here, on every walk: no cache and no mtime (`plans/worktrees.md` § 5b).
+    var sources = try ignores.Sources.load(arena, io, root_path, options.respect_gitignore);
+    defer sources.deinit();
+    var walker = Walker{ .arena = arena, .io = io, .options = options, .sources = &sources };
     // Every frame is popped by `walkDir`, but the stack's own buffer still needs releasing (a no-op under
     // the arena this API asks for, a real free under any other allocator).
     defer walker.ignore_stack.deinit(arena);
+    defer walker.pruned.deinit(arena);
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer root.close(io);
 
     try walker.walkDir(root, "");
     const facts = try walker.facts.toOwnedSlice(arena);
     std.mem.sort(Fact, facts, {}, lessThanFact);
-    return .{ .facts = facts, .skipped_names = walker.skipped_names };
+    return .{
+        .facts = facts,
+        .boundaries = try walker.boundaries.toOwnedSlice(arena),
+        .pruned = try walker.pruned.toOwnedSlice(arena),
+        .ignore_sources = sources.active,
+        .skipped_names = walker.skipped_names,
+    };
 }
 
 fn lessThanFact(_: void, left: Fact, right: Fact) bool {
@@ -120,7 +143,10 @@ const Walker = struct {
     arena: std.mem.Allocator,
     io: std.Io,
     options: Options,
+    sources: *ignores.Sources,
     facts: std.ArrayList(Fact) = .empty,
+    boundaries: std.ArrayList(boundary_mod.Boundary) = .empty,
+    pruned: std.ArrayList(Pruned) = .empty,
     skipped_names: usize = 0,
     ignore_stack: std.ArrayList(IgnoreFrame) = .empty,
 
@@ -144,19 +170,29 @@ const Walker = struct {
             const name = entry.name;
 
             // § 16: these two names are never listed, whatever the options say. A symlink or file with
-            // one of these names is skipped too, not just a directory.
-            if (isReservedName(name)) continue;
+            // one of these names is skipped too, not just a directory. A reserved *directory* is a prune with
+            // no pattern source, which `fsmeta ignored` reports as such.
+            if (isReservedName(name)) {
+                const stat = dir.statFile(self.io, name, .{ .follow_symlinks = false }) catch continue;
+                if (stat.kind == .directory) {
+                    try self.pruned.append(self.arena, .{
+                        .path = try self.relName(rel_dir, name),
+                        .source = "reserved",
+                    });
+                }
+                continue;
+            }
 
             const stat = try dir.statFile(self.io, name, .{ .follow_symlinks = false });
             const kind = factKind(stat.kind) orelse continue;
 
-            // Extra configured names apply to directories only: the option is a *directory* name list.
-            if (kind == .dir and self.isIgnoredDirName(name)) continue;
+            const rel_name = try self.relName(rel_dir, name);
 
-            const rel_name = if (rel_dir.len == 0)
-                try self.arena.dupe(u8, name)
-            else
-                try std.fmt.allocPrint(self.arena, "{s}/{s}", .{ rel_dir, name });
+            // Extra configured names apply to directories only: the option is a *directory* name list.
+            if (kind == .dir and self.isIgnoredDirName(name)) {
+                try self.pruned.append(self.arena, .{ .path = rel_name, .source = "reserved" });
+                continue;
+            }
 
             if (!format.nameValid(rel_name)) {
                 // A name the format cannot store: a newline, a backslash, invalid UTF-8, ... The walk must
@@ -166,7 +202,22 @@ const Walker = struct {
                 continue;
             }
 
-            if (self.options.respect_gitignore and self.isIgnored(rel_name, kind == .dir)) continue;
+            // The boundary rule (`plans/worktrees.md` § 4): a directory whose `.git` entry confirms is another
+            // repository and is neither listed nor entered. Checked before `.gitignore` so a nested clone that
+            // is also ignored is still *reported* as the reason it is absent.
+            if (kind == .dir) {
+                const nested = boundary_mod.confirm(self.arena, self.io, dir, name);
+                if (nested != .none) {
+                    try self.boundaries.append(self.arena, .{ .path = rel_name, .kind = nested });
+                    try self.pruned.append(self.arena, .{ .path = rel_name, .source = "boundary" });
+                    continue;
+                }
+            }
+
+            if (self.ignoreSource(rel_name, kind == .dir)) |source| {
+                if (kind == .dir) try self.pruned.append(self.arena, .{ .path = rel_name, .source = source });
+                continue;
+            }
 
             var fact = Fact{
                 .name = rel_name,
@@ -205,6 +256,11 @@ const Walker = struct {
         }
     }
 
+    fn relName(self: *Walker, rel_dir: []const u8, name: []const u8) ![]const u8 {
+        if (rel_dir.len == 0) return self.arena.dupe(u8, name);
+        return std.fmt.allocPrint(self.arena, "{s}/{s}", .{ rel_dir, name });
+    }
+
     fn isIgnoredDirName(self: *Walker, name: []const u8) bool {
         for (self.options.ignored_dir_names) |ignored| {
             if (std.mem.eql(u8, name, ignored)) return true;
@@ -212,8 +268,22 @@ const Walker = struct {
         return false;
     }
 
-    /// The decision of the deepest applicable `.gitignore` that has one, or "not ignored" when none has.
-    fn isIgnored(self: *Walker, rel_name: []const u8, is_dir: bool) bool {
+    /// The four-source chain of § 5: the `.gitignore` stack, then `info/exclude`, then `.fs-meta/ignore` (whose
+    /// managed block is evaluated last inside the source). The first source that excludes wins, and a later `!` is
+    /// never asked — that is the no-cross-source negation rule. A source's own negation still works: the chain's
+    /// stack returns `false` when the deepest file re-includes, and `Sources` does the same for its file.
+    fn ignoreSource(self: *Walker, rel_name: []const u8, is_dir: bool) ?[]const u8 {
+        if (self.options.respect_gitignore) {
+            if (self.chainDecision(rel_name, is_dir)) |excluded| {
+                if (excluded) return ignores.Source.gitignore.name();
+            }
+        }
+        if (self.sources.decide(rel_name, is_dir)) |source| return source.name();
+        return null;
+    }
+
+    /// The decision of the deepest applicable `.gitignore` that has one, or "no opinion" when none has.
+    fn chainDecision(self: *Walker, rel_name: []const u8, is_dir: bool) ?bool {
         var index = self.ignore_stack.items.len;
         while (index > 0) {
             index -= 1;
@@ -224,7 +294,7 @@ const Walker = struct {
                 rel_name[frame.dir_len + 1 ..]; // skip the `.gitignore` directory and its '/'
             if (frame.rules.decide(scoped, is_dir)) |decision| return decision;
         }
-        return false;
+        return null;
     }
 };
 
@@ -516,6 +586,18 @@ fn expectNames(facts: []const Fact, expected: []const []const u8) !void {
     }
 }
 
+fn findPruned(result: Result, path: []const u8) ?Pruned {
+    for (result.pruned) |pruned| {
+        if (std.mem.eql(u8, pruned.path, path)) return pruned;
+    }
+    return null;
+}
+
+fn writeTestFile(dir: std.Io.Dir, io: std.Io, name: []const u8, data: []const u8) !void {
+    try dir.createDirPath(io, std.fs.path.dirname(name) orelse ".");
+    try dir.writeFile(io, .{ .sub_path = name, .data = data });
+}
+
 test "names are sorted by bytes, and files, directories and file identities are recorded" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -758,6 +840,197 @@ test "respect_gitignore = false lists everything except the reserved directories
         "build/keep.txt",
         "build/x.txt",
     });
+}
+
+test ".fs-meta/ignore excludes a subtree, and deleting the line brings it back" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, io, ".fs-meta/ignore", "worktrees/w1/\n");
+    try writeTestFile(tmp.dir, io, "worktrees/w1/secret.txt", "s");
+    try writeTestFile(tmp.dir, io, "worktrees/w2/keep.txt", "k");
+    try writeTestFile(tmp.dir, io, "top.txt", "t");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const first = try scanDetailed(arena.allocator(), io, root, .{});
+    try expectNames(first.facts, &.{ "top.txt", "worktrees", "worktrees/w2", "worktrees/w2/keep.txt" });
+    const pruned = findPruned(first, "worktrees/w1").?;
+    try testing.expectEqualStrings("fs-meta/ignore", pruned.source);
+
+    // A hand edit is visible on the very next walk: the source is re-read, never cached.
+    try writeTestFile(tmp.dir, io, ".fs-meta/ignore", "");
+    const second = try scanDetailed(arena.allocator(), io, root, .{});
+    try testing.expect(findPruned(second, "worktrees/w1") == null);
+    try testing.expect(findFact(second.facts, "worktrees/w1/secret.txt") != null);
+}
+
+test "info/exclude excludes a subtree, and deleting the line brings it back" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, io, ".git/info/exclude", "cache/\n");
+    try writeTestFile(tmp.dir, io, "cache/generated.txt", "g");
+    try writeTestFile(tmp.dir, io, "keep.txt", "k");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const first = try scanDetailed(arena.allocator(), io, root, .{});
+    try expectNames(first.facts, &.{"keep.txt"});
+    try testing.expectEqualStrings("info/exclude", findPruned(first, "cache").?.source);
+
+    try writeTestFile(tmp.dir, io, ".git/info/exclude", "");
+    const second = try scanDetailed(arena.allocator(), io, root, .{});
+    try testing.expect(findFact(second.facts, "cache/generated.txt") != null);
+    try testing.expect(findPruned(second, "cache") == null);
+
+    // The list of sources says what was consulted: `info/exclude` stays present because the file still is.
+    try testing.expectEqual(@as(usize, 2), second.ignore_sources.len);
+    try testing.expectEqualStrings("gitignore", second.ignore_sources[0]);
+    try testing.expectEqualStrings("info/exclude", second.ignore_sources[1]);
+}
+
+test "a later source cannot re-include an earlier exclusion" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `.gitignore` excludes; `.fs-meta/ignore`'s `!` must not re-open it.
+    try writeTestFile(tmp.dir, io, ".gitignore", "worktrees/w1/\n");
+    try writeTestFile(tmp.dir, io, ".fs-meta/ignore", "!worktrees/w1/\n");
+    // `info/exclude` excludes; `.fs-meta/ignore`'s `!` must not re-open it either.
+    try writeTestFile(tmp.dir, io, ".git/info/exclude", "cache/\n!cache/\n");
+    try writeTestFile(tmp.dir, io, "worktrees/w1/secret.txt", "s");
+    try writeTestFile(tmp.dir, io, "cache/x.txt", "x");
+    try writeTestFile(tmp.dir, io, "keep.txt", "k");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const result = try scanDetailed(arena.allocator(), io, root, .{});
+    try testing.expect(findFact(result.facts, "keep.txt") != null);
+    try testing.expect(findFact(result.facts, "worktrees/w1/secret.txt") == null);
+    try testing.expectEqualStrings("gitignore", findPruned(result, "worktrees/w1").?.source);
+    // info/exclude's own `!cache/` cancels its `cache/`, so the later `.fs-meta/ignore` `!` has nothing to override
+    // and the directory is listed; this is per-source negation, not cross-source.
+    try testing.expect(findFact(result.facts, "cache/x.txt") != null);
+
+    // Now `info/exclude` excludes and `.fs-meta/ignore` negates: the earlier decision stands.
+    try writeTestFile(tmp.dir, io, ".git/info/exclude", "cache/\n");
+    try writeTestFile(tmp.dir, io, ".fs-meta/ignore", "!cache/\n");
+    const second = try scanDetailed(arena.allocator(), io, root, .{});
+    try testing.expect(findFact(second.facts, "cache/x.txt") == null);
+    try testing.expectEqualStrings("info/exclude", findPruned(second, "cache").?.source);
+}
+
+test "--no-gitignore keeps .fs-meta/ignore, and .gitignore/info/exclude are not consulted" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, io, ".gitignore", "a.txt\n");
+    try writeTestFile(tmp.dir, io, ".git/info/exclude", "cache/\n");
+    try writeTestFile(tmp.dir, io, ".fs-meta/ignore", "worktrees/w1/\n");
+    try writeTestFile(tmp.dir, io, "a.txt", "a");
+    try writeTestFile(tmp.dir, io, "cache/c.txt", "c");
+    try writeTestFile(tmp.dir, io, "worktrees/w1/w.txt", "w");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const result = try scanDetailed(arena.allocator(), io, root, .{ .respect_gitignore = false });
+    try testing.expect(findFact(result.facts, "a.txt") != null);
+    try testing.expect(findFact(result.facts, "cache/c.txt") != null);
+    try testing.expect(findFact(result.facts, "worktrees/w1/w.txt") == null);
+    try testing.expectEqual(@as(usize, 1), result.ignore_sources.len);
+    try testing.expectEqualStrings("fs-meta/ignore", result.ignore_sources[0]);
+}
+
+test "a linked worktree reads info/exclude from its common dir during the walk" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+    try writeTestFile(tmp.dir, io, "main/.git/info/exclude", "cache/\n");
+    try writeTestFile(tmp.dir, io, "main/.git/worktrees/wt/commondir", "../..\n");
+    try writeTestFile(tmp.dir, io, "wt/.git", "gitdir: ../main/.git/worktrees/wt\n");
+    try writeTestFile(tmp.dir, io, "wt/cache/generated.txt", "g");
+    try writeTestFile(tmp.dir, io, "wt/keep.txt", "k");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+    const root = try std.fs.path.join(arena.allocator(), &.{ base, "wt" });
+
+    const result = try scanDetailed(arena.allocator(), io, root, .{});
+    try testing.expect(findFact(result.facts, "keep.txt") != null);
+    try testing.expect(findFact(result.facts, "cache/generated.txt") == null);
+    try testing.expectEqualStrings("info/exclude", findPruned(result, "cache").?.source);
+}
+
+test "a nested clone is a boundary: its files are absent and the boundary is reported" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "visible.txt", .data = "v" });
+    try tmp.dir.createDirPath(io, "clone");
+    try tmp.dir.createDirPath(io, "clone/.git/objects");
+    try tmp.dir.writeFile(io, .{ .sub_path = "clone/.git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "clone/secret.txt", .data = "s" });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const result = try scanDetailed(arena.allocator(), io, root, .{});
+    // The boundary directory itself is absent too: a trio describes one tree, and a directory whose contents
+    // are all missing would be a half-description.
+    try expectNames(result.facts, &.{"visible.txt"});
+    try testing.expectEqual(@as(usize, 1), result.boundaries.len);
+    try testing.expectEqualStrings("clone", result.boundaries[0].path);
+    try testing.expectEqual(boundary_mod.Kind.repo, result.boundaries[0].kind);
+}
+
+test "a stray .git directory is entered like any other directory, and is not a boundary" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "fixture/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/.git/notes.txt", .data = "not a repo\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fixture/a.txt", .data = "a" });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+
+    var arena = TestArena.init();
+    defer arena.deinit();
+
+    const result = try scanDetailed(arena.allocator(), io, root, .{});
+    try expectNames(result.facts, &.{ "fixture", "fixture/a.txt" });
+    try testing.expectEqual(@as(usize, 0), result.boundaries.len);
 }
 
 /// A symlink cannot be created without the privilege that creates one: on Windows that is

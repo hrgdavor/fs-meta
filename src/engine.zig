@@ -27,6 +27,8 @@ const publish_mod = @import("publish.zig");
 const batch_mod = @import("batch.zig");
 const scan = @import("scan.zig");
 const ignore_mod = @import("ignore.zig");
+const ignores = @import("ignores.zig");
+const boundary_mod = @import("boundary.zig");
 
 pub const Cache = cache_mod.Cache;
 
@@ -89,6 +91,30 @@ fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.real.now(io).nanoseconds;
 }
 
+/// Whether `name` is strictly below `base` in the trio's `/`-separated namespace. The boundary directory itself
+/// was never listed, so only its children can be found under it.
+fn isUnder(name: []const u8, base: []const u8) bool {
+    if (name.len <= base.len) return false;
+    if (!std.mem.startsWith(u8, name, base)) return false;
+    return name[base.len] == '/';
+}
+
+/// How many names the previous generation had under any of this pass's boundaries. That count is the migration:
+/// the first pass after the rule lands deletes them, and the user is told why once rather than discovering it.
+fn countUnderBoundaries(items: []const batch_mod.Item, boundaries: []const boundary_mod.Boundary) u64 {
+    if (boundaries.len == 0) return 0;
+    var total: u64 = 0;
+    for (items) |item| {
+        for (boundaries) |boundary| {
+            if (isUnder(item.name, boundary.path)) {
+                total += 1;
+                break;
+            }
+        }
+    }
+    return total;
+}
+
 pub const Outcome = struct {
     /// `ok` when the previous trio was valid, or the verdict it failed with (the pass then rebuilt from nothing).
     previous_verdict: validate.Verdict = .ok,
@@ -99,6 +125,15 @@ pub const Outcome = struct {
     report: coldstart.Report = .{},
     /// Entries whose content hash was taken by this pass (the dirty ones). Unchanged entries reuse theirs.
     hashed: u64 = 0,
+    /// Nested repositories this pass refused to cross (`plans/worktrees.md` § 4). Recorded in the trio as
+    /// `scan.nestedRepos = true`; reported by `scan --json` as a list, and counted here for the log.
+    boundaries: u64 = 0,
+    /// The boundaries themselves, workspace-relative. M6's pass-time discovery reads this: with `gitwatch` off there
+    /// is no metadata event, so the pass that saw a new worktree is the only discovery route.
+    boundary_paths: []const boundary_mod.Boundary = &.{},
+    /// Names the previous generation described under a boundary and this pass does not. Non-zero means the
+    /// boundary rule changed the answer for this root, which is what the one-line migration notice says.
+    dropped_under_boundaries: u64 = 0,
     /// Where the pass spent its time.
     stats: Stats = .{},
 };
@@ -161,26 +196,42 @@ var previous: std.ArrayListUnmanaged(batch_mod.Item) = .empty;
             }
             cache = try Cache.load(arena, result.entries, result.names, generation);
 // The previous generation exists only here: discovery mutates the cache in place.
-for (cache.files.keys()) |name| try previous.append(arena, batch_mod.fileItem(name, cache.files.get(name).?));
+//
+// Only the entries may be borrowed from the cache; **the names are duplicated**. A cache loaded from a trio
+// keys its entries by interior slices of that trio's `files.txt`, and `coldstart` frees the name of every entry
+// it removes — `Allocator.free` writes `undefined` (0xAA in a debug build) over the slice, and only then is the
+// arena free a no-op. A snapshot holding those slices would read a dead name for exactly the deleted entries,
+// which are the only names `diff` takes from `previous`: a deletion keeps the hash and no bytes, so a batch
+// cannot recover the path from the entry. Owning the names here is what puts the path that was deleted into
+// `batches/<generation>/files.txt`.
+for (cache.files.keys()) |name| try previous.append(arena, batch_mod.fileItem(try arena.dupe(u8, name), cache.files.get(name).?));
 for (cache.dirs.keys()) |name| {
 if (name.len == 0) continue;
-try previous.append(arena, batch_mod.dirItem(name, cache.dirs.get(name).?));
+try previous.append(arena, batch_mod.dirItem(try arena.dupe(u8, name), cache.dirs.get(name).?));
 }
         }
     }
 
-    // 3. The tree, through the OS lister.
+    // 3. The tree, through the OS lister. The two root-level ignore sources are re-read here on every pass — no
+    // cached copy and no mtime (`plans/worktrees.md` § 5b), which is what makes a hand edit land on the next one.
     const t1 = nowNs(io);
     var rules = ignore_mod.Stack.init(arena, io, root, options.respect_gitignore);
     defer rules.deinit();
+    var sources = try ignores.Sources.load(arena, io, root, options.respect_gitignore);
+    defer sources.deinit();
     var tree: lister.Tree = .{
         .io = io,
+        .root = root,
         .reserved = &.{ ".git", ".fs-meta" },
         .ignored_dir_names = options.ignored_dir_names,
         .ignore = &rules,
+        .sources = &sources,
         .per_file = options.per_file,
     };
     outcome.report = try coldstart.coldStart(arena, &cache, tree.lister(), root);
+    outcome.boundaries = tree.boundaries.items.len;
+    outcome.boundary_paths = tree.boundaries.items;
+    outcome.dropped_under_boundaries = countUnderBoundaries(previous.items, tree.boundaries.items);
     const t2 = nowNs(io);
     outcome.count = cache.files.count() + cache.dirCount();
 
@@ -223,6 +274,12 @@ try previous.append(arena, batch_mod.dirItem(name, cache.dirs.get(name).?));
             },
             .ignored_dir_names = options.ignored_dir_names,
             .respect_gitignore = options.respect_gitignore,
+            // The engine always applies the boundary rule, so the record is always present. Absent in a trio
+            // means an older engine (or a port) that did not, and a reader may not infer the rule from it.
+            .nested_repos = true,
+            // What this pass actually consulted, in precedence order. A missing file is absent from the list
+            // rather than present as a stale entry; `.gitignore` is listed whenever the flag allowed the chain.
+            .ignore_sources = sources.active,
         },
     });
     outcome.published = true;
@@ -380,6 +437,159 @@ test "a changed file makes the next pass publish, and the change is listing-only
     try testing.expect(after.published);
     try testing.expectEqual(@as(u64, 2), after.generation);
     try testing.expectEqual(@as(u64, 1), after.report.files_modified);
+}
+
+test "a deleted name survives into the batch that records it" {
+    // The regression this guards: the `previous` snapshot is built *before* discovery, discovery frees the cache
+    // entry of a name it no longer sees (for a trio-loaded cache that is an interior slice of `files.txt`), and
+    // the batch writer then copies the name. Without an owned snapshot the deleted entry's path in the batch's
+    // `files.txt` is a dead run of one byte, which still passes the self-delimiting LF check in `batch.decode`
+    // and reaches a consumer as `deleted <mojibake>`.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, io, "a.txt", "one\n");
+    try writeFile(tmp.dir, io, "src/b.java", "class B {}\n");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..count];
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    _ = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:00Z" });
+    try tmp.dir.deleteFile(io, "src/b.java");
+    const second = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:01Z" });
+    try testing.expect(second.published);
+    try testing.expectEqual(@as(u64, 2), second.generation);
+
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+    defer meta_dir.close(io);
+    var batch_dir = try meta_dir.openDir(io, "batches/00000002", .{});
+    defer batch_dir.close(io);
+    const txt = try batch_dir.readFileAlloc(io, format.txt_file, arena, std.Io.Limit.limited(1 << 16));
+
+    try testing.expect(std.mem.indexOf(u8, txt, "src/b.java\n") != null);
+    // And no line is a single repeated byte: a dead name is a run of the allocator's poison (0xAA in debug),
+    // and no real path is. A one-byte name is skipped because `aaaa` would trivially match.
+    var lines = std.mem.splitScalar(u8, txt, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 2) continue;
+        var all_same = true;
+        for (line[1..]) |byte| {
+            if (byte != line[0]) {
+                all_same = false;
+                break;
+            }
+        }
+        try testing.expect(!all_same);
+    }
+}
+
+test "a nested repository is absent from the trio, and the trio records the boundary rule" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, io, "visible.txt", "v\n");
+    try tmp.dir.createDirPath(io, "clone/.git/objects");
+    try writeFile(tmp.dir, io, "clone/.git/HEAD", "ref: refs/heads/main\n");
+    try writeFile(tmp.dir, io, "clone/secret.txt", "s\n");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..count];
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    const first = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:00Z" });
+    try testing.expect(first.published);
+    try testing.expectEqual(@as(u64, 1), first.boundaries);
+
+    // The trio describes one tree: the boundary's files are absent, and the record says why without growing.
+    const names = try trioNames(arena, root, io);
+    try testing.expect(hasName(names, "visible.txt"));
+    try testing.expect(!hasName(names, "clone/secret.txt"));
+    try testing.expect(!hasName(names, "clone"));
+
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+    defer meta_dir.close(io);
+    const document = try meta_dir.readFileAlloc(io, format.json_file, arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, document, "\"nestedRepos\": true") != null);
+
+    // A second pass is unchanged: the rule is stable, not a one-time deletion.
+    const second = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:01Z" });
+    try testing.expect(!second.published);
+    try testing.expectEqual(@as(u64, 0), second.dropped_under_boundaries);
+}
+
+test "the ignore sources exclude, are recorded, and a hand edit lands on the next pass" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, io, ".gitignore", "*.log\n");
+    try writeFile(tmp.dir, io, ".git/info/exclude", "cache/\n");
+    try writeFile(tmp.dir, io, ".fs-meta/ignore", "worktrees/w1/\n");
+    try writeFile(tmp.dir, io, "a.txt", "a\n");
+    try writeFile(tmp.dir, io, "debug.log", "d\n");
+    try writeFile(tmp.dir, io, "cache/generated.txt", "g\n");
+    try writeFile(tmp.dir, io, "worktrees/w1/secret.txt", "s\n");
+    try writeFile(tmp.dir, io, "worktrees/w2/keep.txt", "k\n");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..count];
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    const first = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:00Z" });
+    try testing.expect(first.published);
+
+    // Both root-level sources did their job, and the walk and the pass agree about the result.
+    const from_pass = try trioNames(arena, root, io);
+    const from_walk = try scanNames(arena, root, io);
+    try expectNameSets(from_walk, from_pass);
+    try testing.expect(hasName(from_pass, "a.txt"));
+    try testing.expect(hasName(from_pass, "worktrees/w2/keep.txt"));
+    try testing.expect(!hasName(from_pass, "debug.log"));
+    try testing.expect(!hasName(from_pass, "worktrees/w1/secret.txt"));
+    try testing.expect(!hasName(from_pass, "cache/generated.txt"));
+
+    // The trio records what it consulted, in precedence order.
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+    defer meta_dir.close(io);
+    var document = try meta_dir.readFileAlloc(io, format.json_file, arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, document,
+        "\"ignoreSources\": [\"gitignore\", \"info/exclude\", \"fs-meta/ignore\"]") != null);
+
+    // A hand edit to `.fs-meta/ignore` is re-read on the next pass; nothing cached the old rules.
+    try writeFile(tmp.dir, io, ".fs-meta/ignore", "");
+    const second = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:01Z" });
+    try testing.expect(second.published);
+    const relaxed = try trioNames(arena, root, io);
+    try testing.expect(hasName(relaxed, "worktrees/w1/secret.txt"));
+
+    // Deleting git's line brings its subtree back too, and the source leaves the recorded list with the file.
+    try tmp.dir.deleteFile(io, ".git/info/exclude");
+    const third = try refresh(arena, io, root, .{ .updated = "2026-10-18T00:00:02Z" });
+    try testing.expect(third.published);
+    const restored = try trioNames(arena, root, io);
+    try testing.expect(hasName(restored, "cache/generated.txt"));
+    document = try meta_dir.readFileAlloc(io, format.json_file, arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, document,
+        "\"ignoreSources\": [\"gitignore\", \"fs-meta/ignore\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, document, "\"info/exclude\"") == null);
 }
 
 /// The names a trio describes, sorted the way the trio sorts them.

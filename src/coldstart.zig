@@ -24,6 +24,7 @@
 const std = @import("std");
 const format = @import("format.zig");
 const cache_mod = @import("cache.zig");
+const boundary_mod = @import("boundary.zig");
 
 pub const Cache = cache_mod.Cache;
 
@@ -35,6 +36,10 @@ pub const EntryInfo = struct {
     size_bytes: u64,
     file_id_lo: u64,
     file_id_hi: u64,
+    /// Set for a directory that confirms as a nested repository (`boundary.zig`). The walker neither lists it
+    /// nor enters it; the field is what carries that decision out of the listing, where the directory handle
+    /// already exists, instead of reopening every directory to ask.
+    boundary: boundary_mod.Kind = .none,
 };
 
 /// The metadata of one path: the directory's own mtime and identity.
@@ -105,6 +110,13 @@ const Dropped = struct {
 /// Reconcile `cache` with the tree at `root`. `arena` is scratch for the call; the cache keeps its own memory.
 pub fn coldStart(arena: std.mem.Allocator, cache: *Cache, lister: Lister, root: []const u8) !Report {
     var report: Report = .{};
+
+    // Every key this pass inserts is duplicated below, so the cache becomes the owner of its keys: `deinit` may
+    // free them, and so may a removal. A cache loaded from a trio is already in that state (`Cache.load`
+    // duplicates too) and a fresh one is not, which is why this is a fact set here rather than a constructor
+    // parameter. Without it, a loaded cache's keys were borrowed slices of `files.txt` and freeing one poisoned
+    // the trio's own bytes.
+    cache.owns_keys = true;
 
     // The root is bookkeeping rather than an entry (§ 3), and it needs a state like any other directory: its own
     // mtime and identity are what the *next* pass compares, and its child lists are what a removal is looked for

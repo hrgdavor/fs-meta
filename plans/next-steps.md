@@ -10,12 +10,22 @@ cd fs-meta
 D:\wrk\zig\17\zig.exe build test --cache-dir .zig-cache\local --summary all
 ```
 
-Today: **37/37 steps, 321/327 tests** (6 skipped — **two** platform guards, each counted in three test binaries;
+Today: **40/40 steps, 431/437 tests** (6 skipped — **two** platform guards, each counted in three test binaries;
 see § G). Before the move it was 41 steps: the four file-modules for the matcher and the chain left with their 27
-tests.
+tests; the daemon (§ 18 of [`daemon.md`](archive/daemon.md)) added one more test binary and its tests, and § H's fix added
+the two regression tests counted here.
 
-The Bun gate (`bun test`, which runs `js/` and `test/`) is **71 pass, 4 skip, 0 fail** across 75 tests: three
-writer-scope tests (§ G1) and one POSIX-only socket assertion (§ G2).
+The Bun gate (`bun test`, which runs `js/` and `test/`) is **99 pass, 4 skip, 0 fail** across 103 tests: three
+writer-scope tests (§ G1), one POSIX-only socket assertion (§ G2), and the suites the daemon work added
+(`test/daemon.test.mjs`, `test/daemon-parity.test.mjs`, `test/query-cli.test.mjs`). The two `reconcile` failures
+this file used to record are gone (§ H).
+
+**Status of the sections below, verified against the code:** A (the gitignore move) is done — the dependency is a
+pinned URL, not a path; B (pair layout) is done — `publish` lays out through `pair.layout` with the count assertion
+and emits `roots`; C (the batches' consumer entry point) is done — `fsmeta reconcile`, both refusals, the baseline;
+D (the socket server, live included) is done — `fsmeta serve`, `test/socket.test.mjs`; E1–E3 (both ports and their
+matchers on the vendored vectors) are done. **F remains deliberately open**, § H was a real defect and is fixed, and
+§ I records two small warts.
 
 ## A. Sync with the gitignore move
 
@@ -30,7 +40,7 @@ writer-scope tests (§ G1) and one POSIX-only socket assertion (§ G2).
   re-run the gate. Acceptance: same test count, no path reference left (`grep -r "\.\./gitignore" fs-meta`).
 
 **A2. Do not re-add the moved files.** `.gitignore` parsing, the chain and `globMatch` live in
-[`../gitignore/`](../gitignore/README.md); a change to matching behaviour belongs there, with a vector and a bench row,
+[`../../gitignore/`](../../gitignore/README.md); a change to matching behaviour belongs there, with a vector and a bench row,
 not in `fs-meta`. The practical test: if a change needs `src/gitignore.zig`, it is a change to the other project.
 
 **A3. Measure through the other project from now on.** `fs-meta`'s own numbers (`doc/benchmark.md`,
@@ -39,7 +49,7 @@ re-measured in `gitignore/bench` and `fs-meta`'s documents link there instead of
 
 ## B. The pair layout (the open defect)
 
-Full detail, with the code, is in [`plans/next-session-pair-layout.md`](next-session-pair-layout.md). Summary:
+Full detail, with the code, is in [`plans/next-session-pair-layout.md`](archive/next-session-pair-layout.md). Summary:
 
 - **B1.** Add the count assertion in `publish` before `pair.layout`:
   `items.items.len == cache.files.count() + cache.dirs.count() - 1`. It either fires (the item loop) or holds (a real
@@ -73,12 +83,16 @@ Full detail, with the code, is in [`plans/next-session-pair-layout.md`](next-ses
   at `g-1`.
 - **D4.** Acceptance: a client written in Bun (or curl-like) receives a replay identical to reading the batch folder.
 
-## E. Ports
+## E. Ports — done
 
-- **E1. Bun reader** — `fs-meta/js` still speaks the old 64-byte layout: `nameHash`/`sizeBytes` transposed, no
-  directories, no `roots`. Owner: the port, against `conformance` vectors.
-- **E2. Java reader** — [`doc/java-port.md`](doc/java-port.md) is the ordered plan; nothing implemented.
-- **E3. Both ports' matchers** should consume `gitignore`'s vectors and bench rather than re-deriving them.
+All three E items are implemented and gated; the ordered plan for the Java reader is kept for the record in
+[`../doc/java-port.md`](../doc/java-port.md).
+
+- **E1. Bun reader** — `js/` speaks the current layout (directories, `roots`, batches) and answers the conformance
+  vectors; `test/portability.test.mjs` is its reader gate.
+- **E2. Java reader** — `src/main/java/hr/hrg/fsmeta/` is implemented and passes its Maven suite (62 tests, 1 skipped,
+  0 failures on 2026-10-26); `doc/java-port.md` records the order it was built in.
+- **E3. Both ports' matchers** consume `gitignore`'s vectors and bench rather than re-deriving them.
 
 ## F. Retention and the WAL (deliberately open)
 
@@ -86,16 +100,16 @@ Full detail, with the code, is in [`plans/next-session-pair-layout.md`](next-ses
 `batch-too-old` becomes reachable. No code depends on the answer: `diff`, `encode`, `decode` and `collapse` all survive
 it unchanged.
 
-- `reconcile --baseline <root>`: specified in [`reconcile-baseline.md`](reconcile-baseline.md); the adapter, the flags it must reconstruct, and the test that proves it.
+- `reconcile --baseline <root>`: specified in [`reconcile-baseline.md`](archive/reconcile-baseline.md); the adapter, the flags it must reconstruct, and the test that proves it.
 
 ## G. The skips, and why each one is deliberate
 
-A fresh-cache gate prints `321/327 tests passed (6 skipped)`. That is **two** Zig tests counted in three test
+A fresh-cache gate prints `431/437 tests passed (6 skipped)`. That is **two** Zig tests counted in three test
 binaries — `scan`, `lister` and `engine` all import `scan.zig`, and a test binary runs its imports' tests too — so
 the six are not six separate gaps. Both skip sites print their platform and condition before returning
 `error.SkipZigTest`; `zig build test` echoes them once per test binary (the three that import `scan.zig`),
 preceded by the builder's `+- run test` / `failed command:` context header. That header is the builder showing a
-step's stderr, not a failed step: the summary still ends `37/37 steps succeeded`. A direct run of the binary shows
+step's stderr, not a failed step: the summary still ends `40/40 steps succeeded`. A direct run of the binary shows
 the same reason next to its `SKIP` line.
 
 | Test (`src/scan.zig`)                                   | Why it skips | What would close it                                                                     |
@@ -118,4 +132,104 @@ is win32; an S_ISSOCK node on the bound address is POSIX-only". Linux/macOS CI i
 
 ## The daemon
 
-A long-lived process that tracks several roots, keeps a Unix socket per root for consumers, and decides when each root is worth watching (`off` / `always` / `auto` with a per-root idle timeout, so a slept root wakes with one full scan and a diff). Planned in [daemon.md](daemon.md); Zig only, and shaped so a root can later be served by its own child daemon without changing the consumer socket.
+A long-lived process that tracks several roots, keeps a Unix socket per root for consumers, and decides when each root is worth watching (`off` / `always` / `auto` with a per-root idle timeout, so a slept root wakes with one full scan and a diff). Planned in [daemon.md](archive/daemon.md); Zig only, and shaped so a root can later be served by its own child daemon without changing the consumer socket.
+
+**Implemented:** M0–M4 — the runtime/home split, `roots.json`, the state machine, the per-root sockets, the `STATE`
+frame (`FORMAT.socket.md`, protocol `0x0101`), sleep and wake with a scan and a diff, per-root retention by count and
+bytes with `on_remove`, the control socket and the `daemon`/`root`/`roots` CLI. Watching is event-driven
+(`nightwatch`) and each root schedules itself, so a batch never waits on another root's pass. Housekeeping calls
+over many roots follow the bounded-wait rule in `FORMAT.daemon.md` § 4b: they name a root they could not read
+(`available: false`, `partial: true`) instead of blocking or guessing. `FORMAT.daemon.md` is the reference;
+`test/daemon.test.mjs` is the suite.
+
+**Still open, in the order that matters:**
+
+1. **The per-root child daemon (M5)** has moved out of the daemon plan, to
+   [`tbd-per-root-daemon.md`](tbd-per-root-daemon.md) — it is not needed for the daemon to work, and the latency
+   argument that motivated it was removed by the per-root scheduler. What is left is failure and memory isolation,
+   and that file says what would trigger it and what has to be decided first.
+
+**Done since this list was written, besides the nested-roots decision below:** the watcher-overflow gap is closed by a
+safety net, not a counter — `nightwatch` cannot report an overflow (a failed `ReadDirectoryChangesW` completion ends
+its thread), so a `watching` root runs one pass after 60 s of silence and re-arms the watcher if that pass finds a
+change the watcher missed; `event_passes` / `safety_passes` in `root status` are the split (`FORMAT.daemon.md` § 2b).
+The `coldstart` key-ownership cleanup in § H is also done.
+
+**Settled since this list was written — and now implemented:** nested roots. § 16b of
+[daemon.md](archive/daemon.md) measured the overlap (10 of 10 edits produce a pass in both roots; a nested pair scans 904
+names where one root covers the changes with 604; the inner history duplicates the overlapping batch bytes, +48.8%) and
+chose option A as the semantics with B implemented: `root add` warned with those numbers and refused nothing. **The
+worktree plan replaced that rule with a guard** ([`worktrees.md`](worktrees.md) § 5–§ 6, M2): the parent's internal ignore
+excludes a nested root, `root add` passes the parent once and refuses when it cannot arrange the line, and the startup
+pass repairs a block that was deleted or edited. The warning code is gone.
+
+**Measured, no longer open:** the wake scan. `doc/benchmark.md` § The wake scan records 20 101 names, a cold scan of
+840–1 050 ms and a wake scan of 72–76 ms for 500 changed files on this host, taken from the new
+`last_pass_duration_ms` / `last_pass_files` / `last_pass_batch_bytes` fields. That same measurement found a real bug
+outside the daemon — a genesis batch over 1 MiB could not be read back by `server.loadBatch`, so a large tree's first
+batch was undeliverable from both `fsmeta serve` and the daemon; `server.max_batch_file_bytes` now separates the file
+limit from the 1 MiB frame limit, with a test.
+
+## H. The two failing `reconcile` tests — fixed
+
+`bun test test/reconcile.test.mjs` failed two cases — `a range reports added, changed and deleted, and honours the end
+it is given` and `merge is an alias…` — with a **deleted** entry printed under a corrupted name (`deleted <mojibake>`
+where the tree had `src/b.java`), while `changed` and `added` in the same range printed correctly. It was pre-existing
+and unrelated to the daemon.
+
+**Root cause (not offsets, and not in `batch.zig`).** `engine.refresh` built its `previous` snapshot from the cache's
+keys, and for a cache loaded from a trio those keys are **interior slices of that trio's `files.txt`**. Discovery then
+mutates the cache in place: `coldstart` frees the name of every entry it removes
+(`src/coldstart.zig:131`), and Zig 0.17's `Allocator.free` writes `undefined` over the slice before the raw free —
+`0xAA` in a debug build, harmlessly a no-op in release because an arena can only rewind its last allocation. So the
+deleted entry's bytes were dead *before* `diff` ran; the batch copied them faithfully, and `decode`'s LF check still
+passed because the churn ended at the right newline. The meta entry's `nameOffset`/`nameLength` were correct all along
+(`off=17 len=10` over `"a.txt\nsrc/c.java\nªªªªªªªªªª\n"`).
+
+**Fix:** the snapshot owns its names (`try arena.dupe(u8, name)` per file and directory in `src/engine.zig`), with the
+invariant stated at the site. Regression tests: `a deleted name survives into the batch that records it`
+(`engine.zig` — verified to fail with the dupe removed) and `a deleted entry's name survives diff, encode and decode`
+(`batch.zig`; the round-trip alone cannot catch this, which is why both exist).
+
+**Follow-up, done:** the ownership itself is now uniform. `Cache.load` duplicates every key it takes from the trio,
+`coldstart` already duplicated its own, and `Cache.deinit` frees the keys when `owns_keys` is set — a flag both real
+producers set and a hand-built fixture does not, so a cache the tests assemble from literals is never freed through
+the allocator. `coldstart`'s removals are therefore freeing memory it owns, and the poisoning that caused this defect
+cannot reach `files.txt` at all. The engine's snapshot fix stays: the snapshot must own its names regardless, because
+removal legitimately frees the cache's copies.
+
+The change had one consequence worth recording, because the suite caught it: **`BaselineStore` borrowed the cache's
+keys** and outlived the cache, so once `deinit` freed them the baseline matched nothing (`changed a.txt` where `0
+names` was right — `test/reconcile.test.mjs` is the test that noticed). It now copies each key, which is the rule for
+any store that outlives the cache it was built from.
+
+## I. Two smaller warts the query CLI tests found (decided, not pending)
+
+- **A name containing a space makes a query line ambiguous.** `match` prints `name mtimeNs sizeBytes contentHash`,
+  space-separated, and the name is the only variable-width field — so a file called `my notes.txt` cannot be parsed
+  back unambiguously. **Decision: keep the shape, point at `--json`.** The text form is a human/debug view that
+  scripts already parse; changing it (quoting, a tab, name last) would break every reader for a case `--json`
+  already answers exactly, and `--json` is the documented machine path. Revisit only if a port or a test needs the
+  text form programmatically.
+- **The footer is always `<n> names`**, including `1 names`. **Decision: keep it.** All the commands print the same
+  footer and tests pin it; a pluralisation rule is a change to every command for no information.
+
+
+## J. What is next
+
+[`worktrees.md`](worktrees.md) is the next plan, and it is the first work that is not a cleanup. Three parts:
+
+- **worktrees as roots** — a worktree inside a served root is ignored by the parent (R1), nesting is guarded and refused
+  when it cannot be (R2), and an adopted worktree seeds from the base trio instead of scanning cold (R4);
+- **git-aware watching** — the root watcher also watches `$GIT_COMMON_DIR` (a *filtered* watch: never `objects/`),
+  refuses to pass while its own tree is mid-write, optionally uses the repo's hooks for precise signals, and sends
+  `GIT_EVENT` start/finish to consumers with the guarantee that a finish never precedes the `END_BATCH` of the pass it
+  describes (R3, § 5b–§ 5d);
+- **the gate (R5)** — `worktrees` (recognition, adoption, seeding, worktree events, the removal reaction) and `gitwatch`
+  (the metadata watch, latch, events, hooks) are per-root switches with daemon defaults, and `FSMETA_WORKTREES=0` is an
+  emergency override that needs no working control socket. It gates the *handling*, never the rule: a nested repository
+  — worktree, clone or submodule — is always excluded from the parent's scan, because that is what a trio describes, not
+  a feature (§ 5h).
+
+Read it before touching `lister.zig`, `coldstart.zig`, the watcher in `src/main.zig` (whose git-lock latch M3 lifts into
+the daemon), `roots.json`'s defaults or the daemon's `root add`.

@@ -20,6 +20,15 @@ pub const ScanFields = struct {
     hash_mode: []const u8,
     ignored_dir_names: []const []const u8,
     respect_gitignore: bool,
+    /// The nested-repository boundary rule was applied in this pass (`plans/worktrees.md` § 4). The reference
+    /// engine always writes `true`; the key is **optional**, and absent means "the writer did not apply the
+    /// rule", never "there was no nested repository". A port writer that does not implement the rule omits it.
+    nested_repos: ?bool = null,
+    /// The ignore sources actually in effect in this pass, in precedence order — `gitignore`, `info/exclude`,
+    /// `fs-meta/ignore` (`plans/worktrees.md` § 5, § 5g). A source whose file is absent is omitted. Optional and
+    /// additive: a reader that does not know the key ignores it, and a writer that did not read the sources omits
+    /// the key rather than claiming an empty list.
+    ignore_sources: ?[]const []const u8 = null,
 };
 
 /// A batch records itself (§ 17.2): the generation it produces, the one it follows, and the counts its entries
@@ -113,6 +122,18 @@ pub fn encode(gpa: std.mem.Allocator, fields: Fields) ![]u8 {
         }
         try writer.writeAll("], \"respectGitignore\": ");
         try writer.writeAll(if (scan.respect_gitignore) "true" else "false");
+        if (scan.nested_repos) |nested| {
+            try writer.writeAll(", \"nestedRepos\": ");
+            try writer.writeAll(if (nested) "true" else "false");
+        }
+        if (scan.ignore_sources) |sources| {
+            try writer.writeAll(", \"ignoreSources\": [");
+            for (sources, 0..) |source, index| {
+                if (index != 0) try writer.writeAll(", ");
+                try writeString(writer, source);
+            }
+            try writer.writeAll("]");
+        }
         try writer.writeAll(" },\n");
     }
     try writer.writeAll("  \"created\": ");
@@ -219,6 +240,13 @@ pub fn boolField(map: *const Map, key: []const u8) Invalid!bool {
     };
 }
 
+pub fn optionalBool(map: *const Map, key: []const u8) ?bool {
+    return switch (map.get(key) orelse return null) {
+        .bool => |b| b,
+        else => null,
+    };
+}
+
 test "the emitted document has the keys § 7 requires, and reads back" {
     const gpa = std.testing.allocator;
     const bytes = try encode(gpa, .{
@@ -234,7 +262,13 @@ test "the emitted document has the keys § 7 requires, and reads back" {
         .created = "2026-10-17T00:00:00Z",
         .updated = "2026-10-17T00:00:01Z",
         .writer = "fs-meta/1",
-        .scan = .{ .hash_mode = "text", .ignored_dir_names = &.{ ".git", ".fs-meta" }, .respect_gitignore = true },
+        .scan = .{
+            .hash_mode = "text",
+            .ignored_dir_names = &.{ ".git", ".fs-meta" },
+            .respect_gitignore = true,
+            .nested_repos = true,
+            .ignore_sources = &.{ "gitignore", "info/exclude", "fs-meta/ignore" },
+        },
     });
     defer gpa.free(bytes);
 
@@ -264,6 +298,12 @@ test "the emitted document has the keys § 7 requires, and reads back" {
     // A trio describes a workspace, not a path: no member carries one (§ 3, § 7).
     try std.testing.expect(root.get("rootPath") == null);
     try std.testing.expectEqualStrings("fs-meta/1", try stringField(root, "writer"));
+    // The two additive scan keys are written by the reference engine and remain readable as the values they are.
+    const scan = try objectField(root, "scan");
+    try std.testing.expectEqual(true, try boolField(scan, "nestedRepos"));
+    const ignore_sources = scan.get("ignoreSources").?.array;
+    try std.testing.expectEqual(@as(usize, 3), ignore_sources.items.len);
+    try std.testing.expectEqualStrings("info/exclude", ignore_sources.items[1].string);
 
     // A `wyhash` member that is not sixteen lowercase hex characters is not this document.
     try std.testing.expectError(error.Invalid, hexField(meta, "nope"));

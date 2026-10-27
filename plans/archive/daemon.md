@@ -1,6 +1,8 @@
 # fs-meta daemon — implementation plan
 
-**Status:** plan for a new session. Nothing in this document is implemented yet.
+**Status:** implemented through M4. The only unfinished item, M5 (the per-root child daemon), lives in
+[`tbd-per-root-daemon.md`](../tbd-per-root-daemon.md); § 18 is the status table — what exists, what was built
+differently, and what is open. The design as built is [`FORMAT.daemon.md`](../../FORMAT.daemon.md).
 **Language:** Zig only. Tooling and tests around it stay Bun, per the house rules.
 **Purpose:** one long-lived process that tracks a set of active roots, keeps a Unix socket per root for consumers, and
 decides when each root is worth watching.
@@ -10,7 +12,7 @@ decides when each root is worth watching.
 ## 1. What it is, in one paragraph
 
 `fsmeta daemon` runs in the background. Each **root** it tracks gets its own Unix socket that speaks the existing binary
-protocol from [`FORMAT.socket.md`](../FORMAT.socket.md) — a consumer connects, `SUBSCRIBE`s, and receives batches as the
+protocol from [`FORMAT.socket.md`](../../FORMAT.socket.md) — a consumer connects, `SUBSCRIBE`s, and receives batches as the
 tree changes. Each root has a **watch mode** (`off`, `always`, `auto`) and an **idle timeout**: watching costs a thread and
 filesystem handles, so a root that nobody is listening to can go **asleep**, and waking it costs one full scan to work
 out what changed while it slept. A small **control socket** plus a CLI let a person list roots, change modes and timeouts,
@@ -179,7 +181,7 @@ is stale and reaped. This is what stops two daemons from serving one root.
 
 ## 7. Consumer socket: one new frame, and the protocol moves to 0x0101
 
-Consumers keep using [`FORMAT.socket.md`](../FORMAT.socket.md): `HELLO`, `SUBSCRIBE`, `START_BATCH`/`CHANGE_ENTRY`/`END_BATCH`,
+Consumers keep using [`FORMAT.socket.md`](../../FORMAT.socket.md): `HELLO`, `SUBSCRIBE`, `START_BATCH`/`CHANGE_ENTRY`/`END_BATCH`,
 `PING`/`PONG`, and the two refusals. **The daemon adds no semantics to those frames.** The sleep feature adds exactly one,
 because it creates a question the wire could not ask before: *is this subscribe slow because the root is waking?*
 
@@ -420,10 +422,10 @@ Answered on 2026-10-26; a new session implements these rather than re-opening th
 - **Root-level config vs daemon config** is settled by § 9a: a global `defaults` block plus per-root records, and adding a root
   copies the current defaults, so a later change to a default never silently mutates an existing root.
 
-### 16a. Deferred: nested roots (brainstorm after M4, before M5)
+### 16a. Nested roots — settled in § 16b
 
-Allowed today, not settled. This section exists so the discussion happens deliberately — at the end of the milestone work,
-with all the measurements and the real CLI in hand — instead of being decided by whoever writes the add path.
+Allowed and settled. This section is kept as the record of what the decision had to answer — it is the checklist a
+future "should these two roots be one?" question starts from — and § 16b has the measurements, the choice and the code.
 
 **Why it is not obvious.** Two roots, one inside the other, mean two watchers over overlapping trees. Everything that is
 cheap and correct for one root becomes a question for two:
@@ -462,6 +464,46 @@ expensive — and D rejected, because a generation that skips part of its tree i
 **Output of the brainstorm:** a short decision note appended here (chosen option, the measurements behind it, and what the code
 already guarantees), and — if B is chosen — one paragraph in `README.md` under the daemon section. Then M5.
 
+### 16b. Decision: allowed, with the cost stated at add time (2026-10-26)
+
+> **Superseded (2026-10-27)** by [`../worktrees.md`](../worktrees.md) § 5–§ 6: the rule is now that a nested root is
+> *guarded* — a nested **repository** is excluded by the scan rule (a trio describes the tree minus nested
+> repositories), and a nested root that is **not** a repository is excluded by the parent's internal ignore
+> (`.fs-meta/ignore`), with `root add` refusing when that cannot be arranged — not merely warned about. A generation
+> then has a defined edge, which answers the objection that option D left a hole; the duplicate cost measured below
+> disappears by construction. The warning this section decided is removed in that plan's M2.
+
+
+Measured on this host (§ 16a of this plan asked for exactly this), with a parent root over a tree of **601 files** and a
+child root at `packages/a` (**300** of them), both `--mode always --idle 0`, daemon in a scratch runtime:
+
+| what                                                    | parent              | child               | reading                                                          |
+| ------------------------------------------------------- | ------------------: | ------------------: | ---------------------------------------------------------------- |
+| genesis pass (names / ms / batch)                       | 604 / 49 / 51 266 B | 300 / 28 / 22 467 B | both scan their own tree                                         |
+| ten edits inside the child                              | **10 passes**       | **10 passes**       | duplicate events are real: **10/10**, no coalescing across roots |
+| wake scan (100 changed inside the child, 100 elsewhere) | 604 names / 32 ms   | 300 names / 18 ms   | the parent alone covers every change at 32 ms; the pair scans **904 names / 50 ms** for the same 200 files |
+| 12 generations of batch history                         | 75 061 B            | 36 640 B            | the child's overlapping history is **+48.8%** — the same 300 files stored twice, as `packages/a/…` and as `f…` |
+
+**Decision: A as the semantics, with B implemented.** Nesting is allowed; there is no dedup and no scan skipping; and
+`root add` now says what the overlap costs, naming the root it overlaps, in both directions (a new root inside a served one,
+and a new root that contains one). It is a `note:` on a successful add, and the control reply carries it as `warning` so a
+script does not parse prose. The test is `a nested root is allowed, and adding one says what the overlap costs`.
+
+**Why not the others, with the numbers:**
+
+- **C (share a watcher, fan out by prefix)** would remove the duplicated pass and the second scan, which are ~18 ms and one
+  extra pass here — but it couples the roots' lifetimes: the parent could not sleep while the child watches, which is the
+  invariant § 2/§ 5 rest the whole idle model on. Buying 18 ms with that is a bad trade at this size.
+- **D (prune a child subtree from the parent's scan)** is still rejected: the parent's generation would stop describing its
+  whole tree, which is what a generation *is* (`FORMAT.md` § 17). A state description with a hole in it is worse than a
+  duplicate pass.
+
+**What the code already guarantees, so a nested pair is a cost and not a hazard:** independent ids (`hex8(wyhash(path))`),
+independent sockets, independent archives, independent state machines and idle deadlines; a removed parent does not touch a
+child's history (`on_remove` is per root); and the *consumer* never sees a merged stream — a client of the child gets the
+child's names. That last point is the legitimate reason to nest at all: a consumer that wants `one.txt` rather than
+`packages/a/one.txt`, and a smaller stream, cannot have it any other way.
+
 ## 17. Documentation to write as part of the work
 
 - `FORMAT.socket.md` — the `STATE` frame (§ 7): kind `0x09`, the payload fields and their meaning, when it is sent, and the
@@ -476,3 +518,48 @@ already guarantees), and — if B is chosen — one paragraph in `README.md` und
   the trio still contains no absolute path.
 - `doc/performance.md` or a note in `plans/next-steps.md` — the wake-scan cost, once measured, so the idle default has
   evidence rather than taste.
+
+## 18. Status after implementation
+
+What exists is documented in [`FORMAT.daemon.md`](../../FORMAT.daemon.md) and pinned by `zig build test` and
+`test/daemon.test.mjs`. This table exists so the next session does not re-read the plan to work out what happened.
+
+| milestone                                                                                        | state                                                                                        |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| **M0** paths, registry, state machine, durable home list, control socket, `daemon start/stop/status`, `roots list` | done (§ 1, § 3, § 4b of `FORMAT.daemon.md`)                                |
+| **M1** one root served: `RootRuntime` owns a socket, `HELLO`/`SUBSCRIBE`, cold scan, first batch | done, with one deviation: `server.zig` was **not** refactored into a `RootServer`. It owns no global state to begin with, so only its frame helpers became public and `RootRuntime` is the per-root value. The M1 gate "parity with `fsmeta serve` on the same tree" is now `test/daemon-parity.test.mjs`: one archive, both servers, same generation, batch numbers, entries and counts. |
+| **M2** state machine, idle timeout, sleep, wake with scan+diff, `STATE` frame, protocol `0x0101` | done, and the protocol pin is in `FORMAT.socket.md`                                          |
+| **M3** multi-root, add/remove at runtime, reaping, retention by count **and** bytes              | done                                                                                         |
+| **M4** diagnostics, `root status --json`, per-root log, `FORMAT.daemon.md`                       | done: `passes`, `wakes`, `head_batch`, `rotated_by_bytes`, and the per-pass cost `last_pass_duration_ms` / `last_pass_files` / `last_pass_batch_bytes` (`FORMAT.daemon.md` § 4, printed by `root status`). The measurement they exist for is in `doc/benchmark.md` § The wake scan: 20 101 names, cold scan 840–1 050 ms, wake scan 72–76 ms for 500 changed files |
+| **M5** the split seam exercised with a `child` `RootHost`                                        | **moved out** to [`tbd-per-root-daemon.md`](../tbd-per-root-daemon.md) — nothing is needed for the daemon to work, and the latency argument that motivated it was removed by the per-root scheduler (see that file for the trigger, the open decisions and the definition of done). The `RootHost` vtable in § 4 above is a sketch, not code: nothing calls it |
+| **§ 16a** nested roots brainstorm                                                                | **settled** — § 16b: allowed, with a measured-cost warning at add time (option A as the semantics, B implemented, C and D rejected with numbers). The code is `paths.isInside`, `Host.nestingWarningLocked`, the `warning` field of `root.add` and a `note:` line in the CLI |
+
+**Two design changes made while implementing, both recorded in `FORMAT.daemon.md`:**
+
+- **The watcher is `nightwatch`** (§ 3, § 12 of this plan), linked into the engine: `zig build` now has that dependency
+  because the daemon is part of `fsmeta`. The § 12 "single event loop, no thread per root" was replaced by **one
+  scheduler task per root** — a batch belongs to one root, and its latency must not depend on another root's scan or on
+  a client that stopped reading. `FORMAT.daemon.md` § 2c and the suite pin it.
+- **Housekeeping APIs over many roots follow a bounded-wait rule** (`FORMAT.daemon.md` § 4b): a per-operation budget, a
+  truthful `available: false` / `partial: true` instead of blocking, and unbounded waits only for lifecycle work. The
+  plan asked for the first half of that (§ 4b's `RootSnapshot`) without settling the waiting behaviour.
+
+**A cross-cutting bug the measurement found, and fixed:** at 20 101 names the genesis batch's `files.meta` is
+1 286 464 bytes, and `server.loadBatch` read every batch file through `wire.max_frame` (1 MiB) — so the first batch of
+a large tree could not be read back at all: the root published its generation, the subscriber got
+`STATE(waking)` → `STATE(watching)` with no batch, and only `last_error: "StreamTooLong"` said why. `fsmeta serve` had
+the same limit. A batch is a *chain* of small frames on the wire, so the frame limit was never the file limit:
+`server.max_batch_file_bytes` (256 MiB) is now separate, with a test that loads a 16 500-name batch (over the old
+limit). See `doc/benchmark.md` § The wake scan for the numbers that exposed it.
+
+**Two cleanups the work left behind, both now done:** `coldstart` freed cache keys it did not own — a cache loaded
+from a trio borrowed them from `files.txt`, so `Allocator.free`'s debug poisoning landed in the trio's own bytes
+(the § H defect, now fixed at the source: `Cache.load` and `coldstart` both own their keys, `deinit` frees them, and
+`owns_keys` says which kind of cache it is). And a watcher that dies without telling us (a buffer overflow is a
+failed `ReadDirectoryChangesW` completion, which ends nightwatch's thread) is now caught by a **safety pass** after
+60 s of silence, which re-arms the watcher when it finds a change the watcher missed; `event_passes` and
+`safety_passes` in `root status` say whether it ever earned its keep. Both are in `FORMAT.daemon.md` § 2b/§ 4.
+
+**Still open:** nothing in this plan. The per-root child daemon (M5) lives in
+[`tbd-per-root-daemon.md`](../tbd-per-root-daemon.md).
+

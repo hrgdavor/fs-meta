@@ -5,6 +5,8 @@
 > current numbers — and the reason the old ones are an order of magnitude slower — are in
 > [watch-mode.md](watch-mode.md#current-performance). The method, the trees and the harness in this document are
 > still the method; only the numbers moved.
+> [The wake scan](#the-wake-scan) at the end is the exception: it was measured on 2026-10-26, after the engine had
+> hashing, and carries its own method and caveats.
 Numbers, not impressions. The harness is [`../bench/bench.mjs`](../bench/bench.mjs); every figure below is a
 median of five runs of the ReleaseFast build (`zig build -Doptimize=ReleaseFast`), on the machine that wrote the
 reference, against trees checked out to the same volume as the engine so that no result is a cross-volume artifact.
@@ -208,6 +210,56 @@ bun fs-meta/bench/bench.mjs .tmp/bench/fory --label "Apache Fory @ <sha>" --repe
 
 The harness prints a Markdown table ready for this document, and its last line reports what it measured. Re-run it
 after a change; a warm pass that does not improve is a change that did not address the defect.
+
+## The wake scan
+
+`fsmeta daemon` sleeps an idle root, and waking it costs **one full pass** (`engine.refresh`) — the number the
+five-minute idle default was missing. This section measures that pass. `root status --json` now reports the same
+three fields for every root, so the numbers can be taken on any tree: `last_pass_duration_ms`, `last_pass_files`
+(names seen: files + directories) and `last_pass_batch_bytes` (the batch the pass wrote).
+
+**Tree.** 20 000 small text files (11–16 bytes each) across 100 directories, plus one 4 MiB file: **20 001 files,
+100 directories, 4 429 304 bytes (4.2 MiB)**, so a pass sees **20 101 names** (the root itself is not an entry).
+Each run removed `.fs-meta/`, started a fresh daemon, subscribed once, let the root sleep at `--idle 200ms`,
+changed 500 of the files while it slept, and subscribed again.
+
+**Host.** Windows 11 Pro 10.0.26300, AMD Ryzen 9 7945HX (16 cores / 32 threads), 67.9 GB RAM, fixed NTFS volume,
+Zig 0.17.0, ReleaseFast build (`zig build -Doptimize=ReleaseFast`).
+
+| pass                    | duration (ms)          | names  | batch bytes |
+| ----------------------- | ---------------------: | -----: | ----------: |
+| cold first scan         | 840–1 050 (median 860) | 20 101 | 1 567 648   |
+| wake scan (500 changed) | 72–76 (median 73)      | 20 101 | 39 568      |
+
+Three runs each. Cold was 1 050 / 860 / 840 ms, wake was 72 / 76 / 73 ms. The batch sizes were identical in every
+run because the change set was: the cold batch is the genesis change set (every name added), the wake batch is the
+500 changed entries. The cold range is wide relative to the wake one (25% vs 5%); the first run was the slowest,
+which is consistent with a cold file cache, but with three runs that is a range rather than a coefficient.
+
+Read it as: **the wake scan is a full discovery pass, ~73 ms here, not a replay of 500 changes.** Finding the diff
+is the cost; the diff itself is cheap — the wake batch is 2.5% of the first scan's genesis batch.
+
+**How this was taken.** A scratch Bun script (`.tmp/agent-b/measure.mjs`, gitignored) spawned
+`fsmeta daemon start --foreground --base .tmp/agent-b/run`, added the root with `--idle 200ms`, spoke the consumer
+protocol (`HELLO` + `SUBSCRIBE`) to connect and to disconnect, and read `root status --json` after each pass. Every
+number in the table is a field that reply printed; nothing is derived by the script.
+
+Caveats, because they decide what the number means:
+
+- **One host, one tree.** 20 001 files in 100 directories is a developer tree, not a 500 000-file monorepo, and a
+  slower volume or a deeper `.gitignore` chain moves the number. Re-run on the tree you care about and read the
+  three fields from `root status --json`.
+- **A genesis batch over 1 MiB used to be undeliverable — fixed while this was written.** Its `files.meta` alone is
+  1 286 464 bytes, and `server.loadBatch` read a batch through `wire.max_frame` (1 MiB), so after the cold pass the
+  daemon recorded `last_error: "StreamTooLong"` and the subscriber saw `STATE(waking)` → `STATE(watching)` with no
+  batch. The pass itself succeeded — the duration, name count and written batch above are real — but the first scan of
+  a tree this size could not deliver its genesis batch, and `fsmeta serve` had the same limit. A batch is a *chain* of
+  frames on the wire; the frame limit was never the file limit. `server.max_batch_file_bytes` (256 MiB) is now separate
+  from `wire.max_frame`, and `server.zig` has a test that loads a 16 500-name batch (over the old limit). The numbers
+  in the table were taken from the pass, so they stand; a re-run on the fixed binary also delivers the genesis batch.
+- **`last_pass_duration_ms` is wall clock around `engine.refresh`**: loading the previous trio, discovery, hashing
+  and publishing. It excludes the broadcast to clients and the rotation that follows, so two roots' numbers are
+  comparable even when one has a subscriber and the other does not.
 
 ## Next
 

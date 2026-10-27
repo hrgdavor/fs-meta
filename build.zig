@@ -18,10 +18,11 @@ comptime {
 }
 
 
-/// The reference implementation of `fs-meta`, plus the watcher prototype it leads.
+/// The reference implementation of `fs-meta`, plus the daemon and the watcher prototype it leads.
 ///
-/// `zig build` builds the engine, `zig build test` runs every module, and the watcher — the one artifact with a
-/// third-party dependency — is a separate step so a stale prototype can never stop the engine from building.
+/// `zig build` builds the engine (which contains `fsmeta daemon`), `zig build test` runs every module, and the
+/// watcher prototype is a separate step because it is a prototype, not because of its dependency: the daemon
+/// watches through `nightwatch` too, so that dependency is part of the engine.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -40,19 +41,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "gitignore.zig", .module = gitignore_module }},
     });
-    const basis_imports = [_]std.Build.Module.Import{
+
+    // The file-system watcher. `fsmeta daemon` arms one per watching root (`FORMAT.daemon.md` § 2b), so the
+    // engine binary imports it: the plan's watcher is event-driven, and a poll behind the same seam would be a
+    // different design with different costs.
+    const nightwatch_dep = b.dependency("nightwatch", .{ .target = target, .optimize = optimize });
+    const nightwatch_module = nightwatch_dep.module("nightwatch");
+
+    const engine_imports = [_]std.Build.Module.Import{
         .{ .name = "gitignore.zig", .module = gitignore_module },
         .{ .name = "ignore.zig", .module = ignore_module },
+        .{ .name = "nightwatch", .module = nightwatch_module },
     };
 
-    // The engine: no third-party dependency.
+    // The engine, and the daemon with it.
     const fsmeta = b.addExecutable(.{
         .name = "fsmeta",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/fsmeta.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &basis_imports,
+            .imports = &engine_imports,
         }),
     });
     b.installArtifact(fsmeta);
@@ -63,7 +72,10 @@ pub fn build(b: *std.Build) void {
     // Every module, so one command proves the whole reference.
     const test_step = b.step("test", "Run every module's tests");
     const modules = [_][]const u8{
-        "format", "json_doc", "validate", "cache", "coldstart", "scan", "lister", "publish", "engine", "watch", "watch_tuning", "watch_run", "reconcile", "batch", "wire", "pair", "query", "server",
+        "format", "json_doc", "validate", "cache", "coldstart", "scan", "lister", "boundary", "gitdir", "ignores", "nesting", "seed", "publish", "engine", "watch", "watch_tuning", "watch_run", "reconcile", "batch", "wire", "pair", "query", "server",
+        // The daemon's modules are rooted at `src/daemon_tests.zig`, because a Zig module root fixes how far an
+        // `@import` may reach: a root inside `src/daemon/` could not import the engine's `../format.zig`.
+        "daemon_tests",
     };
     for (modules) |name| {
         const tests = b.addTest(.{
@@ -71,24 +83,21 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &basis_imports,
+                .imports = &engine_imports,
             }),
         });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
-    // The watcher prototype, built against nightwatch. Separate on purpose: it is the one artifact whose
-    // dependency comes from upstream, and the engine must not depend on that fetch succeeding.
-    const dep = b.dependency("nightwatch", .{ .target = target, .optimize = optimize });
+    // The watcher prototype: the same dependency, a separate artifact because it is a prototype. It imports the
+    // engine's modules too (`engine.refresh` is what a pass is), so it gets the same import set.
     const watcher = b.addExecutable(.{
         .name = "watcher",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "nightwatch", .module = dep.module("nightwatch") },
-            },
+            .imports = &engine_imports,
         }),
     });
     const watcher_step = b.step("watcher", "Build the nightwatch watcher prototype");

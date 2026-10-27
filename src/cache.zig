@@ -49,11 +49,25 @@ pub const Cache = struct {
     /// Regular files and symlinks; directories live in `dirs`.
     files: std.StringArrayHashMapUnmanaged(FileState) = .{},
     generation: u64 = 0,
+    /// Whether the map keys were allocated by this cache (and must be freed by `deinit`). True for a cache built
+    /// by `load` or `coldstart`; false for a fixture that keys by a literal. Both real producers duplicate their
+    /// keys, which is what makes `coldstart`'s removal of a key valid — before that, a cache loaded from a trio
+    /// borrowed its keys from `files.txt` and freeing one wrote `0xAA` over the trio's own bytes.
+    owns_keys: bool = false,
 
     pub fn deinit(self: *Cache) void {
         for (self.dirs.values()) |state| {
             self.allocator.free(state.file_names);
             self.allocator.free(state.dir_names);
+        }
+        // Keys are freed only when this cache allocated them: `load` and `coldstart` duplicate every key, so a
+        // cache they built owns all of them, while a hand-built one (the tests, a fixture) may key by a literal.
+        // The empty key is the root itself and is a literal in every case — a path key is never empty.
+        if (self.owns_keys) {
+            for (self.files.keys()) |key| self.allocator.free(key);
+            for (self.dirs.keys()) |key| {
+                if (key.len > 0) self.allocator.free(key);
+            }
         }
         self.dirs.deinit(self.allocator);
         self.files.deinit(self.allocator);
@@ -95,7 +109,7 @@ pub const Cache = struct {
     /// re-added under its path while the slashed key survived as a second, unremovable entry — and a publish would
     /// list both, one of them as `src//`.
     pub fn load(allocator: std.mem.Allocator, entries: []const format.Entry, names: []const []const u8, generation: u64) !Cache {
-        var cache: Cache = .{ .allocator = allocator, .generation = generation };
+        var cache: Cache = .{ .allocator = allocator, .generation = generation, .owns_keys = true };
         errdefer cache.deinit();
 
         // The root itself is not listed by the trio (§ 3), but its children need somewhere to live.
@@ -103,20 +117,35 @@ pub const Cache = struct {
 
         for (entries, names) |entry, name| {
             switch (entry.kind() orelse continue) {
-                .dir => try cache.dirs.put(allocator, dirPath(name), .{
-                    .mtime_ns = entry.mtime_ns,
-                    .file_id_lo = entry.file_id_lo,
-                    .file_id_hi = entry.file_id_hi,
-                }),
-                .regular_file, .symlink => try cache.files.put(allocator, name, .{
-                    .kind = entry.kind().?,
-                    .mtime_ns = entry.mtime_ns,
-                    .size_bytes = entry.size_bytes,
-                    .content_hash = if (entry.contentKnown()) entry.content_hash else null,
-                    .hash_lf = entry.hashLf(),
-                    .file_id_lo = entry.file_id_lo,
-                    .file_id_hi = entry.file_id_hi,
-                }),
+                // Keys are duplicated, never borrowed from the trio's `files.txt`. Ownership has to be uniform:
+                // `coldstart` frees the key of every entry it removes, so a borrowed key would be foreign memory
+                // freed through this allocator (in a debug build `Allocator.free` writes `0xAA` over the slice
+                // first, which is how a deleted batch name turned into a run of one byte) — and `deinit` frees what
+                // is left, which a borrowed key cannot survive either. `dirPath` is a slice of `name`, so it is
+                // duplicated too.
+                .dir => {
+                    const path = dirPath(name);
+                    const owned = try allocator.dupe(u8, path);
+                    errdefer allocator.free(owned);
+                    try cache.dirs.put(allocator, owned, .{
+                        .mtime_ns = entry.mtime_ns,
+                        .file_id_lo = entry.file_id_lo,
+                        .file_id_hi = entry.file_id_hi,
+                    });
+                },
+                .regular_file, .symlink => {
+                    const owned = try allocator.dupe(u8, name);
+                    errdefer allocator.free(owned);
+                    try cache.files.put(allocator, owned, .{
+                        .kind = entry.kind().?,
+                        .mtime_ns = entry.mtime_ns,
+                        .size_bytes = entry.size_bytes,
+                        .content_hash = if (entry.contentKnown()) entry.content_hash else null,
+                        .hash_lf = entry.hashLf(),
+                        .file_id_lo = entry.file_id_lo,
+                        .file_id_hi = entry.file_id_hi,
+                    });
+                },
             }
         }
 

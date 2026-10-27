@@ -5,14 +5,21 @@
 //! ```text
 //! fsmeta verify  <root>      # does the trio describe what it claims? (§ 8) — exit 1 when it does not
 //! fsmeta scan    <root>      # what does the walker see? one line per name, no trio written
+//! fsmeta ignored <root>      # which source pruned which directory (read-only; never writes)
 //! fsmeta refresh <root>      # bring <root>/.fs-meta up to date; publishes only if something changed
 //! fsmeta serve   <root>      # serve <root>/.fs-meta/socket (FORMAT.socket.md binary protocol)
+//! fsmeta daemon  start|stop|status        # the background daemon (FORMAT.daemon.md)
+//! fsmeta root    add|remove|set|status|sleep|wake
+//! fsmeta roots   list
 //! ```
 //!
 //! `refresh` is the engine pass; `verify` is the reader's gate; `scan` is the diagnostic that shows what a walk
 //! would put in a fresh trio; `serve` is the live path, and it loads the trio first because a server with no
 //! usable state can only answer with an error. `--no-gitignore` and `--hash none|lf|text` mirror the engine's
 //! options, and `--updated` supplies the pass's timestamp, because the engine core deliberately has no clock.
+//!
+//! The daemon subcommands are a different plane: they talk to a long-lived process over its control socket
+//! (`daemon/cli.zig`), and they never write a trio themselves — the engine remains the only writer.
 
 const std = @import("std");
 const format = @import("format.zig");
@@ -24,6 +31,10 @@ const cache_mod = @import("cache.zig");
 const batch = @import("batch.zig");
 const reconcile = @import("reconcile.zig");
 const server = @import("server.zig");
+const boundary_mod = @import("boundary.zig");
+const gitdir = @import("gitdir.zig");
+const ignores = @import("ignores.zig");
+const daemon_cli = @import("daemon/cli.zig");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -31,9 +42,16 @@ const usage =
     \\usage:
     \\  fsmeta verify  <root>        validate <root>/.fs-meta and report the verdict
     \\  fsmeta scan    <root>        list what the walker sees (no trio written)
+    \\  fsmeta ignored <root> [--json]
+    \\                               list every pruned directory with the source that excluded it; text mode
+    \\                               prints one "<source> <path>" line per directory, sources are gitignore,
+    \\                               info/exclude, fs-meta/ignore, boundary and reserved; writes nothing
+    \\  fsmeta exclude <root>        append ".fs-meta/" under "# fsmeta: our own directory" to <common>/info/exclude
+    \\                               (marked, idempotent, LF; a later "!" line in that file overrides it)
     \\  fsmeta refresh <root>        bring <root>/.fs-meta up to date
-    \\  fsmeta glob    <root> <pattern> [--since <timestamp>]
-    \\                                   glob-search the trio; one line per match
+    \\  fsmeta match   <root> <pattern> [--since <timestamp>]
+    \\                                   wildmatch the trio (git's syntax, never glob's); one line per match
+    \\                                   `glob` is a deprecated alias of `match`
     \\  fsmeta changed <root> <since>  files changed since <since>; one line per match
     \\  fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
@@ -41,6 +59,12 @@ const usage =
     \\                                   deprecated: an alias of reconcile, kept for scripts
     \\  fsmeta serve   <root> [--live]
     \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md
+    \\  fsmeta daemon  start [--base <dir>] [--foreground]
+    \\  fsmeta daemon  stop | status [--json]
+    \\                               the background daemon: one socket per root, sleep and wake (FORMAT.daemon.md)
+    \\  fsmeta roots   list [--json] [--state watching,asleep]
+    \\  fsmeta root    add|remove|set|status|sleep|wake …
+    \\                               manage the daemon's roots
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -50,8 +74,8 @@ const usage =
     \\  --live                       serve: keep subscribers connected and publish a pass every 250 ms
     \\  --stats                      print where the pass spent its time
     \\  --since <timestamp>          mtime filter for glob (ISO-8601 or relative: 1h, 30m, 2d)
-    \\  --keep-batches <n>           how many generations of batch history to retain (default 32)\
-\\  --json                       emit results as a JSON array
+    \\  --keep-batches <n>           how many generations of batch history to retain (default 32)
+    \\  --json                       emit results as a JSON array
     \\
 ;
 
@@ -66,6 +90,15 @@ pub fn main(init: std.process.Init) !void {
         try write(io, usage);
         return;
     };
+
+    // The daemon's subcommands are their own plane: they talk to a control socket and never touch a trio, so
+    // they are dispatched before any of the engine's option parsing applies to them.
+    if (std.mem.eql(u8, command, "daemon") or std.mem.eql(u8, command, "root") or std.mem.eql(u8, command, "roots")) {
+        var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer rest.deinit(gpa);
+        while (args.next()) |arg| try rest.append(gpa, arg);
+        return daemon_cli.run(io, gpa, init.environ_map, command, rest.items);
+    }
 
     var root: ?[]const u8 = null;
     var second: ?[]const u8 = null;
@@ -125,12 +158,16 @@ pub fn main(init: std.process.Init) !void {
     defer arena_alloc.deinit();
     const arena = arena_alloc.allocator();
 
+    if (std.mem.eql(u8, command, "exclude")) return runExclude(io, arena, target);
     if (std.mem.eql(u8, command, "verify")) return verify(io, arena, target);
     if (std.mem.eql(u8, command, "scan")) {
         return listFacts(io, arena, target, .{
             .hash_mode = hash_mode,
             .respect_gitignore = respect_gitignore,
-        });
+        }, json_output);
+    }
+    if (std.mem.eql(u8, command, "ignored")) {
+        return runIgnored(io, arena, target, respect_gitignore, json_output);
     }
     if (std.mem.eql(u8, command, "refresh") or std.mem.eql(u8, command, "publish")) {
         options.respect_gitignore = respect_gitignore;
@@ -147,6 +184,13 @@ pub fn main(init: std.process.Init) !void {
             outcome.hashed,
         });
         try write(io, line);
+        if (outcome.dropped_under_boundaries > 0) {
+            // The migration the boundary rule implies: a trio written before the rule described a nested clone's
+            // files, and this pass removes them. Say it once, with the count, rather than letting a consumer
+            // discover a large deletion batch and guess.
+            const notice = try std.fmt.allocPrint(arena, "{d} names under nested repositories are no longer described\n", .{outcome.dropped_under_boundaries});
+            try write(io, notice);
+        }
         if (show_stats) {
             const stats = try std.fmt.allocPrint(arena, "stats: load {d:.1} ms, discover {d:.1} ms, hash {d:.1} ms, publish {d:.1} ms\n", .{
                 @as(f64, @floatFromInt(outcome.stats.load_ns)) / 1_000_000.0,
@@ -160,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // `glob` is abandoned as a name and as a dialect; `match` is the command, and the old name stays for scripts.
     if (std.mem.eql(u8, command, "match") or std.mem.eql(u8, command, "glob")) {
-        const pattern = second orelse return fail(io, gpa, "glob needs a pattern");
+        const pattern = second orelse return fail(io, gpa, "match needs a pattern");
         return runGlob(io, arena, gpa, target, pattern, since, json_output);
     }
     if (std.mem.eql(u8, command, "changed")) {
@@ -215,7 +259,7 @@ fn runServe(
     return server.run(io, arena, root, &cache, live_options);
 }
 
-/// Load the trio, run a glob query, and print one line per match (or a JSON array with --json).
+/// Load the trio, run a match/glob query, and print one line per match (or a JSON array with --json).
 fn runGlob(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8, pattern: []const u8, since: ?[]const u8, json: bool) !void {
     var cache = try loadCache(arena, io, root);
     defer cache.deinit();
@@ -224,7 +268,9 @@ fn runGlob(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: [
     defer glob.deinit(gpa);
 
     const now_ns: u64 = @intCast(std.Io.Clock.real.now(io).nanoseconds);
-    const since_ns = if (since) |s| query.parseSince(s, now_ns) else null;
+    // A `--since` that does not parse is an error, not "no filter": silently matching everything would answer a
+    // narrower question than the one asked, and the caller would believe it. `runChanged` already refuses.
+    const since_ns = if (since) |s| query.parseSince(s, now_ns) orelse return fail(io, gpa, "invalid since timestamp") else null;
 
     const results = try query.run(arena, .{
         .cache = &cache,
@@ -392,9 +438,39 @@ fn verify(io: std.Io, arena: std.mem.Allocator, root: []const u8) !void {
     std.process.exit(1);
 }
 
-fn listFacts(io: std.Io, arena: std.mem.Allocator, root: []const u8, options: scan.Options) !void {
-    const facts = try scan.scan(arena, io, root, options);
-    for (facts) |fact| {
+fn listFacts(io: std.Io, arena: std.mem.Allocator, root: []const u8, options: scan.Options, json: bool) !void {
+    const result = try scan.scanDetailed(arena, io, root, options);
+    if (json) {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        defer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"names\":[");
+        for (result.facts, 0..) |fact, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"name\":");
+            try writeJsonString(writer, fact.name);
+            try writer.writeAll(",\"kind\":");
+            try writeJsonString(writer, switch (fact.kind) {
+                .dir => "dir",
+                .symlink => "symlink",
+                .regular_file => "file",
+            });
+            try writer.print(",\"size\":{d},\"mtime\":{d}}}", .{ fact.size_bytes, fact.mtime_ns });
+        }
+        try writer.print("],\"count\":{d},\"boundaries\":[", .{result.facts.len});
+        for (result.boundaries, 0..) |boundary, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"path\":");
+            try writeJsonString(writer, boundary.path);
+            try writer.writeAll(",\"kind\":");
+            try writeJsonString(writer, boundary.kind.name());
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}\n");
+        try write(io, out.written());
+        return;
+    }
+    for (result.facts) |fact| {
         const kind = switch (fact.kind) {
             .dir => "dir",
             .symlink => "symlink",
@@ -403,8 +479,130 @@ fn listFacts(io: std.Io, arena: std.mem.Allocator, root: []const u8, options: sc
         const line = try std.fmt.allocPrint(arena, "{s} {d} {d} {s}\n", .{ kind, fact.size_bytes, fact.mtime_ns, fact.name });
         try write(io, line);
     }
-    const total = try std.fmt.allocPrint(arena, "{d} names\n", .{facts.len});
+    const total = try std.fmt.allocPrint(arena, "{d} names\n", .{result.facts.len});
     try write(io, total);
+}
+
+/// `fsmeta ignored`: which source pruned which directory (`plans/worktrees.md` § 5g).
+///
+/// It is a diagnostic over a fresh walk, not over the trio: a trio records the sources that were in effect, not
+/// the answer for one path, and "why is this subtree absent" is a question about the current tree. Nothing here
+/// writes, so it is safe on a root the daemon is serving.
+fn runIgnored(io: std.Io, arena: std.mem.Allocator, root: []const u8, respect_gitignore: bool, json: bool) !void {
+    const result = try scan.scanDetailed(arena, io, root, .{
+        .hash_mode = .none,
+        .respect_gitignore = respect_gitignore,
+    });
+    // The walk's order is the file system's. A diagnostic is easier to diff when it is ordered by path.
+    const items = try arena.dupe(scan.Pruned, result.pruned);
+    std.mem.sort(scan.Pruned, items, {}, prunedLessThan);
+
+    if (json) {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        defer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('[');
+        for (items, 0..) |item, index| {
+            if (index > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"path\":");
+            try writeJsonString(writer, item.path);
+            try writer.writeAll(",\"source\":");
+            try writeJsonString(writer, item.source);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]\n");
+        return write(io, out.written());
+    }
+
+    for (items) |item| {
+        const line = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ item.source, item.path });
+        try write(io, line);
+    }
+}
+
+fn prunedLessThan(_: void, left: scan.Pruned, right: scan.Pruned) bool {
+    return std.mem.order(u8, left.path, right.path) == .lt;
+}
+
+/// A failure of the subject (exit 1, no usage dump): `exclude` has nothing to write because the path is not a
+/// repository, so printing the whole usage text would be noise rather than an answer.
+fn excludeFail(io: std.Io, arena: std.mem.Allocator, comptime format_text: []const u8, args: anytype) noreturn {
+    const message = std.fmt.allocPrint(arena, format_text, args) catch "exclude: cannot format the failure";
+    const text = std.fmt.allocPrint(arena, "fsmeta: {s}\n", .{message}) catch message;
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {};
+    std.process.exit(1);
+}
+
+/// `fsmeta exclude <root>` (`plans/worktrees.md` § 5f, M7): append the marked `.fs-meta/` block to git's own,
+/// repo-local `<common>/info/exclude`, so a served worktree can be removed with `git worktree remove` without
+/// `--force` (the untracked `.fs-meta` is what makes git refuse otherwise).
+///
+/// It is a local file operation, not a control request: it needs no daemon and writes nothing inside the working
+/// tree. It refuses — naming the path — when the root is not a repository, because there is no `<common>` to write.
+/// A **later** `!` line in the same file overrides the entry (git's last-match-wins rule); this command never rewrites
+/// a line a person put there.
+fn runExclude(io: std.Io, arena: std.mem.Allocator, root: []const u8) !void {
+    // Resolve the locator once, by opening it: `std.fs.path.resolve` is a virtual path operation in Zig 0.17 and
+    // does not consult the process directory, so a relative root must be opened from the cwd to become absolute.
+    const opened = if (std.fs.path.isAbsolute(root))
+        std.Io.Dir.openDirAbsolute(io, root, .{})
+    else
+        std.Io.Dir.cwd().openDir(io, root, .{});
+    var root_dir = opened catch |err| {
+        excludeFail(io, arena, "exclude: cannot open {s}: {s}", .{ root, @errorName(err) });
+    };
+    defer root_dir.close(io);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = root_dir.realPath(io, &path_buffer) catch |err| {
+        excludeFail(io, arena, "exclude: cannot resolve {s}: {s}", .{ root, @errorName(err) });
+    };
+    const absolute = try arena.dupe(u8, path_buffer[0..count]);
+
+    const parent = std.fs.path.dirname(absolute) orelse {
+        excludeFail(io, arena, "exclude: {s} is not a git working copy (it names a filesystem root)", .{absolute});
+    };
+    const name = std.fs.path.basename(absolute);
+    var parent_dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch |err| {
+        excludeFail(io, arena, "exclude: cannot open {s}: {s}", .{ parent, @errorName(err) });
+    };
+    defer parent_dir.close(io);
+    // The same confirmation the boundary rule uses: a `.git` file must name an existing directory, a `.git` directory
+    // must carry `HEAD` and `objects/`. A stray `.git` directory is not a repository, so it has no `info/exclude`.
+    if (boundary_mod.confirm(arena, io, parent_dir, name) == .none) {
+        excludeFail(io, arena, "exclude: {s} is not a git working copy (no confirmed .git entry); nothing was written", .{absolute});
+    }
+    const location = (gitdir.resolve(arena, io, absolute) catch null) orelse {
+        excludeFail(io, arena, "exclude: {s} has a .git entry that cannot be read; nothing was written", .{absolute});
+    };
+
+    const path = try std.fs.path.join(arena, &.{ location.common_dir, "info", "exclude" });
+    const wrote = ignores.appendExclude(arena, io, location.common_dir) catch |err| {
+        excludeFail(io, arena, "exclude: cannot write {s}: {s}", .{ path, @errorName(err) });
+    };
+    if (wrote) {
+        const line = try std.fmt.allocPrint(arena, "exclude: appended the marked .fs-meta/ block to {s} (a later ! line in that file overrides it)\n", .{path});
+        try write(io, line);
+    } else {
+        const line = try std.fmt.allocPrint(arena, "exclude: {s} already carries the marked .fs-meta/ block; nothing written\n", .{path});
+        try write(io, line);
+    }
+}
+
+/// A JSON string for the scan report. The names are already valid UTF-8 (§ 3), so only the two characters JSON
+/// requires are escaped; everything else is written through as the format's bytes.
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
 }
 
 fn write(io: std.Io, bytes: []const u8) !void {
@@ -594,7 +792,11 @@ const BaselineStore = struct {
             };
             if (state.content_hash != null) flags |= format.flags.content_known;
             if (state.hash_lf) flags |= format.flags.hash_lf;
-            try self.by_name.put(arena, entry.key_ptr.*, .{
+            // The key is copied: the cache dies at the end of this function and its keys are the cache's own
+            // (`Cache.load` duplicates them, `Cache.deinit` frees them), so a borrowed key here would leave a map of
+            // dangling names and a baseline that silently matches nothing. Directory keys below are formatted for
+            // the same reason.
+            try self.by_name.put(arena, try arena.dupe(u8, entry.key_ptr.*), .{
                 .contentHash = state.content_hash orelse 0,
                 .sizeBytes = state.size_bytes,
                 .flags = flags,

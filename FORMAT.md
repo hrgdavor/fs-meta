@@ -30,13 +30,13 @@ The consumers are a watcher (the writer — this project's Zig engine) and the t
 
 All three live in one directory (default `<root>/.fs-meta/`), and none is meaningful without the other two:
 
-| File         | Kind               | Role                                                                             |
-| ------------ | ------------------ | -------------------------------------------------------------------------------- |
-| `files.txt`  | text, LF-delimited | the names, one per line, in order — the debuggable half                          |
-| `files.meta` | binary, fixed-size | one 64-byte entry per name, **same order** — the half programs read              |
-| `files.json` | JSON object        | the housekeeping: version, counts, sizes, hashes, generation — the commit record |
+| File         | Kind               | Role                                                                              |
+| ------------ | ------------------ | --------------------------------------------------------------------------------- |
+| `files.txt`  | text, LF-delimited | the names, one per line, in name order — the debuggable half                      |
+| `files.meta` | binary, fixed-size | one 64-byte entry per name, sorted by `(nameHash, name)` — the half programs read |
+| `files.json` | JSON object        | the housekeeping: version, counts, sizes, hashes, generation — the commit record  |
 
-`files.meta` and `files.txt` are a **pair**: entry `i` describes the name on line `i`. `files.json` exists so that the compact binary file needs no header, no magic and no self-description: everything a reader must know before interpreting the bytes is in the sidekick, and its hashes make a torn publish detectable.
+`files.meta` and `files.txt` are a **pair**, but **not by position**: each entry carries `nameOffset` and `nameLength` into `files.txt`, because the two files are ordered differently on purpose (§ 4 — the meta by `(nameHash, name)` so a hash lookup can binary-search it, the text by name so a human can read it). A reader joins an entry to its name through those two fields; anything that assumes "entry `i` is line `i`" is wrong and will mis-associate names as soon as one hash sorts away from its name order. `files.json` exists so that the compact binary file needs no header, no magic and no self-description: everything a reader must know before interpreting the bytes is in the sidekick, and its hashes make a torn publish detectable.
 
 `files.meta` carries **no header, no magic and no padding**. Entry count is `size / 64`, which is exactly why the entry is 64 bytes (a power of two: `entry(i)` is at `i << 6`, and a count is a shift, not a division). One entry is one cache line.
 
@@ -128,7 +128,9 @@ txtBytes = sum(utf8Length(name[i]) + 1)
 
 ## 5. `files.meta`
 
-One 64-byte record per name, in the same order as `files.txt`, little-endian throughout.
+One 64-byte record per name, sorted by `(nameHash, name)` (§ 4), little-endian throughout. The record points at its
+name in `files.txt` through `nameOffset` and `nameLength`; the two files are **not** in the same order, so a reader
+must never pair them by position.
 
 | Offset | Size | Type | Field         | Meaning                                                                        |
 | ------ | ---- | ---- | ------------- | ------------------------------------------------------------------------------ |
@@ -192,7 +194,7 @@ UTF-8 JSON object, no comment. The commit record.
 | `created`        | string | RFC3339 instant of the trio's first publish, informational; a rewriter keeps it               |
 | `writer`         | string | tool/version, informational (`fs-meta/1` is the engine)                                       |
 | `root`           | object | `{ "dev": number, "ino": number }` - identity of the root directory; a copied tree has a different one, a renamed tree keeps it (§ 3.1) |
-| `scan`           | object | optional, the settings the engine used: `{ "hashMode": "text" \| "lf" \| "none", "ignoredDirectoryNames": [string], "respectGitignore": boolean }` |
+| `scan`           | object | optional, the settings the engine used: `{ "hashMode": "text" \| "lf" \| "none", "ignoredDirectoryNames": [string], "respectGitignore": boolean, "nestedRepos": boolean?, "ignoreSources": [string]? }`. `nestedRepos: true` records that the nested-repository boundary rule (§ 16) was applied; **absent means it was not**, never "there was no nested repository". `ignoreSources` records the root-level ignore sources **actually in effect**, in precedence order: `gitignore` (the `.gitignore` chain, listed whenever the flag allowed it), `info/exclude` and `fs-meta/ignore` (each listed only when its file exists). It is a record of what the pass read, not an mtime: both files are re-read on every pass. Additive and optional: a reader that does not know either key ignores it. |
 | `roots`          | object | optional, § 18: `{ "<direct child>": { "offset": number, "length": number } }` — byte ranges in `files.txt`, each covering the folder's own `dir/` line and its subtree |
 
 Required keys: `format`, `version`, `entrySize`, `count`, `meta.bytes`, `meta.wyhash`, `txt.bytes`, `txt.wyhash`, `hash.content`, `hash.name`, `hash.seed`. Unknown keys ignored and preserved by rewriter.
@@ -333,7 +335,34 @@ That ends at the first release. From then on a new version is required for a lay
 
 - Regular files, directories, and symlinks (symlink listed as SYMLINK, not followed)
 - `.git` and `.fs-meta` never listed
+- **A nested repository is a boundary and is neither listed nor entered.** A directory whose `.git` entry confirms is
+  another repository — a clone, a submodule checkout or a linked worktree — and a trio describes one tree. Confirmation
+  is a filesystem read, never a shell-out to git: a `.git` **file** must start with `gitdir: ` and name an existing
+  directory (the back-pointer is confirmation when it matches, not a requirement — a stale pointer is still a worktree);
+  a `.git` **directory** must carry `HEAD` (a `ref: …` line or a 40-hex object id) and an `objects/` directory. A
+  directory that merely contains a file named `.git` is an ordinary directory and is listed. A symlink is never
+  followed, so a `.git` symlink does not confirm. The rule is always on and is not one of the daemon's switches
+  (`worktrees = off` stops the handling, never the rule). The `scan` member records that the writer applied it with
+  `"nestedRepos": true`; the key is optional and **absent means the rule was not applied**, never "no nested
+  repository was present".
 - `.gitignore` honoured with git precedence: patterns apply only below its dir, last match wins, `!` re-includes, trailing `/` = dirs only, excluded dir not entered, `**` follows git's three cases. Matching case-sensitive on every platform.
+- **Two root-level sources join the chain, in this order:** the root's `.gitignore` chain, `<common>/info/exclude`, then
+  `<root>/.fs-meta/ignore`. Both are parsed by the same `gitignore` reader — there is no second pattern syntax — and both
+  are re-read on every pass: there is no cached copy and no mtime. `<common>` is resolved by the boundary's gitdir
+  resolution (a linked worktree's is `<common>/info/exclude`, not its own git dir); when the root is not a repository
+  the source does not exist. `--no-gitignore` disables the chain and `info/exclude` (git's own) but not
+  `.fs-meta/ignore`, which is the nested-root guard.
+- **Precedence is per source, and a `!` never crosses a source.** The first source that excludes a path decides it; a
+  later `!` cannot re-include what an earlier source excluded. A `!` still overrides an earlier pattern **inside its own
+  source**, which is git's last-match-wins rule. `.fs-meta/ignore`'s `# fsmeta-managed` block is evaluated after the
+  file's user lines, so a user `!` there cannot re-open a managed entry.
+- A source that does not exist is omitted from `scan.ignoreSources`; the list says what was consulted, not what was
+  configured.
+- **A seeded worktree is a normal generation-1 trio.** `plans/worktrees.md` § 5e copies a served base generation into
+  a new worktree's archive and writes a genesis batch for it; the document is rewritten for generation 1 (its own
+  `created`/`updated` and root identity) and keeps the base's `scan` block, because the two trios must describe the
+  same ignore rules. There is no seed key in the format: a reader sees an ordinary first generation, and the next pass
+  is an ordinary diff.
 - Writer default hash mode `text`: CRLF and LF checkout produce same hash for text, NUL = raw
 - Writer must `lstat` not `stat` to see symlink, and `statx`/`GetFileInformationByHandle` to get fileId+mtimeNs+size in one syscall
 - The writer is the engine. A client does not publish; it reads the trio, or asks the engine over the socket for the live path

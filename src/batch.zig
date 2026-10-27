@@ -27,6 +27,12 @@ pub const CHANGE_DELETED: u32 = 0x80;
 pub const CHANGE_MASK: u32 = CHANGE_ADDED | CHANGE_CHANGED | CHANGE_DELETED;
 
 /// One name and its entry, as a generation holds it.
+///
+/// `name` is **borrowed**: it must stay valid until `encode`/`write` has copied it into the batch, because a
+/// deleted entry has no other copy of its path — the entry keeps only the hash. The engine builds its
+/// `previous` snapshot before discovery mutates the cache, so it owns those names (a duplicate per item); a
+/// writer that hands `diff` a slice into memory the cache can free or overwrite gets a churned name in the
+/// batch's `files.txt`, which is the corruption this contract exists to prevent.
 pub const Item = struct {
     name: []const u8,
     entry: format.Entry,
@@ -359,6 +365,46 @@ test "encode then decode is the same plan, byte for byte in both files" {
     }
 }
 
+test "a deleted entry's name survives diff, encode and decode" {
+    // A deleted entry is the one entry whose name exists nowhere else: `diff` zeroes its content and the entry
+    // keeps only the name hash. So the round trip has to be asserted for a deletion on its own, not only as a
+    // passenger of a mixed batch: the name must come back exactly, and the entry's offset/length must address it
+    // in the batch's own `files.txt` (whose order is by name, while `files.meta` is by `(nameHash, name)`).
+    const plan = try diff(testing.allocator, &.{
+        item("src", 30, format.flags.is_dir),
+        item("src/b.java", 20, format.flags.regular_file | format.flags.content_known),
+    }, &.{});
+    defer {
+        testing.allocator.free(plan.entries);
+        testing.allocator.free(plan.names);
+    }
+    try testing.expectEqual(@as(usize, 2), plan.entries.len);
+
+    const encoded = try encode(testing.allocator, plan);
+    defer {
+        testing.allocator.free(encoded.meta);
+        testing.allocator.free(encoded.txt);
+    }
+    // The layout's text order, with the directory in its stored `src/` form.
+    try testing.expectEqualStrings("src/\nsrc/b.java\n", encoded.txt);
+
+    const decoded = try decode(testing.allocator, encoded.meta, encoded.txt);
+    defer {
+        testing.allocator.free(decoded.entries);
+        testing.allocator.free(decoded.names);
+    }
+    try testing.expectEqual(@as(usize, 2), decoded.entries.len);
+    // `files.meta` is by `(nameHash, name)`: src/b.java (20) then src (30), the reverse of the text order.
+    try testing.expectEqualStrings("src/b.java", decoded.names[0]);
+    try testing.expectEqualStrings("src/", decoded.names[1]);
+    for (decoded.entries, decoded.names) |entry, name| {
+        try testing.expectEqual(reconcile.Kind.deleted, kindOf(entry).?);
+        const end = entry.name_offset + entry.name_length;
+        try testing.expectEqualStrings(name, encoded.txt[entry.name_offset..end]);
+        try testing.expectEqual(@as(u8, '\n'), encoded.txt[end]);
+    }
+}
+
 test "decode refuses an entry with no change bit" {
     const plan = try diff(testing.allocator, &.{
         item("a.txt", 1, format.flags.regular_file | format.flags.content_known),
@@ -587,6 +633,213 @@ pub fn rotate(
     }
 
     return .{ .kept = @min(numbers.items.len, keep), .dropped = drop.len };
+}
+
+// ---------------------------------------------------------------- retention by bytes
+
+/// What a byte-budget rotation left behind.
+pub const ByteRotation = struct {
+    /// Generations retained after the rotation.
+    kept: usize = 0,
+    /// Generations removed by this rotation, oldest first.
+    dropped: u64 = 0,
+    /// The archive's size after the rotation.
+    bytes: u64 = 0,
+};
+
+/// The total size of every generation under `<meta_dir>/batches`, and the generations themselves.
+///
+/// A generation is three files, so its size is their sum; anything else in the directory (a leftover
+/// `.trash-…`, a foreign entry) is not a generation and is not counted as one.
+pub fn measureArchive(allocator: std.mem.Allocator, io: std.Io, meta_dir: std.Io.Dir) !struct {
+    numbers: []u64,
+    sizes: []u64,
+    bytes: u64,
+} {
+    var batches = meta_dir.openDir(io, "batches", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .numbers = try allocator.alloc(u64, 0), .sizes = try allocator.alloc(u64, 0), .bytes = 0 },
+        else => return err,
+    };
+    defer batches.close(io);
+
+    var numbers: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer numbers.deinit(allocator);
+    var sizes: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer sizes.deinit(allocator);
+    var total: u64 = 0;
+
+    var iterator = batches.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory or !isBatchName(entry.name)) continue;
+        const number = std.fmt.parseInt(u64, entry.name, 16) catch continue;
+        var dir = batches.openDir(io, entry.name, .{}) catch continue;
+        defer dir.close(io);
+        var size: u64 = 0;
+        for ([_][]const u8{ format.meta_file, format.txt_file, format.json_file }) |file_name| {
+            const stat = dir.statFile(io, file_name, .{}) catch continue;
+            size += stat.size;
+        }
+        try numbers.append(allocator, number);
+        try sizes.append(allocator, size);
+        total += size;
+    }
+
+    return .{
+        .numbers = try numbers.toOwnedSlice(allocator),
+        .sizes = try sizes.toOwnedSlice(allocator),
+        .bytes = total,
+    };
+}
+
+/// Apply the **byte ceiling** to `<meta_dir>/batches`, oldest first, until the archive fits `max_bytes`.
+///
+/// The count limit and the byte limit are both needed and neither is sufficient: thirty-two generations are
+/// bounded in number but not in size, and a byte budget alone leaves a hundred tiny generations that are a
+/// hundred handshakes to replay. The newest generation is always kept, even when it alone exceeds the budget:
+/// refusing to keep it would break the commit that just happened, and one oversized generation is better than
+/// a missing one.
+///
+/// The removal is the same rename-then-delete the count rotation uses, so a reader never sees a generation
+/// with some of its files already gone.
+pub fn rotateToBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    meta_dir: std.Io.Dir,
+    max_bytes: u64,
+) !ByteRotation {
+    const archive = try measureArchive(allocator, io, meta_dir);
+    defer allocator.free(archive.numbers);
+    defer allocator.free(archive.sizes);
+    if (archive.numbers.len == 0) return .{};
+
+    // Sort generations by number so "oldest" is unambiguous even though a directory listing has no order.
+    const Order = struct {
+        fn lessThan(context: void, left: u64, right: u64) bool {
+            _ = context;
+            return left < right;
+        }
+    };
+    const sorted_numbers = try allocator.dupe(u64, archive.numbers);
+    defer allocator.free(sorted_numbers);
+    std.mem.sort(u64, sorted_numbers, {}, Order.lessThan);
+
+    var total = archive.bytes;
+    var drop_count: usize = 0;
+    while (total > max_bytes and drop_count + 1 < sorted_numbers.len) : (drop_count += 1) {
+        const number = sorted_numbers[drop_count];
+        for (archive.numbers, archive.sizes) |candidate, size| {
+            if (candidate == number) {
+                total -= size;
+                break;
+            }
+        }
+    }
+
+    var batches = try meta_dir.openDir(io, "batches", .{ .iterate = true });
+    defer batches.close(io);
+
+    // Finish an interrupted rotation before starting this one: the rename below must not collide.
+    var leftovers: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (leftovers.items) |name| allocator.free(name);
+        leftovers.deinit(allocator);
+    }
+    {
+        var iterator = batches.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, trash_prefix)) continue;
+            try leftovers.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+    }
+    for (leftovers.items) |name| try batches.deleteTree(io, name);
+
+    for (sorted_numbers[0..drop_count]) |number| {
+        const name = try std.fmt.allocPrint(allocator, "{x:0>8}", .{number});
+        defer allocator.free(name);
+        const aside = try std.fmt.allocPrint(allocator, "{s}{s}", .{ trash_prefix, name });
+        defer allocator.free(aside);
+        try batches.rename(name, batches, aside, io);
+        try batches.deleteTree(io, aside);
+    }
+
+    return .{
+        .kept = sorted_numbers.len - drop_count,
+        .dropped = drop_count,
+        .bytes = total,
+    };
+}
+
+test "the byte ceiling removes the oldest generations, and always keeps the newest" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var number: u64 = 1;
+    while (number <= 3) : (number += 1) {
+        const plan = try diff(testing.allocator, &.{}, &.{
+            item("a.txt", 10, format.flags.regular_file | format.flags.content_known),
+            item("b.txt", 20, format.flags.regular_file | format.flags.content_known),
+        });
+        defer {
+            testing.allocator.free(plan.entries);
+            testing.allocator.free(plan.names);
+        }
+        try write(testing.allocator, io, tmp.dir, plan, .{
+            .generation = number,
+            .parent = number - 1,
+            .created = "2026-10-19T00:00:00Z",
+            .updated = "2026-10-19T00:00:00Z",
+        });
+    }
+
+    const measured = try measureArchive(testing.allocator, io, tmp.dir);
+    defer testing.allocator.free(measured.numbers);
+    defer testing.allocator.free(measured.sizes);
+    try testing.expectEqual(@as(usize, 3), measured.numbers.len);
+    const per_generation = measured.bytes / 3;
+    try testing.expect(per_generation > 0);
+
+    // A budget for two generations: the oldest goes, and nothing else does.
+    const rotation = try rotateToBytes(testing.allocator, io, tmp.dir, per_generation * 2);
+    try testing.expectEqual(@as(u64, 1), rotation.dropped);
+    try testing.expectEqual(@as(usize, 2), rotation.kept);
+    try testing.expectEqual(per_generation * 2, rotation.bytes);
+
+    tmp.dir.access(io, "batches/00000001", .{}) catch |err| {
+        try testing.expectEqual(error.FileNotFound, err);
+    };
+    var kept = try tmp.dir.openDir(io, "batches/00000003", .{});
+    kept.close(io);
+
+    // Running it again at the same budget removes nothing: rotation is a function of the archive, not a clock.
+    const again = try rotateToBytes(testing.allocator, io, tmp.dir, per_generation * 2);
+    try testing.expectEqual(@as(u64, 0), again.dropped);
+}
+
+test "a generation larger than the whole budget is kept rather than leaving the archive empty" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plan = try diff(testing.allocator, &.{}, &.{
+        item("a.txt", 10, format.flags.regular_file | format.flags.content_known),
+    });
+    defer {
+        testing.allocator.free(plan.entries);
+        testing.allocator.free(plan.names);
+    }
+    try write(testing.allocator, io, tmp.dir, plan, .{
+        .generation = 7,
+        .parent = 6,
+        .created = "2026-10-19T00:00:00Z",
+        .updated = "2026-10-19T00:00:00Z",
+    });
+
+    const rotation = try rotateToBytes(testing.allocator, io, tmp.dir, 1);
+    try testing.expectEqual(@as(u64, 0), rotation.dropped);
+    try testing.expectEqual(@as(usize, 1), rotation.kept);
+    var kept = try tmp.dir.openDir(io, "batches/00000007", .{});
+    kept.close(io);
 }
 
 test "a written batch lands under batches/<generation>, three files, decodable" {

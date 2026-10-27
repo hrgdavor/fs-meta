@@ -1,5 +1,11 @@
 # Plan: query the trio — glob search and changed-since, via CLI and socket
 
+**Status:** the CLI half is implemented (`fsmeta match` — `glob` kept as an alias — with `--since` and `--json`, and
+`fsmeta changed <root> <since>`), unit-tested in `src/query.zig`; the commands themselves still have no integration
+test. The **socket half is superseded**: the socket speaks the binary protocol of `FORMAT.socket.md`, not JSON-RPC, so
+"a JSON-RPC client gets the same results" is not a missing feature but a design that was replaced. Kept for the record;
+the pattern it established (`query.run` over the loaded cache, one line per match) is what the CLI still uses.
+
 **Goal in one line.** Give the runtime two query tools on top of the loaded cache — a glob that returns every
 matching entry with its full 64-byte metadata, and a mtime filter that can be paired with the glob — exposed as
 new `fsmeta` subcommands and as JSON-RPC methods on the socket.
