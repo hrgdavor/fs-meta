@@ -3195,6 +3195,11 @@ describe('the two M4 gaps: a failed finish, and what a hook cannot say about a w
         );
         expect(gone.event.source).toBe('metadata');
         expect(existsSync(join(repo, '.git', 'worktrees'))).toBe(false);
+        // `root status` records the last git signal too (`plans/worktrees.md` § 8.12), so an idle root can be told
+        // from one whose watcher died.
+        const last = rootStatusOf(m, id);
+        expect(last.last_git_kind).toBe('worktree');
+        expect(last.last_git_phase).toBe('finish');
         peer.end();
       } catch (error) {
         throw new Error(`${error.message}\ndaemon output:\n${daemon.output.text}`);

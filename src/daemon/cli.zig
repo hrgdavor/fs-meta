@@ -864,6 +864,14 @@ fn rootStatus(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: 
             integerFieldValue(root, "git_passes") orelse 0,
         });
     }
+    // The most recent signal (`plans/worktrees.md` § 8.12), so a stale root and a quiet one are distinguishable.
+    const last_git_kind = stringFieldValue(root, "last_git_kind") orelse "";
+    if (last_git_kind.len > 0) {
+        print(io, "  last git event: {s} {s}", .{
+            last_git_kind,
+            stringFieldValue(root, "last_git_phase") orelse "",
+        });
+    }
     if (root.object.get("retention")) |retention| {
         print(io, "  retention: {d} batch(es), {d} bytes; the last byte rotation dropped {d} generation(s)", .{
             integerFieldValue(retention, "max_batches") orelse 0,

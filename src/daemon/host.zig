@@ -1242,6 +1242,11 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: root_mod.Snapshot) !void 
     try control.stringField(writer, "head", snapshot.head.text());
     try control.boolField(writer, "detached", snapshot.head.detached);
     try control.stringField(writer, "in_progress", snapshot.in_progress.name());
+    // The last git signal this root saw (`plans/worktrees.md` § 8.12): kind and phase by name, the wall-clock
+    // millisecond it was written. Empty/0 before the first event and with `gitwatch` off.
+    try control.stringField(writer, "last_git_kind", if (snapshot.last_git_kind) |kind| @tagName(kind) else "");
+    try control.stringField(writer, "last_git_phase", if (snapshot.last_git_phase) |phase| @tagName(phase) else "");
+    try control.intField(writer, "last_git_at_ms", snapshot.last_git_at_ms);
     // `GIT_EVENT` counters (§ 5d): frames sent to this root's subscribers, and passes a finish waited for.
     try control.intField(writer, "git_events", snapshot.git_events);
     try control.intField(writer, "git_passes", snapshot.git_passes);

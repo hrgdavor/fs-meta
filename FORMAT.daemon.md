@@ -494,6 +494,9 @@ is not repaired in place; the next `root add`/start reconciliation reports the f
   "head": "main",
   "detached": false,
   "in_progress": "",
+  "last_git_kind": "checkout",
+  "last_git_phase": "finish",
+  "last_git_at_ms": 1793000001234,
   "git_events": 4,
   "git_passes": 3,
   "gitwatch": true,
@@ -543,8 +546,12 @@ are wake scans and `off`'s on-demand scans, which are neither.
 (`plans/worktrees.md` § 5g). A root whose `gitwatch` is off has **no resolved git dir at all**, so all three are
 empty/false — not because the root is not a repository, but because the switch means the metadata is never read.
 `git_events` counts `GIT_EVENT` frames sent to this root's subscribers, and `git_passes` counts passes a finish waited
-for (§ 5d); both stay 0 with `gitwatch` off. `fsmeta root status` prints them as `git events: 4 sent, 3 pass(es) a
-finish waited for`, and omits the line when neither has moved. `gitwatch` repeats this root's effective switch, so a
+for (§ 5d); both stay 0 with `gitwatch` off. `last_git_kind`, `last_git_phase` and `last_git_at_ms` are the **last**
+signal the root saw (`branch`/`checkout`/`commit`/`merge`/`rebase`/`index`/`worktree`/`other`, the phase by name, and
+the wall-clock epoch millisecond) — recorded before the subscriber check, so a root with no clients still reports what
+its watcher observed; all three are empty/`0` before the first event and with `gitwatch` off. `fsmeta root status`
+prints them as `git events: 4 sent, 3 pass(es) a finish waited for` and `last git event: checkout finish`, and omits
+the lines when there is nothing to say. `gitwatch` repeats this root's effective switch, so a
 caller that is not the daemon can ask whether a hook spool for this root would ever be read — which is exactly what
 `fsmeta daemon hooks install` does before it writes anything (§ 6).
 

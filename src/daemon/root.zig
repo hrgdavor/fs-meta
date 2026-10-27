@@ -167,6 +167,11 @@ pub const Snapshot = struct {
     /// then never read at all — the switch is the promise, not a hint.
     head: gitwatch.Head = .{},
     in_progress: gitwatch.InProgress = .none,
+    /// The last `GIT_EVENT` this root emitted (`plans/worktrees.md` § 8.12): its kind, phase and the wall-clock
+    /// millisecond it was written. `null`/`0` before the first event and while `gitwatch` is off.
+    last_git_kind: ?wire.GitKind = null,
+    last_git_phase: ?wire.GitPhase = null,
+    last_git_at_ms: i64 = 0,
     /// `GIT_EVENT` frames sent to this root's subscribers, and passes a finish waited for (§ 5d counters).
     git_events: u64 = 0,
     git_passes: u64 = 0,
@@ -458,6 +463,11 @@ pub const RootRuntime = struct {
     /// Counters (§ 5d): `GIT_EVENT` frames sent, and passes a finish waited for.
     git_events: u64 = 0,
     git_passes: u64 = 0,
+    /// The last emitted `GIT_EVENT`, for `root status` (§ 8.12). Set before the subscriber check, so it reports what
+    /// the root observed even while nobody is listening.
+    last_git_kind: ?wire.GitKind = null,
+    last_git_phase: ?wire.GitPhase = null,
+    last_git_at_ms: i64 = 0,
 
     /// The repository's hook spool, as this root reads it (`plans/worktrees.md` § 5c, M5): `<common>/fsmeta-events.log`.
     /// The offset is **per root**, not per repo, because the tick is per root and so is the delivery; the file is a
@@ -686,6 +696,9 @@ pub const RootRuntime = struct {
             .created_at = self.record.created_at,
             .head = git_status.head,
             .in_progress = git_status.in_progress,
+            .last_git_kind = self.last_git_kind,
+            .last_git_phase = self.last_git_phase,
+            .last_git_at_ms = self.last_git_at_ms,
             .git_events = self.git_events,
             .git_passes = self.git_passes,
             .gitwatch = self.record.gitwatch,
@@ -1481,6 +1494,11 @@ pub const RootRuntime = struct {
     /// Write one `GIT_EVENT` to every subscriber. Never inside a batch: the caller runs outside
     /// `broadcastBatchLocked`, and the root's lock is what keeps that true.
     fn broadcastGitEventLocked(self: *RootRuntime, arena: std.mem.Allocator, event: wire.GitEvent) void {
+        // Recorded before the subscriber check: `root status` should say what the root saw, not only what it could
+        // deliver (§ 8.12). The counter below stays "frames sent", because that is a different promise.
+        self.last_git_kind = event.kind;
+        self.last_git_phase = event.phase;
+        self.last_git_at_ms = @intCast(event.at_ms);
         if (self.subscribers.items.len == 0) return;
         const payload_size = event.payloadSize();
         const frame = arena.alloc(u8, wire.prefix_size + payload_size) catch return;

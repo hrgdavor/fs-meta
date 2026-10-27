@@ -10,22 +10,20 @@ cd fs-meta
 D:\wrk\zig\17\zig.exe build test --cache-dir .zig-cache\local --summary all
 ```
 
-Today: **40/40 steps, 431/437 tests** (6 skipped — **two** platform guards, each counted in three test binaries;
-see § G). Before the move it was 41 steps: the four file-modules for the matcher and the chain left with their 27
-tests; the daemon (§ 18 of [`daemon.md`](archive/daemon.md)) added one more test binary and its tests, and § H's fix added
-the two regression tests counted here.
+Today: **50/50 steps, 755/763 tests** (8 skipped — **two** platform guards, each counted in four test binaries; see
+§ G). The jump from 40/41 steps is the worktrees plan ([`worktrees.md`](worktrees.md)): it added `boundary`,
+`gitdir`, `ignores`, `nesting` and `seed` as modules, the daemon's `gitwatch`/`hooks`, and their tests.
 
-The Bun gate (`bun test`, which runs `js/` and `test/`) is **99 pass, 4 skip, 0 fail** across 103 tests: three
-writer-scope tests (§ G1), one POSIX-only socket assertion (§ G2), and the suites the daemon work added
-(`test/daemon.test.mjs`, `test/daemon-parity.test.mjs`, `test/query-cli.test.mjs`). The two `reconcile` failures
-this file used to record are gone (§ H).
+The Bun gate (`bun test`, which runs `js/` and `test/`) is **130 pass, 4 skip, 0 fail** across 134 tests: three
+writer-scope tests (§ G1), one POSIX-only socket assertion (§ G2), and the suites the daemon and worktrees work added
+(`test/daemon.test.mjs`, `test/daemon-parity.test.mjs`, `test/query-cli.test.mjs`, `test/ignored-cli.test.mjs`).
 
 **Status of the sections below, verified against the code:** A (the gitignore move) is done — the dependency is a
 pinned URL, not a path; B (pair layout) is done — `publish` lays out through `pair.layout` with the count assertion
 and emits `roots`; C (the batches' consumer entry point) is done — `fsmeta reconcile`, both refusals, the baseline;
 D (the socket server, live included) is done — `fsmeta serve`, `test/socket.test.mjs`; E1–E3 (both ports and their
-matchers on the vendored vectors) are done. **F remains deliberately open**, § H was a real defect and is fixed, and
-§ I records two small warts.
+matchers on the vendored vectors) are done; **J (the worktrees plan) is done** — M0–M7 plus the gap-closure batch.
+**F remains deliberately open**, § H was a real defect and is fixed, and § I records two small warts.
 
 ## A. Sync with the gitignore move
 
@@ -104,12 +102,12 @@ it unchanged.
 
 ## G. The skips, and why each one is deliberate
 
-A fresh-cache gate prints `431/437 tests passed (6 skipped)`. That is **two** Zig tests counted in three test
-binaries — `scan`, `lister` and `engine` all import `scan.zig`, and a test binary runs its imports' tests too — so
-the six are not six separate gaps. Both skip sites print their platform and condition before returning
-`error.SkipZigTest`; `zig build test` echoes them once per test binary (the three that import `scan.zig`),
+A fresh-cache gate prints `755/763 tests passed (8 skipped)`. That is **two** Zig tests counted in four test
+binaries — `scan`, `lister` and `engine` all import `scan.zig`, and the daemon's `daemon_tests` imports the engine —
+so the eight are not eight separate gaps. Both skip sites print their platform and condition before returning
+`error.SkipZigTest`; `zig build test` echoes them once per test binary (the four that import `scan.zig`),
 preceded by the builder's `+- run test` / `failed command:` context header. That header is the builder showing a
-step's stderr, not a failed step: the summary still ends `40/40 steps succeeded`. A direct run of the binary shows
+step's stderr, not a failed step: the summary still ends `50/50 steps succeeded`. A direct run of the binary shows
 the same reason next to its `SKIP` line.
 
 | Test (`src/scan.zig`)                                   | Why it skips | What would close it                                                                     |
@@ -135,9 +133,10 @@ is win32; an S_ISSOCK node on the bound address is POSIX-only". Linux/macOS CI i
 A long-lived process that tracks several roots, keeps a Unix socket per root for consumers, and decides when each root is worth watching (`off` / `always` / `auto` with a per-root idle timeout, so a slept root wakes with one full scan and a diff). Planned in [daemon.md](archive/daemon.md); Zig only, and shaped so a root can later be served by its own child daemon without changing the consumer socket.
 
 **Implemented:** M0–M4 — the runtime/home split, `roots.json`, the state machine, the per-root sockets, the `STATE`
-frame (`FORMAT.socket.md`, protocol `0x0101`), sleep and wake with a scan and a diff, per-root retention by count and
-bytes with `on_remove`, the control socket and the `daemon`/`root`/`roots` CLI. Watching is event-driven
-(`nightwatch`) and each root schedules itself, so a batch never waits on another root's pass. Housekeeping calls
+frame and the `GIT_EVENT` frame (`FORMAT.socket.md`, protocol `0x0102`), sleep and wake with a scan and a diff,
+per-root retention by count and bytes with `on_remove`, the control socket and the `daemon`/`root`/`roots` CLI, the
+worktrees extension (boundary rule, seeded worktree roots, git-aware watching, hooks, the two switches). Watching is
+event-driven (`nightwatch`) and each root schedules itself, so a batch never waits on another root's pass. Housekeeping calls
 over many roots follow the bounded-wait rule in `FORMAT.daemon.md` § 4b: they name a root they could not read
 (`available: false`, `partial: true`) instead of blocking or guessing. `FORMAT.daemon.md` is the reference;
 `test/daemon.test.mjs` is the suite.
@@ -215,21 +214,29 @@ any store that outlives the cache it was built from.
   footer and tests pin it; a pluralisation rule is a change to every command for no information.
 
 
-## J. What is next
+## J. Worktrees — done (2026-10-27)
 
-[`worktrees.md`](worktrees.md) is the next plan, and it is the first work that is not a cleanup. Three parts:
+[`worktrees.md`](worktrees.md) is implemented: M0–M7 plus the gap-closure batch, committed as `f2b3a72`. In one line
+each:
 
-- **worktrees as roots** — a worktree inside a served root is ignored by the parent (R1), nesting is guarded and refused
-  when it cannot be (R2), and an adopted worktree seeds from the base trio instead of scanning cold (R4);
-- **git-aware watching** — the root watcher also watches `$GIT_COMMON_DIR` (a *filtered* watch: never `objects/`),
-  refuses to pass while its own tree is mid-write, optionally uses the repo's hooks for precise signals, and sends
-  `GIT_EVENT` start/finish to consumers with the guarantee that a finish never precedes the `END_BATCH` of the pass it
-  describes (R3, § 5b–§ 5d);
-- **the gate (R5)** — `worktrees` (recognition, adoption, seeding, worktree events, the removal reaction) and `gitwatch`
-  (the metadata watch, latch, events, hooks) are per-root switches with daemon defaults, and `FSMETA_WORKTREES=0` is an
-  emergency override that needs no working control socket. It gates the *handling*, never the rule: a nested repository
-  — worktree, clone or submodule — is always excluded from the parent's scan, because that is what a trio describes, not
-  a feature (§ 5h).
+- **worktrees as roots** — a nested repository is never scanned (the boundary rule), nesting is guarded by the
+  parent's managed ignore block and refused when it cannot be, and an adopted worktree seeds from the base trio
+  instead of scanning cold;
+- **git-aware watching** — a refcounted metadata watch per common dir with `should_watch` pruning on both arms, a
+  per-root lock latch, optional hooks, and `GIT_EVENT` (0x0A, protocol 0x0102) with the finish-after-batch guarantee;
+- **the gate** — `worktrees` and `gitwatch` per root (defaults, `root add`/`root set`, live flip,
+  `FSMETA_WORKTREES`/`FSMETA_GITWATCH`) around a rule that is **never** gated.
 
-Read it before touching `lister.zig`, `coldstart.zig`, the watcher in `src/main.zig` (whose git-lock latch M3 lifts into
-the daemon), `roots.json`'s defaults or the daemon's `root add`.
+The open items are recorded in that plan rather than here: `test/watch-bound.test.mjs` asserts the Linux watch bound
+and skips (with its reason) on hosts without per-directory registration, so the count is a Linux-CI result; the
+Windows-only read-only-`<common>` stand-in and hook spawn cost remain; and `--nested` is intent-only.
+
+## K. What is next (still open)
+
+1. **§ F — retention and the WAL.** A product/format decision: keep the directory of batch trios or move to one
+   append-only log with rotation, without changing the consumer API (§ 17.6). Until it is decided, the directory
+   layout is the reference.
+2. **[`tbd-per-root-daemon.md`](tbd-per-root-daemon.md)** — one root per child process. Not scheduled; it waits for
+   a measured trigger (cross-root delay, a crash/OOM, or a per-root restart need) and for four decisions (IPC shape,
+   socket ownership, supervision, aggregated state).
+3. The two small § I warts stay decided, not pending.

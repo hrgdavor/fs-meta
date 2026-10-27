@@ -339,8 +339,9 @@ never consult it — one registration covers the whole subtree — and there the
 - **Windows, macOS**: the subtree is one handle or one FSEvents stream; the handler filters `objects/`, `modules/`,
   `lfs/`, `hooks/` and the cost of registering is negligible.
 - **Linux, kqueue**: the generic layer consults the predicate at arm time and for a directory created later, so the
-  watch set is bounded by the metadata directories. The empirical `watch_count` on Linux is still unmeasured on this
-  host (Windows); that measurement belongs to Linux CI, not to a design decision left open.
+  watch set is bounded by the metadata directories. `test/watch-bound.test.mjs` asserts the count on Linux (the only
+  backend where a per-directory count is meaningful) and skips with its reason elsewhere; the number is produced by
+  Linux CI, not by this Windows host.
 
 **The tree arm wants the same predicate, and has it.** `gitwatch.shouldWatchTree` admits the served root (which may
 itself be a worktree), refuses `.git`/`.fs-meta` and a confirmed boundary, admits a stray `.git` fixture, and reads a
@@ -1156,8 +1157,11 @@ Three items M0–M7 had recorded as open, plus the two defects the work uncovere
 - **The Linux watch bound was misrecorded.** `INotify.zig` never calls `should_watch`, but nightwatch's generic layer
   does (`nightwatch.zig:362-363` at arm time, `:271-272`/`:319-320` for a directory created later;
   `filters_watches = !watches_recursively`, `:128`), so the predicate was already honoured on inotify. The closure
-  batch pinned the vtable path and the per-platform `filters_watches` contract in `gitwatch.zig` tests and corrected
-  § 5b and the M3 status; an *empirical* Linux `watch_count` is now a Linux-CI measurement, not a missing mechanism.
+  batch pinned the vtable path and the per-platform `filters_watches` contract in `gitwatch.zig` tests, corrected
+  § 5b and the M3 status, and added `test/watch-bound.test.mjs`: on Linux it builds a repository with 120 `objects/`
+  directories, a linked worktree and a 40-directory nested clone, then asserts both the metadata arm's registration
+  count and the tree arm's stay bounded and that the log says the predicate is honoured. It skips, with its reason, on
+  every host without per-directory registration (this Windows one), so Linux CI owns the number.
 - **The tree arm had no predicate at all** (G35's real remainder): `EventHandler` was change/rename only, so on
   kqueue/inotify the working-tree arm registered every boundary and `.git/objects`. `gitwatch.shouldWatchTree` now
   admits the served root, refuses `.git`/`.fs-meta` and a confirmed boundary, and reads a gitfile from a fixed stack
@@ -1332,7 +1336,7 @@ and the watcher-sharing question is answered by the common-dir arm.
 | G43 | **Adoption policy and spool reading had no owner**: whose `--on-worktree` applies for a worktree found inside a parent, and which daemon reads a repo's spool when no root of it watches git. | an ambiguous, silently inert feature | **fixed**: § 5/§ 5c — the policy is the discovering root's, and a spool is read only while some served root of that repo has `gitwatch` on. The flag matrix is spelled out: the `worktree` event needs `gitwatch` for the signal; adoption at pass time works with `gitwatch` off. |
 | G44 | **`roots list` was told to group by common dir, but nothing carried it.** The snapshot had no `git_common`, so the grouping had no data. | a feature with no input          | **fixed**: § 5g — `root status` and `roots list` carry `git_common` (host state like `root`, empty when `gitwatch` is off). |
 | G45 | **The implementation surface named the wrong file for `scan --json`/`ignored`/`exclude`** (they are top-level `fsmeta` subcommands, not daemon CLI), the hook module was unnamed, `ignore_sources` did not say whether absent files are listed, the `.git` special case missed renames, and `path_len` had no upper bound. | five small gaps in one place | **fixed**: § 7 surface (adds `fsmeta.zig` and a new `daemon/hooks.zig`), § 5 (`ignore_sources` = consulted only), § 4 (rename), § 5d (`path_len ≤ length − 24`). |
-| G46 | **The pruning mechanism was misattributed to the backend file.** `INotify.zig` never calls `should_watch` (kqueue does), and the plan concluded the predicate was unavailable on Linux — but nightwatch's generic `recurse_watch` and interceptor consult it for every non-recursive backend (`nightwatch.zig:362-363`, `:271-272`, `:319-320`). | a fix described as missing that was already in the dependency | **corrected (closure batch)**: § 5b and M3 status state the generic-layer mechanism with file/line evidence; `gitwatch.zig` pins the vtable path and `filters_watches` per platform. The only remaining item is an empirical Linux `watch_count`, a CI measurement. |
+| G46 | **The pruning mechanism was misattributed to the backend file.** `INotify.zig` never calls `should_watch` (kqueue does), and the plan concluded the predicate was unavailable on Linux — but nightwatch's generic `recurse_watch` and interceptor consult it for every non-recursive backend (`nightwatch.zig:362-363`, `:271-272`, `:319-320`). | a fix described as missing that was already in the dependency | **corrected (closure batch)**: § 5b and M3 status state the generic-layer mechanism with file/line evidence; `gitwatch.zig` pins the vtable path and `filters_watches` per platform. The Linux count is asserted by `test/watch-bound.test.mjs`, which skips (with its reason) on hosts where per-directory registration does not exist. |
 | G47 | **`--no-gitignore` could disable the guard and fork the two writers**: `refresh --no-gitignore` would publish a nested root's content that the daemon's trio excludes. | two writers, two trios, one tree | **fixed**: § 5 — the flag disables the user's chain and `info/exclude`; the boundary rule and `.fs-meta/ignore` always apply; undoing the guard means removing the nested root. |
 | G48 | **A protocol bump would have made `serve` and the daemon disagree.** `wire.protocol` is shared, so bumping for `GIT_EVENT` changes what `serve` announces too, and the plan said nothing about it. | a client that cannot talk to one of the two servers | **fixed**: § 5d — `serve` announces `0x0102` and never emits `0x0A`/`0x09`, documented as the same asymmetry `STATE` already has. |
 | G49 | **The "fallback" covered only half the problem, and the premise was wrong.** The plan assumed a recursive inotify arm could not be stopped from registering a subtree; in fact the generic layer consults the predicate for the tree arm too, once the arm supplies one. | an acceptance criterion nobody could meet on the target platform | **fixed (closure batch)**: the tree arm now supplies `shouldWatchTree`, § 5b is rewritten, and the per-platform contract is a compile-time test. The Linux empirical count remains CI work, not an open design question. |
