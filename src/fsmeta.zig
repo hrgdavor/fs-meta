@@ -293,18 +293,46 @@ fn runServe(
             .port = port,
             .dirs = dirs,
         };
+        // The returned handle is deliberately discarded: the HTTP thread is not joined, now or ever. It
+        // serves for the life of the process, and the process ends from this function below rather than
+        // unwinding past the arena and the allocator that thread is still using, so there is no join to
+        // make and no window in which joining it would be correct.
         _ = std.Thread.spawn(.{}, httpThread, .{ gpa, config }) catch {
             std.debug.print("fsmeta: cannot start the HTTP thread\n", .{});
         };
+    } else {
+        // No `--http`: the ordinary path, unchanged. Serve the unix socket until the process is killed.
+        return server.run(io, arena, root, &cache, live_options);
     }
 
-    return server.run(io, arena, root, &cache, live_options);
+    // `--http`: do not return into `main`'s unwind once the unix-socket server stops. Once `server.run`
+    // returns there is nothing left to serve, but returning would free the arena that `config.dirs` and
+    // `socket_dir` live in while the HTTP thread may still read them, and then `std.process.Init`'s own
+    // defers would run `safe_allocator.deinit()` — which asserts in Debug if another thread is
+    // mid-allocation and frees the backing memory regardless. So terminate the process from here, where
+    // nothing is unwound, and let the OS reclaim everything the HTTP thread was handed.
+    server.run(io, arena, root, &cache, live_options) catch |err| {
+        std.debug.print("fsmeta: cannot serve {s}: {s}\n", .{ root, @errorName(err) });
+        std.process.exit(1);
+    };
+    std.process.exit(0);
 }
 
 /// The HTTP server thread: creates its own I/O context and runs the socutil HTTP server.
+///
+/// The I/O context gets process lifetime, not thread lifetime: `socutil.run` stores it in `App.io` and
+/// spawns each connection thread with `std.Thread.spawn(...).detach()`, and those detached threads keep
+/// calling into the context after `run` returns (when the accept loop ends, for instance). A `Threaded`
+/// declared as a local lives on this thread's stack, so they would be reading freed stack; a `deinit` is
+/// no better — `Threaded.deinit` ends with `t.* = undefined` and its `join()` waits only for the Threaded
+/// pool, never for `std.Thread.spawn`ed threads, so it cannot make that read safe. Hence: heap-allocate,
+/// initialise, and never destroy. The leak is the fix.
 fn httpThread(gpa: std.mem.Allocator, config: socutil.Config) void {
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
+    const threaded = gpa.create(std.Io.Threaded) catch {
+        std.debug.print("fsmeta: cannot allocate the HTTP server's I/O context\n", .{});
+        return;
+    };
+    threaded.* = std.Io.Threaded.init(gpa, .{});
     const io = threaded.io();
     socutil.run(io, gpa, config) catch |err| {
         std.debug.print("fsmeta: HTTP server error: {s}\n", .{@errorName(err)});
