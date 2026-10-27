@@ -45,19 +45,20 @@ not in `fs-meta`. The practical test: if a change needs `src/gitignore.zig`, it 
 `doc/gitignore-and-optimisations.md`) now describe a matcher it does not own; when the matcher changes, the numbers are
 re-measured in `gitignore/bench` and `fs-meta`'s documents link there instead of restating them.
 
-## B. The pair layout (the open defect)
+## B. The pair layout (done)
 
-Full detail, with the code, is in [`plans/next-session-pair-layout.md`](archive/next-session-pair-layout.md). Summary:
+**Done, and kept for the record:** the plan that diagnosed the defect and the code that closed it is
+[`plans/archive/next-session-pair-layout.md`](archive/next-session-pair-layout.md) (the file it was written as,
+`plans/next-session-pair-layout.md`, moved into `plans/archive/` when the archive was created — the link above is the
+live path). Summary of what landed:
 
-- **B1.** Add the count assertion in `publish` before `pair.layout`:
-  `items.items.len == cache.files.count() + cache.dirs.count() - 1`. It either fires (the item loop) or holds (a real
-  cache entry the walker prunes), and that answer is the next step.
-- **B2.** Convert `publish` to `pair.layout` (the fragment is written in the plan), pass `laid.roots` into `json_doc`
-  (§ 18), and stop freeing meta/txt in a `defer` because `Outcome` returns them.
-- **B3.** Two tests move with it: `publish`'s literal becomes `"a.txt\nsrc/\nsrc/b.java\n"`, and `engine`'s
-  `expectNameSets` compares membership with `trimSlash` (and its diagnostic `for (a, b, 0..)` must go, it panics on
-  unequal lengths).
-- **B4.** Acceptance: gate green, and on a scratch tree `files.txt` is name-ordered with slashed directories and
+- **B1 (done).** The count assertion is in `publish` before `pair.layout`:
+  `items.items.len == cache.files.count() + cache.dirs.count() - 1` — the loader and the walker both depend on it.
+- **B2 (done).** `publish` lays its pair out through `pair.layout`, passes `laid.roots` into `json_doc` (§ 18), and
+  does not free meta/txt in a `defer` because `Outcome` returns them.
+- **B3 (done).** `publish`'s literal is `"a.txt\nsrc/\nsrc/b.java\n"`, and `engine`'s `expectNameSets` compares
+  membership with `trimSlash` (the panicking positional diagnostic is gone).
+- **B4 (done).** Gate green, and on a scratch tree `files.txt` is name-ordered with slashed directories while
   `files.json` carries `roots`.
 
 ## C. The batches' consumer entry point
