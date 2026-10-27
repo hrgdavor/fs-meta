@@ -58,9 +58,10 @@ const usage =
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   deprecated: an alias of reconcile, kept for scripts
-    \\  fsmeta serve   <root> [--live] [--http]
+    \\  fsmeta serve   <root> [--live] [--http[=<port>]]
     \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md;
-    \\                               --http also exposes an optional HTTP endpoint via the socutil library (port 8765)
+    \\                               --http also exposes an optional HTTP endpoint via the socutil library
+    \\                               (port 8765, or <port>; --http=0 asks the OS for any free port)
     \\  fsmeta daemon  start [--base <dir>] [--foreground]
     \\  fsmeta daemon  stop | status [--json]
     \\                               the background daemon: one socket per root, sleep and wake (FORMAT.daemon.md)
@@ -74,7 +75,8 @@ const usage =
     \\  --updated <ISO-8601>         the pass timestamp; the engine has no clock of its own
     \\  --per-file                   naive listing (stat per entry) instead of the batched one
     \\  --live                       serve: keep subscribers connected and publish a pass every 250 ms
-    \\  --http                       serve: also expose an HTTP endpoint via the socutil library (port 8765)
+    \\  --http[=<port>]              serve: also expose an HTTP endpoint via the socutil library
+    \\                               (port 8765; --http=0 asks the OS for any free port)
     \\  --stats                      print where the pass spent its time
     \\  --since <timestamp>          mtime filter for glob (ISO-8601 or relative: 1h, 30m, 2d)
     \\  --keep-batches <n>           how many generations of batch history to retain (default 32)
@@ -147,9 +149,16 @@ pub fn main(init: std.process.Init) !void {
             live = true;
         } else if (std.mem.eql(u8, arg, "--http")) {
             // The HTTP endpoint belongs to `serve` alone. Parsed globally, `refresh --http` would be accepted and
-            // do nothing, so refuse it for every other command rather than ignore it.
+            // do nothing, so refuse it for every other command rather than ignore it. Both spellings go through
+            // the same guard: the exact `--http` match is tested before the `--http=` prefix below.
             if (!std.mem.eql(u8, command, "serve")) return fail(io, gpa, "--http is only valid for the serve command");
             http_port = 8765;
+        } else if (std.mem.startsWith(u8, arg, "--http=")) {
+            // `--http=<port>` is a single token on purpose: `std.process.Args.Iterator` has no `peek()`, so an
+            // optional following argument could not be told apart from the positional root.
+            if (!std.mem.eql(u8, command, "serve")) return fail(io, gpa, "--http is only valid for the serve command");
+            const value = arg["--http=".len..];
+            http_port = std.fmt.parseInt(u16, value, 10) catch return fail(io, gpa, "--http needs a numeric port from 0 to 65535");
         } else if (arg.len > 0 and arg[0] == '-') {
             return fail(io, gpa, "unknown option");
         } else if (root == null) {

@@ -103,12 +103,15 @@ Batch directories are named by the generation in lowercase hex, zero-padded to e
 
 ### The daemon — one process, many roots
 
-`fsmeta serve <root>` owns one tree for its lifetime; its optional `--http` flag takes no argument, always binds
-port 8765, and serves a browser UI (socutil) over the same unix socket the binary protocol uses
-([`FORMAT.socket.md`](FORMAT.socket.md)). `fsmeta daemon` is the other shape: **one long-lived
-process that tracks several roots**, each with its own socket at `<runtime>/roots/<id>.sock`, speaking the same
-binary protocol. A consumer connects, `SUBSCRIBE`s, and receives batches as the tree changes — the same batches the
-engine writes. `FORMAT.daemon.md` is the reference; this is the working view.
+`fsmeta serve <root>` owns one tree for its lifetime; its optional `--http` flag also serves a browser UI (socutil)
+over the same unix socket the binary protocol uses ([`FORMAT.socket.md`](FORMAT.socket.md)). Bare `--http` binds
+port 8765, `--http=<port>` the port you name, and `--http=0` asks the operating system for any free port; the bound
+port is then announced on stdout as `socutil listening on http://127.0.0.1:<port>/`. The flag belongs to `serve` alone:
+any other command given it fails with `fsmeta: --http is only valid for the serve command`. `fsmeta daemon` is the
+other shape: **one long-lived process that tracks several roots**, each with its own socket at
+`<runtime>/roots/<id>.sock`, speaking the same binary protocol. A consumer connects, `SUBSCRIBE`s, and receives
+batches as the tree changes — the same batches the engine writes. `FORMAT.daemon.md` is the reference; this is the
+working view.
 
 ```sh
 zig-out/bin/fsmeta.exe daemon start                      # background; --foreground for tests

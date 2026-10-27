@@ -374,8 +374,11 @@ The rules for today, so the reservation is enforceable rather than decorative:
 
 ### Optional HTTP endpoint
 
-`fsmeta serve <root> --http` also exposes the socket through an HTTP endpoint (port 8765) via the
-[socutil](../socutil/) library. The HTTP endpoint is a front for the same Unix socket: the socutil UI lists
-the socket by name (`fs-meta.socket`) and relays it over a WebSocket byte tunnel or an SSE tail. The binary
-protocol on the Unix socket is unchanged; the HTTP endpoint is an optional convenience for browsers and
-tools that cannot open a Unix socket directly.
+`fsmeta serve <root> --http` also exposes the socket through an HTTP endpoint via the
+[socutil](../socutil/) library. The port is the only thing the flag chooses: bare `--http` binds 8765, as before,
+`--http=<port>` the port you name, and `--http=0` any free port the operating system hands out, which is then
+announced on stdout as `socutil listening on http://127.0.0.1:<port>/`. The flag is valid only for `serve`; any
+other command given it fails with `fsmeta: --http is only valid for the serve command`. The HTTP endpoint is a
+front for the same Unix socket: the socutil UI lists the socket by name (`fs-meta.socket`) and relays it over a
+WebSocket byte tunnel or an SSE tail. The binary protocol on the Unix socket is unchanged; the endpoint is an
+optional convenience for browsers and tools that cannot open a Unix socket directly.
