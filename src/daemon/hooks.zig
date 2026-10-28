@@ -237,7 +237,7 @@ fn writeHook(io: std.Io, arena: std.mem.Allocator, hooks: std.Io.Dir, hook: []co
     if (builtin.os.tag != .windows) {
         var file = try hooks.openFile(io, temporary, .{ .mode = .read_write });
         defer file.close(io);
-        try file.setPermissions(io, 0o755);
+        try file.setPermissions(io, @enumFromInt(0o755));
     }
     try std.Io.Dir.rename(hooks, temporary, hooks, hook, io);
 }

@@ -191,7 +191,7 @@ fn writeTemp(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !
 fn syncDirectory(io: std.Io, dir: std.Io.Dir) void {
     _ = io;
     if (builtin.os.tag == .windows) return;
-    std.posix.fsync(dir.handle) catch {};
+    _ = std.posix.system.fsync(dir.handle);
 }
 
 // --------------------------------------------------------------------------------------------- tests
