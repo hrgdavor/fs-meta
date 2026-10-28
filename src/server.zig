@@ -210,8 +210,105 @@ pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.St
     var read_buffer: [8192]u8 = undefined;
     var reader = std.Io.net.Stream.Reader.init(stream, io, &read_buffer);
 
-    const from_batch = (try negotiate(io, stream, &reader.interface, window)) orelse return;
+    // A connection is classified from its first eight bytes, which is both the smallest binary frame
+    // prefix and the whole opener of the exec dialect (`{{ exec `). One read answers both questions,
+    // and the bytes are not wasted: for a binary client they *are* the frame prefix.
+    const opening = reader.interface.takeArray(opening_size) catch |err| switch (err) {
+        error.EndOfStream => return,
+        else => return err,
+    };
+    if (std.mem.eql(u8, opening, exec_opening)) {
+        try serveExec(io, arena, stream, &reader.interface);
+        return;
+    }
+
+    const hello_frame = wire.readPrefix(opening) catch |err| {
+        refuse(io, stream, .protocol, "{s}", .{frameErrorWord(err)});
+        return;
+    };
+    const from_batch = (try negotiateWith(io, stream, &reader.interface, window, hello_frame)) orelse return;
     try replay(io, arena, stream, window, from_batch);
+}
+
+/// The eight bytes that open the exec dialect (`FORMAT.socket.md` § The `{{` dialect). Exactly eight,
+/// so it is the same read that decides between the dialects.
+const exec_opening = "{{ exec ";
+const opening_size = wire.prefix_size;
+
+fn takeByte(reader: *std.Io.Reader) !u8 {
+    return reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => return error.UnexpectedEndOfStream,
+        else => return err,
+    };
+}
+
+/// Read up to and including `\n`, returning the line without it.
+fn readLine(reader: *std.Io.Reader, buffer: []u8) ![]const u8 {
+    var length: usize = 0;
+    while (true) {
+        const byte = try takeByte(reader);
+        if (byte == '\n') return buffer[0..length];
+        if (length == buffer.len) return error.ExecHeaderTooLarge;
+        buffer[length] = byte;
+        length += 1;
+    }
+}
+
+/// `<length> <bytes>` — the length is what makes a value with a space or a newline safe.
+fn readField(reader: *std.Io.Reader, arena: std.mem.Allocator) ![]const u8 {
+    var digits: [24]u8 = undefined;
+    var count: usize = 0;
+    while (true) {
+        const byte = try takeByte(reader);
+        if (byte == ' ') break;
+        if (byte < '0' or byte > '9' or count == digits.len) return error.MalformedExecHeader;
+        digits[count] = byte;
+        count += 1;
+    }
+    if (count == 0) return error.MalformedExecHeader;
+    const length = std.fmt.parseInt(usize, digits[0..count], 10) catch return error.MalformedExecHeader;
+    if (length > 1 << 20) return error.ExecHeaderTooLarge;
+    const bytes = try arena.alloc(u8, length);
+    try reader.readSliceAll(bytes);
+    if (try takeByte(reader) != '\n') return error.MalformedExecHeader;
+    return bytes;
+}
+
+/// `{{ exec ` has been consumed; read `argc envc`, then the argv and env fields, and run the program
+/// with the socket as its stdin and stdout.
+///
+/// The socket is handed to the child directly rather than relayed: `StdIo.file` passes an open file,
+/// and a unix socket is a file descriptor, so the child's own writes go straight to the peer and the
+/// server needs no copy loop. When the child exits the connection closes.
+///
+/// v1 runs argv[0] as given. The environment is parsed and currently ignored — the child inherits the
+/// server's, which is what a daemon should do by default; a client that needs `NAME=VALUE` entries
+/// honoured is talking to a server that has yet to implement them, and `FORMAT.socket.md` says so.
+fn serveExec(io: std.Io, arena: std.mem.Allocator, stream: std.Io.net.Stream, reader: *std.Io.Reader) !void {
+    var line_buffer: [64]u8 = undefined;
+    const line = readLine(reader, &line_buffer) catch return;
+    var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+    const argc_text = tokens.next() orelse return;
+    const envc_text = tokens.next() orelse return;
+    const argc = std.fmt.parseInt(usize, argc_text, 10) catch return;
+    const envc = std.fmt.parseInt(usize, envc_text, 10) catch return;
+    if (argc == 0 or argc > 4096 or envc > 4096) return;
+
+    const argv = arena.alloc([]const u8, argc) catch return;
+    for (argv) |*slot| slot.* = readField(reader, arena) catch return;
+    for (0..envc) |_| _ = readField(reader, arena) catch return;
+
+    // Everything still unread on the socket is the program's stdin.
+    const socket_file: std.Io.File = .{ .handle = stream.socket.handle, .flags = .{ .nonblocking = false } };
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .{ .file = socket_file },
+        .stdout = .{ .file = socket_file },
+        .stderr = .inherit,
+    }) catch {
+        return;
+    };
+    _ = child.wait(io) catch {};
 }
 
 /// The handshake: send `HELLO` for the window's newest batch, read the peer's, then its `SUBSCRIBE`.
@@ -221,6 +318,19 @@ fn negotiate(
     stream: std.Io.net.Stream,
     reader: *std.Io.Reader,
     window: BatchWindow,
+) !?u64 {
+    const first = (try readFramePrefix(io, stream, reader)) orelse return null;
+    return negotiateWith(io, stream, reader, window, first);
+}
+
+/// The handshake once the client's first frame prefix is already in hand — which it is when the dialect
+/// was decided from those same eight bytes.
+fn negotiateWith(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    reader: *std.Io.Reader,
+    window: BatchWindow,
+    hello_frame: wire.Frame,
 ) !?u64 {
     // Simultaneous greeting: both sides send HELLO without waiting for the other (FORMAT.socket.md).
     const ours = wire.Hello{
@@ -236,7 +346,6 @@ fn negotiate(
     ours.write(&hello_bytes);
     try writeBytes(io, stream, &hello_bytes);
 
-    const hello_frame = (try readFramePrefix(io, stream, reader)) orelse return null;
     if (hello_frame.kind != .hello or hello_frame.length != wire.hello_size) {
         refuse(io, stream, .protocol, "expected a 24-byte HELLO greeting", .{});
         return null;

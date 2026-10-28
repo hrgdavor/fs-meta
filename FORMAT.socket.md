@@ -90,15 +90,24 @@ without decoding anything.
   0" from "exit 1" and must treat a close with no output as a failure. A later minor may append a
   status trailer, which is why the first word of the header is the dialect's verb (`exec`) and not a
   version number buried elsewhere.
+- **The environment, in this implementation.** Entries are carried and parsed, and `fsmeta serve`
+  currently lets the child inherit the server's environment instead of applying them. A client must
+  not assume its `NAME=VALUE` entries reach the program until a server says so; the wire format is
+  ready for that decision, the reference implementation has not taken it.
 - **A working directory or a tty.** The server decides where the program runs; a client that needs a
   different directory passes it as an argument, exactly as it would on a command line.
 - **Multiplexing.** One `{{` header per connection. A second request is a second connection.
 
-**Server side, in order:** read at most two bytes to classify; if they are `{{`, read the header
-exactly as specified, then hand the socket to the program as stdin and stdout and wait for it. The
-two bytes read for classification are part of the header, not a separate peek — a server that peeks
-with `MSG_PEEK` keeps them in the stream, and one that reads them must treat them as the first two
-bytes of `{{ `.
+**Server side, in order:** read the first **eight** bytes and compare them with `{{ exec `; that is
+both the smallest binary frame prefix and the whole opener of this dialect, so one read decides and
+nothing is consumed twice. If they match, read the header exactly as specified, then hand the socket
+to the program as stdin and stdout and wait for it. Otherwise the eight bytes are the client's frame
+prefix, and the binary handshake continues from there.
+
+That means the server no longer greets first: it reads before it writes. It is safe because a client
+that sends its HELLO immediately — which is what § Handshake already asks for — has those bytes
+waiting, and any client that waited for the server's greeting would have had to break the
+simultaneous-greeting rule anyway.
 
 ### Messages
 
