@@ -39,6 +39,67 @@ separate `max_batch_file_bytes` for it, with a test that loads a batch larger th
 not a hypothetical: a first batch of more than ~16 384 names (64 B per entry) could not be read back, so the consumer
 of a large tree received no batch at all and only the daemon's `last_error` said why.
 
+### Dialects on one socket
+
+A socket that serves more than one kind of client decides from the first bytes, before anything
+else is read. Four classes are allowed, and the rules are chosen so the decision never needs more
+than two bytes:
+
+| first bytes                       | dialect        | what follows                                        |
+| --------------------------------- | -------------- | --------------------------------------------------- |
+| `{"`                              | JSON-RPC       | a JSON object                                       |
+| `{{`                              | shell exec     | a `{{ exec …` header, then raw streams (§ below)    |
+| an ASCII uppercase letter `A`–`Z` | HTTP           | a request line: `GET`, `POST`, `HEAD`, …            |
+| anything else                     | binary         | the `kind`/`flags`/`length` frames of § Framing     |
+
+The fourth class is where this file's binary protocol lives, and it is collision-free by the rule
+§ Framing already states: every `kind` is **below `0x7B`**, so a binary message can never begin with
+`{` (0x7B) or with an uppercase letter. That single property is what leaves room for the other
+three classes without a length, a magic number, or a negotiation round trip.
+
+`{"` and `{{` share their first byte and differ in the second, so a server reads two bytes and
+knows. A first byte that is neither `{` nor uppercase is binary, so one byte is enough there.
+
+### The `{{` dialect: a socket that is an executable
+
+The contract this dialect makes is deliberately the one a shell already understands: **parameters
+and environment go in a header, and after that the connection is the program's stdin and stdout.**
+
+Request header — ASCII, LF-terminated; the client's stdin bytes follow it raw:
+
+```
+{{ exec <argc> <envc>\n
+<length> <bytes>\n      × argc     argv[0] is the program word
+<length> <bytes>\n      × envc     each entry is NAME=VALUE
+```
+
+- `<argc>`, `<envc>` and each `<length>` are decimal ASCII.
+- A field is its decimal byte length, one space, exactly that many bytes, then LF. The length is
+  what makes an argument containing a space or a newline safe: the line carries a count, and the
+  reader takes exactly that many bytes rather than scanning for a delimiter.
+- The header ends after the last environment line. Every byte after it is stdin, unescaped and
+  unframed.
+
+Response: the program's stdout, raw, until the connection closes. No envelope, no base64, nothing
+added — which is what makes binary output exact and what lets a shell pipe the socket into `grep`
+without decoding anything.
+
+**What v1 does not carry, stated so implementations can match:**
+
+- **The exit status.** Connection close is the end of the stream; a client cannot distinguish "exit
+  0" from "exit 1" and must treat a close with no output as a failure. A later minor may append a
+  status trailer, which is why the first word of the header is the dialect's verb (`exec`) and not a
+  version number buried elsewhere.
+- **A working directory or a tty.** The server decides where the program runs; a client that needs a
+  different directory passes it as an argument, exactly as it would on a command line.
+- **Multiplexing.** One `{{` header per connection. A second request is a second connection.
+
+**Server side, in order:** read at most two bytes to classify; if they are `{{`, read the header
+exactly as specified, then hand the socket to the program as stdin and stdout and wait for it. The
+two bytes read for classification are part of the header, not a separate peek — a server that peeks
+with `MSG_PEEK` keeps them in the stream, and one that reads them must treat them as the first two
+bytes of `{{ `.
+
 ### Messages
 
 | `kind` | Name           | Payload                                                                                |
