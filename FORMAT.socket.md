@@ -1,5 +1,10 @@
 # format for unix socket communication
 
+**Status: the Zig `fsmeta daemon` is the server and the intended watcher; this is its live transport.** One daemon
+per watched root serves one Unix socket; multiple tools connect as clients and subscribe to the same change stream.
+The Java and Bun ports are clients/readers; they do not host the watcher or publish a trio. The format below is
+implemented by the Zig side (`src/wire.zig`, `src/server.zig`) and is the contract a client implements.
+
 notes
 
 - define binary handshake but in such way it can not happen first two bytes are start of JSON object `{"`
@@ -13,7 +18,7 @@ notes
   - CHANGE_ENTRY
   - etc...
 
-## Proposed wire format
+## The wire format
 
 The notes above are the origin of this design; what follows makes them precise enough to implement, and deliberately
 reuses the format the engine already writes so that **nothing on the wire needs a second parser**.
@@ -118,7 +123,7 @@ simultaneous-greeting rule anyway.
 | `0x03` | `CHANGE_ENTRY` | 64-byte entry (§ 5) + name bytes, no LF                                                |
 | `0x04` | `END_BATCH`    | `u64 number`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`            |
 | `0x05` | `ERROR`        | `u16 code`, then a UTF-8 message                                                       |
-| `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing)               |
+| `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing); optionally followed by filter patterns (see below) |
 | `0x07` | `PING`         | empty                                                                                  |
 | `0x08` | `PONG`         | empty                                                                                  |
 | `0x09` | `STATE`        | `u8 state`, `u8 reason`, `u32 idle_timeout_ms`, `u64 head_batch` — see § STATE         |
@@ -157,6 +162,37 @@ off-line.
 Live updates are the same messages: when a pass publishes generation `g`, the server sends its `START_BATCH`,
 `CHANGE_ENTRY` messages and `END_BATCH` to every subscribed client whose `from_batch` is `g - 1`. A client that was
 asleep gets the replay path instead, which is why replay and live streaming are one protocol rather than two.
+
+### SUBSCRIBE filter patterns
+
+A `SUBSCRIBE` payload longer than 8 bytes carries **consumer-side filter patterns**: the server still tracks every
+file, but sends only the `CHANGE_ENTRY` frames whose names match the client's patterns. This lets a markdown checker
+ask for `*.md` changes without filtering client-side.
+
+The extended layout (all little-endian):
+
+```
+u64  from_batch
+u16  include_count
+     include_count × (u16 pattern_len + pattern_bytes)
+u16  exclude_count
+     exclude_count × (u16 pattern_len + pattern_bytes)
+```
+
+Semantics:
+
+- **Include patterns** — a name must match at least one to be sent.
+- **Exclude patterns** — a name matching any is suppressed, even if it also matches an include.
+- **Exclude wins over include.**
+- **Both empty** (or the original 8-byte form) — pass-all; every entry is sent.
+
+Pattern syntax is git's `wildmatch` (the same matcher as `gitignore` and the `glob` query): `*` matches any
+sequence, `?` matches one character, `[abc]` matches one of the listed characters. A pattern without `/` matches
+the basename at any depth; a pattern with `/` matches the whole workspace-relative path.
+
+The `END_BATCH` counts reflect what was **actually sent** (the filtered set), not the full batch. A client that
+applies `END_BATCH` counts to its state therefore sees the same numbers it counted from the `CHANGE_ENTRY` frames
+it received.
 
 ### STATE
 
@@ -364,7 +400,7 @@ and never on the text.
 
 | code | word            | sent when                                                                                          |
 | ---- | --------------- | -------------------------------------------------------------------------------------------------- |
-| 1    | `protocol`      | the peer's greeting is not a `HELLO` frame with `length = 24`, its payload does not decode (`role` outside 0/1), or it fails a greeting check (`unsupported-entry-size`, `unsupported-hash`, `unsupported-version`, `unsupported-capability`); `SUBSCRIBE` is not an 8-byte payload, or its `from_batch` is newer than the newest batch; or a frame prefix is refused (`unknown-kind`, `unsupported-flags`, `frame-too-large`) |
+| 1    | `protocol`      | the peer's greeting is not a `HELLO` frame with `length = 24`, its payload does not decode (`role` outside 0/1), or it fails a greeting check (`unsupported-entry-size`, `unsupported-hash`, `unsupported-version`, `unsupported-capability`); `SUBSCRIBE` is shorter than 8 bytes, its `from_batch` is newer than the newest batch, or its extended filter section is malformed; or a frame prefix is refused (`unknown-kind`, `unsupported-flags`, `frame-too-large`) |
 | 2    | `batch-too-old` | `from_batch + 1` is below the oldest retained batch, so replay cannot start where the client asked |
 | 3    | `batch-gap`     | a generation in `from_batch + 1 ..= newest` has no batch directory                                 |
 

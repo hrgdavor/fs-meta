@@ -11,6 +11,14 @@ what the engine published; it never lays a trio out. A port's tests are therefor
 writing-side tests are kept but gated (`FSMETA_PORT_WRITER=1`) rather than deleted, so that porting the writing side stays
 possible. Do not add a writer to a port to make a test pass.
 
+**The watcher is the Zig engine, and tools talk to it over a Unix socket.** The intended deployment is one
+long-lived `fsmeta daemon` for the served roots; each root has its own socket and its own trio. A tool asks the
+daemon for the live stream (`SUBSCRIBE` / `CHANGE_ENTRY`, `FORMAT.socket.md`) instead of running a watcher of its own;
+without a daemon it reads the trio. Multiple tools are expected to be active at once, which is why the Zig engine is
+the intended watcher: one native process performs the scan, hash, batch and git-transaction handling once, and every
+Java, Bun, editor or codegen client shares it. A Java or Bun watcher in-process would duplicate that work and be
+heavier; do not add one, and do not move the watcher into a port.
+
 ## 2. Format invariants that must not drift
 
 - **`glob` is abandoned and strictly not supported; `wildmatch` is the only wildcard syntax.** That applies here, in
