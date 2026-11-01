@@ -4,6 +4,18 @@
 history under `batches/`, and the Zig engine that writes both. It has its own repository, its own version and no parent
 (see `jcodebuddy`'s `AGENTS.md` § 2), and it is consumed as an artifact or a checkout.
 
+## 0. The daemon must run as a non-root user
+
+**Never run `fsmeta daemon`, `fsmeta serve`, or any other serving process as root or as an elevated Administrator.
+Use an ordinary unprivileged user.** The daemon watches trees, writes `.fs-meta`, parses paths and filters, and serves
+a local Unix socket that includes an executable dialect. An exploit in any of those paths would otherwise give the
+attacker **elevated permissions** over the host and every served repository.
+
+This is a hard deployment rule. The enforcement work — startup refusal, socket permissions and peer credentials,
+privilege dropping, packaging and negative tests — is planned in
+[`plans/non-root-daemon.md`](plans/non-root-daemon.md). Do not weaken that plan with an unrestricted “run as root”
+flag; any escape hatch must be narrow, explicit, and documented as unsafe.
+
 ## 1. The engine writes; ports read
 
 The Zig implementation is the **only writer**. A port (Bun, Java, and anything added later) validates, decodes and loads

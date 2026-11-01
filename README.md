@@ -1,5 +1,12 @@
 # fs-meta
 
+> **Security rule: run the daemon as a non-root, unprivileged user. Never run it as root or as an elevated
+> Administrator.** The daemon walks project trees, writes `.fs-meta` and serves a local Unix socket — including an
+> executable dialect that hands the connection to a child program. Any exploit in that attack surface would
+> otherwise run with **elevated permissions**. This is a hard deployment rule, not a recommendation. Enforcement
+> (a startup refusal, socket permissions and peer checks, privilege dropping, packaging and tests) is planned in
+> [`plans/non-root-daemon.md`](plans/non-root-daemon.md).
+
 The file-system state of one codebase folder, as a **trio of files** a watcher maintains and every other tool
 reads — so a tool that kept an index can ask *"is this file still what I indexed last time?"* by reading one
 64-byte entry instead of walking the tree and re-reading every file.
