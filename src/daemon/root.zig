@@ -59,6 +59,7 @@ const paths = @import("paths.zig");
 const registry = @import("registry.zig");
 const reaper = @import("reaper.zig");
 const state = @import("state.zig");
+const safe_dir = @import("../safe_dir.zig");
 const socket_security = @import("../socket_security.zig");
 
 /// The watcher every root uses: nightwatch's recommended backend for this platform (ReadDirectoryChangesW on
@@ -2089,7 +2090,7 @@ fn openMetaDir(io: std.Io, root: []const u8, allocator: std.mem.Allocator) !std.
     else
         try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer root_dir.close(io);
-    return root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+    return (try safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true })) orelse error.FileNotFound;
 }
 
 /// Whether an event's path is one the daemon must not react to.

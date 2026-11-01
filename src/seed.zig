@@ -23,6 +23,7 @@ const json = @import("json_doc.zig");
 const validate = @import("validate.zig");
 const cache_mod = @import("cache.zig");
 const publish_mod = @import("publish.zig");
+const safe_dir = @import("safe_dir.zig");
 const pair = @import("pair.zig");
 const batch_mod = @import("batch.zig");
 const scan = @import("scan.zig");
@@ -73,13 +74,7 @@ pub fn trySeed(arena: std.mem.Allocator, io: std.Io, base_root: []const u8, new_
 
     var new_dir = try openRoot(io, new_root);
     defer new_dir.close(io);
-    var new_meta = new_dir.openDir(io, ".fs-meta", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            try new_dir.createDirPath(io, ".fs-meta");
-            break :blk try new_dir.openDir(io, ".fs-meta", .{ .iterate = true });
-        },
-        else => return err,
-    };
+    var new_meta = try safe_dir.openOrCreateDirectory(io, new_dir, ".fs-meta", .{});
     defer new_meta.close(io);
 
     const identity = rootIdentity(arena, io, new_root) catch return false;

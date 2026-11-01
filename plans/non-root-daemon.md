@@ -36,19 +36,21 @@ The Windows socket DACL/peer gap and the remaining CI-host cases are called out 
   symlink/junction/reparse point (`error.MetaDirSymlink`) or a non-directory (`error.MetaDirNotDirectory`). Fresh
   `.fs-meta` is `0700` / fresh trio files `0600`; existing modes are inherited. Temp files are created exclusively so
   a pre-planted `files.*.tmp` cannot redirect the write. `batch.zig` now opens `batches`/`<gen>` no-follow and writes
-  its three files exclusively; `ignores.zig` uses the same safe open and exclusive `ignore.tmp` create.
+  its three files exclusively; `ignores.zig` uses the same safe open and exclusive `ignore.tmp` create; `seed.zig`
+  and the daemon's root/meta/batch-window opens use `safe_dir`. `safe_dir.zig` has direct tests for missing/refused
+  directories, exclusive creation and POSIX modes.
 - **N7 / packaging and tests:** `doc/service-deployment.md` and `packaging/` cover systemd, launchd, Windows service
-  wrapper and containers, with non-root service users and verification commands. `test/socket.test.mjs` covers the
-  default `{{` refusal, `--allow-exec` serve-only behavior, POSIX socket modes and the same-uid/other-gid peer
-  refusal; `test/daemon.test.mjs` covers POSIX runtime/socket modes and the root/elevated refusal when the runner is
+  wrapper and containers, with non-root service users and verification commands; `test/packaging.test.mjs` asserts
+  the templates never select root/LocalSystem. `test/socket.test.mjs` covers the default `{{` refusal,
+  `--allow-exec` serve-only behavior, POSIX socket modes and the same-uid/other-gid peer refusal;
+  `test/daemon.test.mjs` covers POSIX runtime/socket modes and the root/elevated refusal when the runner is
   privileged. Those tests skip with an explicit reason on Windows/non-root hosts.
 
 **Still open / explicitly not claimed:** the Windows socket DACL and peer check; UID+GID clients started through
 `sg`/`newgrp` when the primary gid differs; a **different-uid** peer test (needs a second unprivileged account) and
-execution of the root/elevated refusal tests on a root/elevated CI runner; writer-path `.fs-meta` opens in
-`seed.zig`, `main.zig`, `fsmeta.zig`, `daemon/host.zig` and `server.zig` still use the follow-open path and have not
-been routed through `safe_dir` (engine/publish/batch/ignores are covered); the `{{` child path on Windows is
-pre-existing and unverified; and direct unit tests for `safe_dir.zig` itself.
+execution of the root/elevated refusal tests on a root/elevated CI runner; the watcher prototype's `main.zig` state
+directory and the read-only `fsmeta.zig` trio paths still use ordinary follow opens (engine/publish/batch/ignores/seed
+and the daemon's root/meta opens are covered); the `{{` child path on Windows is pre-existing and unverified.
 
 ## 1. Why this is a hard rule
 
@@ -85,8 +87,8 @@ run a child, so socket access must never imply elevated execution.
 | Unix socket       | N3: `0700` dirs / `0600` sockets and uid+gid peer checks on Linux/macOS/BSD; Windows DACL/peer gap | an elevated daemon would hand a local client root-level access |
 | `{{` exec dialect | N4: off by default; only `serve --allow-exec`; daemon/live never had it                            | a local client could run a child as the daemon user            |
 | Peer identity     | N3: `.other_user` refused on POSIX; Windows gap documented                                         | any local user with socket access would be a client            |
-| `.fs-meta` writes | N6: engine/publish no-follow and exclusive temp creation; batch/ignores gaps remain                | a crafted layout could redirect root writes                    |
-| Packaging         | N7: non-root service/container templates and operator guide done; negative/CI tests open           | an operator could install a root service without noticing      |
+| `.fs-meta` writes | N6: engine/publish/batch/ignores and seed/daemon root/meta opens no-follow; watcher `main.zig`/read-only `fsmeta.zig` remain | a crafted layout could redirect root writes |
+| Packaging         | N7: non-root service/container templates, operator guide and packaging test done; second-uid/root CI jobs open | an operator could install a root service without noticing |
 | Windows           | N2 token/SID refusal done; no POSIX modes, no AF_UNIX peer credentials/DACL in Zig 0.17            | socket access relies on the inherited profile ACL              |
 
 The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's socket is
@@ -181,8 +183,8 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 3. **N3:** socket directory/mode + peer credentials; Windows DACL. **Done on POSIX; Windows gap.**
 4. **N4:** exec dialect off/opt-in and peer-gated. **Done for `serve`; daemon/live never had it.**
 5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing. **Done as hardening, not a drop.**
-6. **N6:** filesystem no-follow/handle checks. **Done for engine/publish/batch/ignores; other writer paths remain.**
-7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates and in-tree tests done; second-uid/root CI jobs open.**
+6. **N6:** filesystem no-follow/handle checks. **Done for engine/publish/batch/ignores/seed and daemon root/meta; watcher and read-only paths remain.**
+7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates, packaging test and in-tree tests done; second-uid/root CI jobs open.**
 
 ## 7. Acceptance
 
@@ -191,8 +193,8 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
   Windows has no peer credentials/DACL in this implementation.**
 - The exec dialect is not reachable without the explicit opt-in and same-user peer check. **Done for `serve`; the
   daemon never had the dialect.**
-- `.fs-meta` creation refuses a symlink and uses owner-only modes. **Done for engine/publish/batch/ignores; Windows
-  has no POSIX modes and a few other writer paths still use a follow open.**
+- `.fs-meta` creation refuses a symlink and uses owner-only modes. **Done for engine/publish/batch/ignores/seed and
+  daemon root/meta; Windows has no POSIX modes and the watcher/read-only paths still use a follow open.**
 - Service templates and docs never suggest root/LocalSystem. **Done in `packaging/` and
   `doc/service-deployment.md`.**
 - Tests cover refusal, permissions, peer rejection and the exec gate; the rule is in the top-level README, AGENTS.md

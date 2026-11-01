@@ -77,6 +77,7 @@ const batch = @import("batch.zig");
 const wire = @import("wire.zig");
 const engine = @import("engine.zig");
 const filter_mod = @import("filter.zig");
+const safe_dir = @import("safe_dir.zig");
 const socket_security = @import("socket_security.zig");
 
 /// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`). It is `wire.zig`'s
@@ -830,9 +831,9 @@ fn frameErrorWord(err: wire.ReadError) []const u8 {
 pub fn openBatchWindow(io: std.Io, root: []const u8) !BatchWindow {
     var root_dir = openRootDir(io, root) catch return .{};
     defer root_dir.close(io);
-    var meta_dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return .{};
+    var meta_dir = (safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true }) catch return .{}) orelse return .{};
     defer meta_dir.close(io);
-    var batches = meta_dir.openDir(io, "batches", .{ .iterate = true }) catch return .{};
+    var batches = (safe_dir.openExistingDirectory(io, meta_dir, "batches", .{ .iterate = true }) catch return .{}) orelse return .{};
 
     var first: ?u64 = null;
     var last: u64 = 0;

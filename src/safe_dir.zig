@@ -122,6 +122,39 @@ pub fn openOrCreateDirectory(
     return dir;
 }
 
+/// Open an existing `sub_path` below `parent` as a directory, without following a link.
+///
+/// Unlike `openOrCreateDirectory`, this never creates anything: `null` means the entry is genuinely absent, which
+/// lets a reader or a rotation preserve its own "missing archive" behaviour instead of fabricating an empty one.
+/// The no-follow and post-open kind checks are the same as the creating form.
+pub fn openExistingDirectory(
+    io: std.Io,
+    parent: std.Io.Dir,
+    sub_path: []const u8,
+    options: OpenOptions,
+) !?std.Io.Dir {
+    const dir = parent.openDir(io, sub_path, .{
+        .access_sub_paths = true,
+        .iterate = options.iterate,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop => return error.MetaDirSymlink,
+        error.NotDir => return error.MetaDirNotDirectory,
+        else => return err,
+    };
+    errdefer dir.close(io);
+
+    const opened = try dir.stat(io);
+    if (opened.kind != .directory) {
+        return switch (opened.kind) {
+            .sym_link, .unknown => error.MetaDirSymlink,
+            else => error.MetaDirNotDirectory,
+        };
+    }
+    return dir;
+}
+
 /// The mode for a new temporary file that will be renamed over `final_name`.
 ///
 /// Creating owner-only is the default, but an existing regular file keeps its mode so that tightening the writer
@@ -170,4 +203,76 @@ fn removeEntry(io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
             return file_err;
         };
     };
+}
+
+// --------------------------------------------------------------------------------------------- tests
+
+test "openExistingDirectory returns null for missing and refuses a file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const missing = try openExistingDirectory(io, tmp.dir, "absent", .{});
+    try std.testing.expect(missing == null);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "occupied", .data = "not a directory\n" });
+    try std.testing.expectError(error.MetaDirNotDirectory, openExistingDirectory(io, tmp.dir, "occupied", .{}));
+
+    try tmp.dir.createDirPath(io, "present");
+    const dir = (try openExistingDirectory(io, tmp.dir, "present", .{})) orelse return error.TestUnexpectedResult;
+    defer dir.close(io);
+}
+
+test "openOrCreateDirectory creates a missing directory and createExclusiveFile ignores a stale entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir = try openOrCreateDirectory(io, tmp.dir, "state", .{});
+    defer dir.close(io);
+
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const dir_stat = try dir.stat(io);
+        try std.testing.expectEqual(@as(u32, 0o700), dir_stat.permissions.toMode() & 0o777);
+    }
+
+    // A stale ordinary file is removed as an entry, then the new file is created with the requested mode.
+    try dir.writeFile(io, .{ .sub_path = "fresh", .data = "stale\n" });
+    var file = try createExclusiveFile(io, dir, "fresh", owner_only_file);
+    defer file.close(io);
+    try file.writeStreamingAll(io, "new\n");
+    const stat = try dir.statFile(io, "fresh", .{});
+    try std.testing.expectEqual(@as(u64, 4), stat.size);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    }
+}
+
+test "a non-empty directory at a file name is refused, not deleted" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "occupied");
+    try tmp.dir.writeFile(io, .{ .sub_path = "occupied/keep", .data = "keep\n" });
+    if (createExclusiveFile(io, tmp.dir, "occupied", owner_only_file)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {
+        // Refused: the non-empty directory was not deleted into or removed.
+    }
+    const kept = try tmp.dir.readFileAlloc(io, "occupied/keep", std.testing.allocator, std.Io.Limit.limited(16));
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("keep\n", kept);
+}
+
+test "a POSIX symlink at the state directory is refused" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "outside");
+    try tmp.dir.symLink(io, "outside", "link", .{ .is_directory = true });
+    try std.testing.expectError(error.MetaDirSymlink, openExistingDirectory(io, tmp.dir, "link", .{}));
+    try std.testing.expectError(error.MetaDirSymlink, openOrCreateDirectory(io, tmp.dir, "link", .{}));
 }

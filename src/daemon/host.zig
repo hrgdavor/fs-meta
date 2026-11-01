@@ -41,6 +41,7 @@ const ignores = @import("../ignores.zig");
 const nesting = @import("../nesting.zig");
 const seed = @import("../seed.zig");
 const wire = @import("../wire.zig");
+const safe_dir = @import("../safe_dir.zig");
 const socket_security = @import("../socket_security.zig");
 
 pub const Options = struct {
@@ -1308,7 +1309,7 @@ fn removeHistory(io: std.Io, allocator: std.mem.Allocator, root: []const u8) voi
     else
         std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
     defer root_dir.close(io);
-    var meta_dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return;
+    var meta_dir = (safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true }) catch return) orelse return;
     defer meta_dir.close(io);
     meta_dir.deleteTree(io, "batches") catch {};
 }
