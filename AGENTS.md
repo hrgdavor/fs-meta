@@ -14,11 +14,11 @@ attacker **elevated permissions** over the host and every served repository.
 This is a hard deployment rule. The **startup refusal is implemented** in `src/security.zig`; `serve` and
 `daemon start` refuse uid 0, elevated Administrator/service tokens and undeterminable privilege. `socket_security.zig`
 sets owner-only sockets and checks peer uid/gid on POSIX (Windows has a documented gap), `safe_dir.zig` refuses a
-symlinked `.fs-meta`, and the `{{` dialect is off unless `fsmeta serve --allow-exec`. The Windows platform gaps and
-the remaining different-uid/root CI cases are in [`plans/non-root-daemon.md`](plans/non-root-daemon.md); deployment
-procedures are in [`doc/service-deployment.md`](doc/service-deployment.md) and
-[`packaging/`](packaging/README.md). Do not weaken the rule with an unrestricted “run as root” flag; any escape hatch
-must be narrow, explicit, and documented as unsafe.
+symlinked `.fs-meta`, and the `{{` dialect is off unless `fsmeta serve --allow-exec`. The Windows platform gap and
+the remaining different-uid CI case are in [`plans/non-root-daemon.md`](plans/non-root-daemon.md); the root/elevated
+refusal runs in CI under `sudo`. Deployment procedures are in [`doc/service-deployment.md`](doc/service-deployment.md)
+and [`packaging/`](packaging/README.md). Do not weaken the rule with an unrestricted “run as root” flag; any escape
+hatch must be narrow, explicit, and documented as unsafe.
 
 ## 1. The engine writes; ports read
 

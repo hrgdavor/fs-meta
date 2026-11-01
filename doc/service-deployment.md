@@ -579,7 +579,7 @@ user. If the served root is not writable, fix the host ownership or the build ar
 - That the POSIX refusal checks capabilities, or that the Windows refusal enumerates every privilege. Neither is
   claimed by `src/security.zig`; the account choice remains the real control.
 - That these templates are an installer. They are examples with comments; the commands in this guide are the
-  procedure, and the second-uid/root CI execution is still open. Verify the checklist on the target host before trusting a
+  procedure, and the different-uid CI execution is still open. Verify the checklist on the target host before trusting a
   deployment.
 - That a third-party service wrapper (WinSW) is supported or shipped. It is an example of the only practical shape
   for a Windows service in this checkout; pin and review the wrapper you install.

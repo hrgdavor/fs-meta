@@ -5,7 +5,7 @@
   templates, with per-platform verification commands and an operator checklist. The startup refusal (N2), POSIX
   socket modes/peer checks (N3), `serve --allow-exec` (N4), startup hardening (N5) and no-follow `.fs-meta` writes (N6)
   are implemented with the platform gaps recorded in [`plans/non-root-daemon.md`](plans/non-root-daemon.md) § 6. The
-  in-tree negative tests are added; the different-uid and root/elevated CI jobs are still open.
+  in-tree negative tests are added; the root/elevated subset runs in CI, while the different-uid CI job remains.
 - **The Zig engine is the reference** (Zig 0.17; `scripts/lib/toolchain.js`'s `resolveZig` is the toolchain
   resolution). It is where the writer half lives: scan, hash, publish, serve. `src/main.zig` today is the
   watcher prototype, with event batching and git-transaction awareness but no trio output and no `.gitignore`

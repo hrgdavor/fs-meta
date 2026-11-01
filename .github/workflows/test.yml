@@ -27,3 +27,10 @@ jobs:
         run: |
           zig build -Doptimize=ReleaseFast
           bun test test
+
+      # The normal suite runs as the unprivileged runner, so the two N2 refusal cases skip. GitHub's runner has
+      # passwordless sudo; run only those cases as root. The socket/mode cases are deliberately not selected: a
+      # root daemon is expected to refuse to start, so they belong to the unprivileged run.
+      - name: Privileged refusal (root runner)
+        run: |
+          sudo -E env "PATH=$PATH" bun test test/daemon.test.mjs -t "a privileged process is refused"

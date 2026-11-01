@@ -1,7 +1,7 @@
 # Run the fs-meta daemon as a non-root user — and enforce it
 
-**Status: N1–N6 implemented with documented platform gaps; N7 docs/packaging and the in-tree negative tests are
-done, with the second-uid/privileged CI jobs still open (2026-11-01).** The rule is at the top of
+**Status: N1–N6 implemented with documented platform gaps; N7 docs/packaging, in-tree tests and the root CI step are
+done, with the different-uid CI job still open (2026-11-01).** The rule is at the top of
 [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md), [`doc/daemon.md`](../doc/daemon.md) and the operator guide
 [`doc/service-deployment.md`](../doc/service-deployment.md). `src/security.zig` refuses `serve`/`daemon start` for uid
 0, an elevated Administrator token or service SIDs; `socket_security.zig` makes POSIX sockets owner-only and
@@ -44,13 +44,13 @@ The Windows socket DACL/peer gap and the remaining CI-host cases are called out 
   the templates never select root/LocalSystem. `test/socket.test.mjs` covers the default `{{` refusal,
   `--allow-exec` serve-only behavior, POSIX socket modes and the same-uid/other-gid peer refusal;
   `test/daemon.test.mjs` covers POSIX runtime/socket modes and the root/elevated refusal when the runner is
-  privileged. Those tests skip with an explicit reason on Windows/non-root hosts.
+  privileged; `.github/workflows/test.yml` runs that privileged subset under `sudo` on the GitHub runner. Those tests
+  skip with an explicit reason on Windows/non-root hosts.
 
 **Still open / explicitly not claimed:** the Windows socket DACL and peer check; UID+GID clients started through
-`sg`/`newgrp` when the primary gid differs; a **different-uid** peer test (needs a second unprivileged account) and
-execution of the root/elevated refusal tests on a root/elevated CI runner; the engine's read-only `readTrio`/verify
-opens still use ordinary follow opens (the writer paths and the read paths in `main.zig`/`fsmeta.zig`/`server`/
-daemon are covered); the `{{` child path on Windows is pre-existing and unverified.
+`sg`/`newgrp` when the primary gid differs; a **different-uid** peer test (needs a second unprivileged account); the
+engine's read-only `readTrio`/verify opens still use ordinary follow opens (the writer paths and the read paths in
+`main.zig`/`fsmeta.zig`/`server`/daemon are covered); the `{{` child path on Windows is pre-existing and unverified.
 
 ## 1. Why this is a hard rule
 
@@ -88,7 +88,7 @@ run a child, so socket access must never imply elevated execution.
 | `{{` exec dialect | N4: off by default; only `serve --allow-exec`; daemon/live never had it                            | a local client could run a child as the daemon user            |
 | Peer identity     | N3: `.other_user` refused on POSIX; Windows gap documented                                         | any local user with socket access would be a client            |
 | `.fs-meta` writes | N6: writer paths and `main`/`fsmeta`/daemon/server read/write opens no-follow; engine's read-only `readTrio` remains | a crafted layout could redirect root writes  |
-| Packaging         | N7: non-root service/container templates, operator guide and packaging test done; second-uid/root CI jobs open | an operator could install a root service without noticing |
+| Packaging         | N7: non-root service/container templates, operator guide, packaging test and root CI step done; different-uid CI job open | an operator could install a root service without noticing |
 | Windows           | N2 token/SID refusal done; no POSIX modes, no AF_UNIX peer credentials/DACL in Zig 0.17            | socket access relies on the inherited profile ACL              |
 
 The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's socket is
@@ -184,7 +184,7 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 4. **N4:** exec dialect off/opt-in and peer-gated. **Done for `serve`; daemon/live never had it.**
 5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing. **Done as hardening, not a drop.**
 6. **N6:** filesystem no-follow/handle checks. **Done for engine writers, publish, batch, ignores, seed, main, fsmeta, daemon and server; engine's read-only `readTrio` remains.**
-7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates, packaging test and in-tree tests done; second-uid/root CI jobs open.**
+7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates, packaging test, in-tree tests and the root CI step done; different-uid CI job open.**
 
 ## 7. Acceptance
 
@@ -199,5 +199,5 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 - Service templates and docs never suggest root/LocalSystem. **Done in `packaging/` and
   `doc/service-deployment.md`.**
 - Tests cover refusal, permissions, peer rejection and the exec gate; the rule is in the top-level README, AGENTS.md
-  and daemon guide. **Partial: socket/daemon tests are in the tree and pass on POSIX/privileged runners; a genuine
-  different-uid peer and root/elevated execution still need their CI hosts.**
+  and daemon guide. **Partial: socket/daemon/packaging tests are in the tree; the root/elevated subset runs under
+  `sudo` in CI; a genuine different-uid peer still needs its second-account host.**
