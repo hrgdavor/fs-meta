@@ -36,6 +36,7 @@ const gitdir = @import("gitdir.zig");
 const ignores = @import("ignores.zig");
 const daemon_cli = @import("daemon/cli.zig");
 const socutil = @import("socutil");
+const filter_mod = @import("filter.zig");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -81,6 +82,10 @@ const usage =
     \\  --since <timestamp>          mtime filter for glob (ISO-8601 or relative: 1h, 30m, 2d)
     \\  --keep-batches <n>           how many generations of batch history to retain (default 32)
     \\  --json                       emit results as a JSON array
+    \\  --include <pattern>          reconcile/merge: only send names matching this gitignore pattern
+    \\                               (repeatable; a name must match at least one to be sent)
+    \\  --exclude <pattern>          reconcile/merge: suppress names matching this gitignore pattern
+    \\                               (repeatable; wins over --include)
     \\
 ;
 
@@ -117,6 +122,8 @@ pub fn main(init: std.process.Init) !void {
     var baseline_root: ?[]const u8 = null;
     var live = false;
     var http_port: ?u16 = null;
+    var include_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+    var exclude_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--no-gitignore")) {
             respect_gitignore = false;
@@ -147,6 +154,12 @@ pub fn main(init: std.process.Init) !void {
             options.keep_batches = std.fmt.parseInt(usize, value, 10) catch return fail(io, gpa, "--keep-batches needs a count");
         } else if (std.mem.eql(u8, arg, "--live")) {
             live = true;
+        } else if (std.mem.eql(u8, arg, "--include")) {
+            const value = args.next() orelse return fail(io, gpa, "--include needs a pattern");
+            try include_patterns.append(gpa, value);
+        } else if (std.mem.eql(u8, arg, "--exclude")) {
+            const value = args.next() orelse return fail(io, gpa, "--exclude needs a pattern");
+            try exclude_patterns.append(gpa, value);
         } else if (std.mem.eql(u8, arg, "--http")) {
             // The HTTP endpoint belongs to `serve` alone. Parsed globally, `refresh --http` would be accepted and
             // do nothing, so refuse it for every other command rather than ignore it. Both spellings go through
@@ -175,6 +188,8 @@ pub fn main(init: std.process.Init) !void {
     var arena_alloc = std.heap.ArenaAllocator.init(gpa);
     defer arena_alloc.deinit();
     const arena = arena_alloc.allocator();
+    defer include_patterns.deinit(gpa);
+    defer exclude_patterns.deinit(gpa);
 
     if (std.mem.eql(u8, command, "exclude")) return runExclude(io, arena, target);
     if (std.mem.eql(u8, command, "verify")) return verify(io, arena, target);
@@ -236,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
             const message = try std.fmt.allocPrint(arena, "{s} needs a from generation", .{command});
             return fail(io, gpa, message);
         };
-        return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output);
+        return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output, include_patterns.items, exclude_patterns.items);
     }
     if (std.mem.eql(u8, command, "serve")) {
         // The live publisher runs the same pass `refresh` does, so it must see the same options the
@@ -719,6 +734,8 @@ fn runReconcile(
     to_arg: ?[]const u8,
     baseline_root: ?[]const u8,
     json: bool,
+    include_patterns: []const []const u8,
+    exclude_patterns: []const []const u8,
 ) !void {
     const from = std.fmt.parseInt(usize, from_arg, 10) catch return fail(io, gpa, "from must be a number");
 
@@ -798,12 +815,28 @@ fn runReconcile(
     const changes = try reconcile.collapse(arena, events.items, baseline);
     defer arena.free(changes);
 
+    // Apply the consumer's include/exclude filter: a markdown checker asks for `*.md` and receives
+    // only markdown changes, not the whole tree.
+    var filtered: []const reconcile.Change = changes;
+    var filter: ?filter_mod.Filter = null;
+    if (include_patterns.len > 0 or exclude_patterns.len > 0) {
+        const f = try filter_mod.Filter.compile(arena, include_patterns, exclude_patterns);
+        filter = f;
+        var out: std.ArrayListUnmanaged(reconcile.Change) = .empty;
+        defer out.deinit(arena);
+        for (changes) |c| {
+            if (f.matches(c.name)) try out.append(arena, c);
+        }
+        filtered = try out.toOwnedSlice(arena);
+        defer arena.free(filtered);
+    }
+
     if (json) {
         var out: std.Io.Writer.Allocating = .init(arena);
         errdefer out.deinit();
         const writer = &out.writer;
         try writer.writeAll("[\n");
-        for (changes, 0..) |change, index| {
+        for (filtered, 0..) |change, index| {
             if (index > 0) try writer.writeAll(",\n");
             try writer.writeAll("  {\"name\": ");
             try jsonWriteString(writer, change.name);
@@ -819,7 +852,7 @@ fn runReconcile(
         return;
     }
 
-    for (changes) |change| {
+    for (filtered) |change| {
         const kind = switch (change.kind) {
             .added => "added",
             .changed => "changed",
@@ -828,7 +861,7 @@ fn runReconcile(
         const line = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ kind, change.name });
         try write(io, line);
     }
-    const total = try std.fmt.allocPrint(arena, "{d} names\n", .{changes.len});
+    const total = try std.fmt.allocPrint(arena, "{d} names\n", .{filtered.len});
     try write(io, total);
 }
 

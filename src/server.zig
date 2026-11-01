@@ -54,6 +54,7 @@ const cache_mod = @import("cache.zig");
 const batch = @import("batch.zig");
 const wire = @import("wire.zig");
 const engine = @import("engine.zig");
+const filter_mod = @import("filter.zig");
 
 /// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`). It is `wire.zig`'s
 /// constant, not a second copy: the daemon's `STATE` frame moved it to 1.1, and a value written in two places
@@ -226,8 +227,8 @@ pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.St
         refuse(io, stream, .protocol, "{s}", .{frameErrorWord(err)});
         return;
     };
-    const from_batch = (try negotiateWith(io, stream, &reader.interface, window, hello_frame)) orelse return;
-    try replay(io, arena, stream, window, from_batch);
+    const sub = (try negotiateWith(io, stream, &reader.interface, window, hello_frame, arena)) orelse return;
+    try replay(io, arena, stream, window, sub.from_batch, &sub.filter);
 }
 
 /// The eight bytes that open the exec dialect (`FORMAT.socket.md` § The `{{` dialect). Exactly eight,
@@ -311,16 +312,23 @@ fn serveExec(io: std.Io, arena: std.mem.Allocator, stream: std.Io.net.Stream, re
     _ = child.wait(io) catch {};
 }
 
+/// The result of a successful `SUBSCRIBE`: the client's `from_batch` and its optional filter.
+const Subscribe = struct {
+    from_batch: u64,
+    filter: filter_mod.Filter,
+};
+
 /// The handshake: send `HELLO` for the window's newest batch, read the peer's, then its `SUBSCRIBE`.
-/// Returns the client's `from_batch`, or `null` when the request was refused (an `ERROR` has been sent).
+/// Returns the client's `from_batch` and filter, or `null` when the request was refused (an `ERROR` has been sent).
 fn negotiate(
     io: std.Io,
     stream: std.Io.net.Stream,
     reader: *std.Io.Reader,
     window: BatchWindow,
-) !?u64 {
+    allocator: std.mem.Allocator,
+) !?Subscribe {
     const first = (try readFramePrefix(io, stream, reader)) orelse return null;
-    return negotiateWith(io, stream, reader, window, first);
+    return negotiateWith(io, stream, reader, window, first, allocator);
 }
 
 /// The handshake once the client's first frame prefix is already in hand — which it is when the dialect
@@ -331,7 +339,8 @@ fn negotiateWith(
     reader: *std.Io.Reader,
     window: BatchWindow,
     hello_frame: wire.Frame,
-) !?u64 {
+    allocator: std.mem.Allocator,
+) !?Subscribe {
     // Simultaneous greeting: both sides send HELLO without waiting for the other (FORMAT.socket.md).
     const ours = wire.Hello{
         .protocol = protocol,
@@ -362,12 +371,50 @@ fn negotiateWith(
     }
 
     const subscribe_frame = (try readFramePrefix(io, stream, reader)) orelse return null;
-    if (subscribe_frame.kind != .subscribe or subscribe_frame.length != 8) {
-        refuse(io, stream, .protocol, "expected SUBSCRIBE with a u64 from_batch", .{});
+    if (subscribe_frame.kind != .subscribe) {
+        refuse(io, stream, .protocol, "expected SUBSCRIBE", .{});
         return null;
     }
     const subscribe_payload = try reader.take(subscribe_frame.length);
+
+    // The original form is 8 bytes (just `from_batch`); the extended form carries filter patterns.
+    if (subscribe_frame.length < 8) {
+        refuse(io, stream, .protocol, "SUBSCRIBE payload too short", .{});
+        return null;
+    }
     const from_batch = std.mem.readInt(u64, subscribe_payload[0..8], .little);
+
+    var filter = filter_mod.Filter{ .include = &[_]filter_mod.Pattern{}, .exclude = &[_]filter_mod.Pattern{} };
+    if (subscribe_frame.length > 8) {
+        // Extended form: u16 include_count, patterns, u16 exclude_count, patterns.
+        var pos: usize = 8;
+        const include_count: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
+        pos += 2;
+        var inc: std.ArrayListUnmanaged(filter_mod.Pattern) = .empty;
+        defer inc.deinit(allocator);
+        for (0..include_count) |_| {
+            const plen: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
+            pos += 2;
+            const pbytes = subscribe_payload[pos .. pos + plen];
+            pos += plen;
+            try inc.append(allocator, filter_mod.compileOne(pbytes));
+        }
+        const exclude_count: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
+        pos += 2;
+        var exc: std.ArrayListUnmanaged(filter_mod.Pattern) = .empty;
+        defer exc.deinit(allocator);
+        for (0..exclude_count) |_| {
+            const plen: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
+            pos += 2;
+            const pbytes = subscribe_payload[pos .. pos + plen];
+            pos += plen;
+            try exc.append(allocator, filter_mod.compileOne(pbytes));
+        }
+        filter = .{
+            .include = try inc.toOwnedSlice(allocator),
+            .exclude = try exc.toOwnedSlice(allocator),
+        };
+    }
 
     if (from_batch > window.last) {
         // FORMAT.socket.md does not say what a client ahead of the server means; refusing it is the
@@ -381,11 +428,12 @@ fn negotiateWith(
             return null;
         }
     }
-    return from_batch;
+    return .{ .from_batch = from_batch, .filter = filter };
 }
 
-/// Send `START_BATCH` … `END_BATCH` for every generation after `from_batch`.
-fn replay(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, window: BatchWindow, from_batch: u64) !void {
+/// Send `START_BATCH` … `END_BATCH` for every generation after `from_batch`, applying the consumer's
+/// filter: entries whose names do not match are skipped, and `END_BATCH` counts reflect what was sent.
+fn replay(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, window: BatchWindow, from_batch: u64, filter: *const filter_mod.Filter) !void {
     const dir = window.dir orelse return;
     var generation = from_batch + 1;
     while (generation <= window.last) : (generation += 1) {
@@ -396,11 +444,18 @@ fn replay(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, w
             else => return err,
         };
 
+        var counted = Counts{};
         try sendStartBatch(io, stream, generation, generation - 1);
         for (plan.entries, plan.names) |entry, name| {
+            if (!filter.matches(name)) continue;
             try sendChangeEntry(io, allocator, stream, entry, name);
+            if (batch.kindOf(entry)) |kind| switch (kind) {
+                .added => counted.added += 1,
+                .changed => counted.changed += 1,
+                .deleted => counted.deleted += 1,
+            };
         }
-        try sendEndBatch(io, stream, generation, counts(plan));
+        try sendEndBatch(io, stream, generation, counted);
     }
 }
 
@@ -418,8 +473,8 @@ fn liveConnection(io: std.Io, root: []const u8, stream: std.Io.net.Stream, live:
     var window = try openBatchWindow(io, root);
     defer if (window.dir) |dir| dir.close(io);
 
-    const from_batch = (try negotiate(io, stream, &reader.interface, window)) orelse return;
-    try replay(io, arena, stream, window, from_batch);
+    const sub = (try negotiate(io, stream, &reader.interface, window, arena)) orelse return;
+    try replay(io, arena, stream, window, sub.from_batch, &sub.filter);
 
     // The replay's own handle is no longer needed; the live loop opens the archive per delivery so it
     // sees batches written after this connection started, and never shares an iteration position.
@@ -427,7 +482,7 @@ fn liveConnection(io: std.Io, root: []const u8, stream: std.Io.net.Stream, live:
     if (window.dir) |dir| dir.close(io);
     window.dir = null;
 
-    try streamBatches(io, stream, live, replayed);
+    try streamBatches(io, stream, live, replayed, &sub.filter);
 }
 
 /// Stream every batch after `from` as the publisher makes it the newest, without reconnecting.
@@ -436,7 +491,7 @@ fn liveConnection(io: std.Io, root: []const u8, stream: std.Io.net.Stream, live:
 /// publisher stores the number only after `batch.write` returned; if it is missing anyway the archive
 /// has a hole, and a hole is `batch-gap` rather than a silent skip (FORMAT.md § 17.1, FORMAT.socket.md
 /// § Replay, resume and the two refusals).
-fn streamBatches(io: std.Io, stream: std.Io.net.Stream, live: *Live, from: u64) !void {
+fn streamBatches(io: std.Io, stream: std.Io.net.Stream, live: *Live, from: u64, filter: *const filter_mod.Filter) !void {
     var sent = from;
     while (true) {
         const newest = live.newest.load(.acquire);
@@ -465,11 +520,18 @@ fn streamBatches(io: std.Io, stream: std.Io.net.Stream, live: *Live, from: u64) 
                 else => return err,
             };
 
+            var counted = Counts{};
             try sendStartBatch(io, stream, generation, generation - 1);
             for (plan.entries, plan.names) |entry, name| {
+                if (!filter.matches(name)) continue;
                 try sendChangeEntry(io, arena, stream, entry, name);
+                if (batch.kindOf(entry)) |kind| switch (kind) {
+                    .added => counted.added += 1,
+                    .changed => counted.changed += 1,
+                    .deleted => counted.deleted += 1,
+                };
             }
-            try sendEndBatch(io, stream, generation, counts(plan));
+            try sendEndBatch(io, stream, generation, counted);
         }
         sent = newest;
     }
