@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Example configuration for hosting fsmeta.exe as a Windows service through a
+  wrapper such as WinSW (https://github.com/winsw/winsw).
+
+  The fs-meta engine in this checkout has NO native Windows service entry point
+  (no StartServiceCtrlDispatcher). Pointing sc.exe straight at fsmeta.exe is
+  therefore wrong and fails with "did not respond in a timely manner" (1053).
+  A wrapper that can host a console program is required; the wrapper is not
+  part of fs-meta and is not shipped in this repository.
+
+  SAFETY: do not install the service as LocalSystem, LocalService or
+  NetworkService, and do not put a <serviceaccount> block for one of them in
+  this file. Create the service with sc.exe and the low-privilege virtual
+  service account instead:
+
+    sc.exe create fsmeta binPath= "\"C:\Program Files\fs-meta\fsmeta-service.exe\"" ^
+      obj= "NT SERVICE\fsmeta" start= auto
+
+  Then verify with `sc.exe qc fsmeta`: SERVICE_START_NAME must be
+  NT SERVICE\fsmeta. If it is LocalSystem, stop and fix it; the daemon's
+  startup refusal also rejects SYSTEM/LocalService/NetworkService tokens, so
+  the misconfiguration fails closed rather than serving elevated.
+
+  The wrapper must be renamed fsmeta-service.exe so that it finds this file as
+  fsmeta-service.xml beside it, and fsmeta.exe must be installed beside it (or
+  adjust <executable>).
+
+  FSMETA_CONFIG_HOME is a prefix: the durable list is
+  C:\ProgramData\fsmeta\roots.json. FSMETA_RUNTIME_DIR is used as-is: sockets,
+  claims and logs live under C:\ProgramData\fsmeta\run. The install steps in
+  doc/service-deployment.md create these directories and grant the service
+  account modify access; they are not world-writable.
+-->
+<service>
+    <id>fsmeta</id>
+    <name>fs-meta daemon</name>
+    <description>fs-meta daemon (non-root file watcher); serves local Unix sockets and writes .fs-meta.</description>
+
+    <!-- Keep the account set by sc.exe. The wrapper's installer defaults a
+         service to LocalSystem; this configuration is started by sc.exe with
+         obj= "NT SERVICE\fsmeta" instead. -->
+    <autoRefresh>false</autoRefresh>
+
+    <executable>C:\Program Files\fs-meta\fsmeta.exe</executable>
+    <arguments>daemon start --foreground</arguments>
+    <workingdirectory>C:\</workingdirectory>
+    <hidewindow>true</hidewindow>
+    <stoptimeout>30sec</stoptimeout>
+
+    <env name="FSMETA_RUNTIME_DIR" value="C:\ProgramData\fsmeta\run"/>
+    <env name="FSMETA_CONFIG_HOME" value="C:\ProgramData"/>
+
+    <logpath>C:\ProgramData\fsmeta\logs</logpath>
+    <log mode="roll"/>
+
+    <resetfailure>1 hour</resetfailure>
+    <onfailure action="restart" delay="10 sec"/>
+</service>

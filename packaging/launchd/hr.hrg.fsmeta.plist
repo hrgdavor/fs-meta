@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  fs-meta daemon as a LaunchDaemon running as the dedicated _fsmeta user.
+
+  Do not remove UserName/GroupName. A LaunchDaemon without UserName runs as
+  root; this template is deliberately not that shape. The daemon also refuses
+  uid 0 at startup (src/security.zig), so a missing UserName fails the service
+  instead of publishing as root, but the file's intent is to run unprivileged.
+
+  Use a LaunchAgent instead for a single developer: it runs as the logged-in
+  user and cannot start before login. See doc/service-deployment.md.
+
+  The directories named below must exist and be owned by _fsmeta before the
+  daemon starts; the install steps in doc/service-deployment.md create them.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>hr.hrg.fsmeta</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/fsmeta</string>
+        <string>daemon</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+
+    <!-- A LaunchDaemon without these keys runs as root. Keep both. -->
+    <key>UserName</key>
+    <string>_fsmeta</string>
+    <key>GroupName</key>
+    <string>_fsmeta</string>
+
+    <key>WorkingDirectory</key>
+    <string>/</string>
+
+    <!-- FSMETA_CONFIG_HOME is a prefix: the durable list is
+         /Library/Application Support/fsmeta/roots.json.
+         FSMETA_RUNTIME_DIR is used as-is; sockets and claims live there.
+         /Library/Caches is used instead of /var/run because the install steps
+         must be able to create the directory once and have it survive a reboot. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FSMETA_RUNTIME_DIR</key>
+        <string>/Library/Caches/fsmeta/run</string>
+        <key>FSMETA_CONFIG_HOME</key>
+        <string>/Library/Application Support</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/fsmeta/daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/fsmeta/daemon.log</string>
+</dict>
+</plist>

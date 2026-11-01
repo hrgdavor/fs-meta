@@ -1,0 +1,51 @@
+# fs-meta daemon in a container, safe-by-default.
+#
+#   docker compose -f packaging/container/compose.yaml up -d --build
+#
+# The container runs as uid/gid 10001, with a read-only root filesystem, no
+# capabilities, no-new-privileges, and no network. The runtime directory is a
+# named volume initialised from the image (owned by 10001); the daemon rebuilds
+# it from roots.json on every start, so it is disposable. The durable root list
+# lives in a second named volume; served roots are bind-mounted read-write
+# because the daemon writes the trio and batches/ inside each root.
+#
+# The host path below is an example. It must be writable by uid 10001 (or by
+# the mapped uid under a rootless user namespace). Never mount /, a home
+# directory or anything under /etc read-write.
+#
+# For rootless Podman/Docker, choose the image uid/gid that can write the bind
+# mount: FSMETA_UID=$(id -u) FSMETA_GID=$(id -g) docker compose ... up -d --build.
+# The two named volumes are initialised from the image, so they take the same
+# ownership; an existing volume keeps its old ownership and must be recreated
+# (docker compose down -v) or chowned to the mapped uid the container uses.
+# Do not "fix" an ownership problem with user: "0:0", --privileged or a
+# capability: uid 0 inside a user namespace is still uid 0 to the daemon, and
+# its startup refusal rejects it.
+
+name: fs-meta
+
+services:
+    fsmeta:
+        build:
+            context: ../..
+            dockerfile: packaging/container/Dockerfile
+            args:
+                UID: ${FSMETA_UID:-10001}
+                GID: ${FSMETA_GID:-10001}
+        image: fs-meta:local
+        user: "${FSMETA_UID:-10001}:${FSMETA_GID:-10001}"
+        read_only: true
+        cap_drop:
+            - ALL
+        security_opt:
+            - no-new-privileges:true
+        network_mode: none
+        volumes:
+            - fs-meta-config:/var/lib/fsmeta
+            - fs-meta-run:/run/fsmeta
+            - /srv/fsmeta:/srv/fsmeta:rw
+        restart: unless-stopped
+
+volumes:
+    fs-meta-config:
+    fs-meta-run:

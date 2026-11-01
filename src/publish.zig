@@ -27,6 +27,7 @@ const format = @import("format.zig");
 const json = @import("json_doc.zig");
 const cache_mod = @import("cache.zig");
 const pair = @import("pair.zig");
+const safe_dir = @import("safe_dir.zig");
 
 pub const Cache = cache_mod.Cache;
 
@@ -175,10 +176,21 @@ fn dirEntry(path: []const u8, directory: cache_mod.DirState) format.Entry {
     };
 }
 
+/// Write one temporary file completely and fsync it.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): the temporary names are fixed by FORMAT.md § 9, so a repository that
+/// ships a prepared `.fs-meta` can plant an entry at `files.meta.tmp`. `safe_dir.createExclusiveFile` removes any
+/// such entry as an entry (never following it) and creates the file `O_EXCL`/`FILE_CREATE`, so the bytes cannot
+/// be redirected through a symlink or junction. The rename that follows replaces the final name rather than
+/// opening through it, which is why the commit order is unchanged.
+///
+/// The new file is owner-only (`0600`) when there is no previous generation to inherit a mode from; an existing
+/// trio file keeps its mode so that tightening the writer does not break a reader that could already read it.
 fn writeTemp(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
     const temp = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp", .{name});
     defer std.heap.page_allocator.free(temp);
-    var file = try dir.createFile(io, temp, .{ .truncate = true });
+    const permissions = safe_dir.filePermissionsFor(io, dir, name);
+    var file = try safe_dir.createExclusiveFile(io, dir, temp, permissions);
     defer file.close(io);
     try file.writeStreamingAll(io, bytes);
     // The fsync is what makes the rename's claim survive a crash: without it the rename can reach the directory
@@ -406,4 +418,41 @@ test "the trio on disk is what the outcome says it is" {
     while (try iterator.next(io)) |entry| {
         try testing.expect(std.mem.endsWith(u8, entry.name, ".tmp") == false);
     }
+}
+
+test "a pre-planted temporary name is replaced, not written through" {
+    // N6's write half. The temporary names are fixed, so a tree that ships a prepared `.fs-meta` can put an entry
+    // at `files.txt.tmp` and hope the writer truncates through it. A hard link is the privilege-free stand-in for
+    // a symlink on POSIX — both make the name share content the writer must not touch — and it exercises the same
+    // code path (the name exists and must be removed, not opened). On Windows Zig 0.17's `Dir.hardLink` is
+    // `error.OperationUnsupported`, so this case skips there and the symlink/junction shape stays a skip-guarded
+    // integration test (reported as a gap).
+    //
+    // Before N6 `writeTemp` opened the name with truncation: the victim's bytes became the trio's. After it, the
+    // link entry is removed and a fresh file is created, so the victim keeps its own content.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim.txt", .data = "the victim's bytes\n" });
+    std.Io.Dir.hardLink(tmp.dir, "victim.txt", tmp.dir, ".fs-meta/files.txt.tmp", io, .{}) catch |err| switch (err) {
+        error.OperationUnsupported, error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    var cache = try sampleCache(arena);
+    defer cache.deinit();
+    var meta_dir = try tmp.dir.openDir(io, ".fs-meta", .{ .iterate = true });
+    defer meta_dir.close(io);
+    const outcome = try publishInto(meta_dir, io, arena, &cache, 2);
+
+    // The commit is the new trio, and the other name of the inode still sees what it always held.
+    const on_disk = try meta_dir.readFileAlloc(io, format.txt_file, arena, std.Io.Limit.limited(1 << 20));
+    try testing.expectEqualStrings(outcome.txt, on_disk);
+    const victim = try tmp.dir.readFileAlloc(io, "victim.txt", arena, std.Io.Limit.limited(1 << 10));
+    try testing.expectEqualStrings("the victim's bytes\n", victim);
 }

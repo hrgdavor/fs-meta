@@ -2,8 +2,10 @@
 
 > **Security rule: run the daemon as a non-root, unprivileged user. Never as root or an elevated Administrator.**
 > It watches trees, writes `.fs-meta` and serves a local socket, including an executable dialect; an exploit would
-> otherwise run with **elevated permissions**. The startup refusal is implemented; the remaining enforcement is
-> planned in [`plans/non-root-daemon.md`](../plans/non-root-daemon.md).
+> otherwise run with **elevated permissions**. The startup refusal, POSIX owner-only sockets/peer checks, `--allow-exec`
+> gate, startup hardening and no-follow `.fs-meta` writes are implemented; the remaining gaps are in
+> [`plans/non-root-daemon.md`](../plans/non-root-daemon.md), and deployment is covered by
+> [`service-deployment.md`](service-deployment.md).
 
 `fsmeta serve <root>` owns one tree for its lifetime; its optional `--http` flag also serves a browser UI (socutil)
 over the same unix socket the binary protocol uses ([`FORMAT.socket.md`](../FORMAT.socket.md)). Bare `--http` binds

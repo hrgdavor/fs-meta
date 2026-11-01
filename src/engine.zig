@@ -29,6 +29,7 @@ const scan = @import("scan.zig");
 const ignore_mod = @import("ignore.zig");
 const ignores = @import("ignores.zig");
 const boundary_mod = @import("boundary.zig");
+const safe_dir = @import("safe_dir.zig");
 
 pub const Cache = cache_mod.Cache;
 
@@ -65,14 +66,13 @@ fn openRoot(io: std.Io, root: []const u8) !std.Io.Dir {
 /// opened on the drive it points at, and a relative create through it resolves there. The failure of a create
 /// is returned as an error the caller sees — the earlier `CreateDirectoryW` call discarded its `BOOL`, so a
 /// refused create resurfaced one call later as `FileNotFound` from this very open.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): the open does **not** follow a link. `safe_dir.openOrCreateDirectory`
+/// refuses a `.fs-meta` that is a symlink, a directory junction or any other reparse point, and a `.fs-meta` that
+/// exists but is not a directory, so the tree cannot redirect the pass's writes to another directory. A newly
+/// created `.fs-meta` is owner-only (`0700`) on POSIX; an existing one is never chmod-ed.
 fn openOrCreateMetaDir(io: std.Io, root_dir: std.Io.Dir) !std.Io.Dir {
-    return root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            try root_dir.createDirPath(io, format.directory_name);
-            return root_dir.openDir(io, format.directory_name, .{ .iterate = true });
-        },
-        else => return err,
-    };
+    return safe_dir.openOrCreateDirectory(io, root_dir, format.directory_name, .{ .iterate = true });
 }
 
 /// Where a pass spends its time, in nanoseconds. Reported with `--stats`; the sum is the pass.
@@ -361,6 +361,35 @@ const testing = std.testing;
 fn writeFile(dir: std.Io.Dir, io: std.Io, name: []const u8, data: []const u8) !void {
     try dir.createDirPath(io, std.fs.path.dirname(name) orelse ".");
     try dir.writeFile(io, .{ .sub_path = name, .data = data });
+}
+
+test "a .fs-meta that is not a directory is refused, not replaced" {
+    // N6. A regular file at `.fs-meta` is the shape the no-follow open has to reject without a symlink, so this
+    // runs everywhere — including this Windows host, where SeCreateSymbolicLinkPrivilege is not available to the
+    // test process. The link shape (symlink or junction) needs that privilege or a POSIX host, so it belongs to
+    // the integrator's skip-guarded test (see the hand-off); what this asserts is that a pass refuses an existing
+    // non-directory instead of opening through it or replacing it.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".fs-meta", .data = "not a directory\n" });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..count];
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    try testing.expectError(
+        error.MetaDirNotDirectory,
+        refresh(arena, io, root, .{ .updated = "2026-11-01T00:00:00Z" }),
+    );
+
+    // The refusal is not a repair: the entry the tree shipped is still there, byte for byte.
+    const still = try tmp.dir.readFileAlloc(io, ".fs-meta", arena, std.Io.Limit.limited(1 << 10));
+    try testing.expectEqualStrings("not a directory\n", still);
 }
 
 test "a pass over a fresh tree publishes one generation, and a second pass changes nothing" {

@@ -5,6 +5,14 @@ per watched root serves one Unix socket; multiple tools connect as clients and s
 The Java and Bun ports are clients/readers; they do not host the watcher or publish a trio. The format below is
 implemented by the Zig side (`src/wire.zig`, `src/server.zig`) and is the contract a client implements.
 
+**The socket is owner-only and peers are checked, not assumed.** The daemon creates its runtime directories `0700`
+and its sockets `0600`; on Linux (`SO_PEERCRED`) and macOS/BSD (`getpeereid`) a connection whose uid/gid is not the
+serving process's is refused on the normal `ERROR` path. Windows and WASI have no mode bits and no AF_UNIX peer
+credentials in this implementation, so the inherited per-user ACL is the only control there; a deployment that
+needs a cross-user boundary must not rely on the socket. The `{{` executable dialect is **off by default** and is
+enabled only with `fsmeta serve --allow-exec`; the daemon never offers it. See
+[`plans/non-root-daemon.md`](plans/non-root-daemon.md) for the full policy and the platform gaps.
+
 notes
 
 - define binary handshake but in such way it can not happen first two bytes are start of JSON object `{"`
@@ -66,6 +74,12 @@ three classes without a length, a magic number, or a negotiation round trip.
 knows. A first byte that is neither `{` nor uppercase is binary, so one byte is enough there.
 
 ### The `{{` dialect: a socket that is an executable
+
+**The reference server offers this dialect only with `fsmeta serve --allow-exec`; the default is off.** A refused
+opener is answered with `ERROR` code `protocol` and the detail starts `exec-dialect-disabled:`; no child is spawned.
+The daemon does not implement the dialect at all, and `serve --live` also does not classify it. Even when enabled,
+the peer must still be the serving uid/gid, and the child runs as that unprivileged user. This is a process-level
+operator decision: no frame, environment variable or control request can turn it on.
 
 The contract this dialect makes is deliberately the one a shell already understands: **parameters
 and environment go in a header, and after that the connection is the program's stdin and stdout.**

@@ -41,6 +41,7 @@ const ignores = @import("../ignores.zig");
 const nesting = @import("../nesting.zig");
 const seed = @import("../seed.zig");
 const wire = @import("../wire.zig");
+const socket_security = @import("../socket_security.zig");
 
 pub const Options = struct {
     /// `--base`: the runtime directory, overriding the platform's rule.
@@ -203,9 +204,13 @@ pub const Host = struct {
 
     fn prepareDirectories(self: *Host) !void {
         const io = self.io;
-        try std.Io.Dir.cwd().createDirPath(io, self.layout.base);
-        try std.Io.Dir.cwd().createDirPath(io, try self.layout.rootsDir(self.arena));
-        try std.Io.Dir.cwd().createDirPath(io, try self.layout.logsDir(self.arena));
+        // N3 (`plans/non-root-daemon.md` § 4C): the runtime directory holds the sockets, the claims and the pid
+        // file, so it — and the two directories under it — is created `0700` and narrowed if it already existed
+        // wider. A control socket in a directory another user can traverse is a control socket another user can
+        // open; on a platform without POSIX modes the socket mode and the peer check are what remain.
+        try socket_security.ensurePrivateDir(io, self.layout.base);
+        try socket_security.ensurePrivateDir(io, try self.layout.rootsDir(self.arena));
+        try socket_security.ensurePrivateDir(io, try self.layout.logsDir(self.arena));
     }
 
     /// Hold `<base>/daemon.lock` for the life of the process. A second daemon on the same base is refused here,
@@ -302,6 +307,10 @@ pub const Host = struct {
         std.Io.Dir.deleteFileAbsolute(io, self.control_path) catch {};
         const address = try std.Io.net.UnixAddress.init(self.control_path);
         self.control = try address.listen(io, .{});
+        // Owner-only, before the accept loop: the daemon's control socket can add roots, change modes and shut
+        // the daemon down, so the mode is set on the same step that binds it. The containing directory is `0700`
+        // as well (`prepareDirectories`), which is what closes the window between the bind and this call.
+        try socket_security.restrictSocketFile(io, self.control_path);
     }
 
     fn writeDaemonFile(self: *Host) !void {
@@ -328,6 +337,17 @@ pub const Host = struct {
                 error.SocketNotListening => return,
                 else => return err,
             };
+            // N3 (§ 4C): a different uid/gid is answered with the control protocol's own error object and closed.
+            // On a platform without peer credentials the check is `unavailable` and the `0700`/`0600` modes are
+            // the control; `socket_security.zig` documents that gap rather than pretending it is covered.
+            switch (socket_security.peerAuthentication(stream)) {
+                .same_user, .unavailable => {},
+                .other_user => {
+                    self.refuseLine(stream, control.Exit.failure, socket_security.refusal_detail) catch {};
+                    stream.close(io);
+                    continue;
+                },
+            }
             self.serveControlConnection(stream) catch |err| {
                 std.debug.print("fsmeta daemon: control connection failed: {s}\n", .{@errorName(err)});
             };

@@ -128,7 +128,7 @@ test "empty filter passes everything" {
 }
 
 test "include only: matching names pass" {
-    const f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.md"}, &[_][]const u8{});
+    var f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.md"}, &[_][]const u8{});
     defer f.deinit(std.testing.allocator);
     try std.testing.expect(f.matches("README.md"));
     try std.testing.expect(f.matches("docs/guide.md"));
@@ -137,14 +137,14 @@ test "include only: matching names pass" {
 }
 
 test "exclude wins over include" {
-    const f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.md"}, &[_][]const u8{"draft*"});
+    var f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.md"}, &[_][]const u8{"draft*"});
     defer f.deinit(std.testing.allocator);
     try std.testing.expect(f.matches("README.md"));
     try std.testing.expect(!f.matches("draft-notes.md"));
 }
 
 test "anchored pattern matches the whole path" {
-    const f = try Filter.compile(std.testing.allocator, &[_][]const u8{"docs/*.md"}, &[_][]const u8{});
+    var f = try Filter.compile(std.testing.allocator, &[_][]const u8{"docs/*.md"}, &[_][]const u8{});
     defer f.deinit(std.testing.allocator);
     try std.testing.expect(f.matches("docs/guide.md"));
     try std.testing.expect(!f.matches("other/docs/guide.md"));
@@ -152,7 +152,7 @@ test "anchored pattern matches the whole path" {
 }
 
 test "basename pattern matches at any depth" {
-    const f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.zig"}, &[_][]const u8{});
+    var f = try Filter.compile(std.testing.allocator, &[_][]const u8{"*.zig"}, &[_][]const u8{});
     defer f.deinit(std.testing.allocator);
     try std.testing.expect(f.matches("main.zig"));
     try std.testing.expect(f.matches("src/deep/main.zig"));

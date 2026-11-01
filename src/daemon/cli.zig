@@ -178,6 +178,13 @@ fn daemonStart(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, env: 
         std.process.exit(control.Exit.refused);
     };
     if (args.foreground) {
+        // N5 (`plans/non-root-daemon.md` § 4B): after the unprivileged gate and before anything is created or
+        // watched, restrict the process itself. The detached path re-executes this same branch in the child, so the
+        // daemon that actually runs is the one that is hardened, not the short-lived parent.
+        security.hardenAfterStart() catch |err| {
+            printError(io, "{s}\n", .{security.hardeningMessage(err)});
+            std.process.exit(control.Exit.refused);
+        };
         // The test and debug path: the daemon runs in this process, on this terminal.
         host.Host.run(io, arena, .{ .base = layout.base, .env = .{ .map = env } }) catch |err| switch (err) {
             error.AlreadyRunning => {

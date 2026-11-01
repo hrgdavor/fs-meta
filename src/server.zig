@@ -47,6 +47,28 @@
 //! what `changes_hash` hashes, and its § Values this implementation pins says a client must not rely on
 //! it; this server therefore does not advertise the capability and leaves the field zero. The counts in
 //! `END_BATCH` are exact and are what the document actually defines.
+//!
+//! ## Who may connect, and what `{{` requires
+//!
+//! Two controls stand in front of the protocol, and they are independent (`plans/non-root-daemon.md` § 4C/§ 4D):
+//!
+//! - **The socket is owner-only.** `<root>/.fs-meta/socket` is narrowed to `0600` immediately after `bind`, before
+//!   the accept loop starts (`socket_security.zig`). The containing `.fs-meta` directory is the state directory:
+//!   N6 (`plans/non-root-daemon.md` § 4E) creates a **new** one `0700` with fresh trio files `0600`, and a
+//!   pre-existing one keeps whatever modes it already had — the server neither widens nor narrows it. That is
+//!   deliberate: a fresh `.fs-meta` must not be broadened to let another user read the trio, and an inherited
+//!   mode is the owner's business. Same-user clients are the supported path, and the socket's own mode keeps the
+//!   control channel owner-only whatever the directory's mode is.
+//! - **The peer must be this user.** Every accepted connection is compared against this process's own uid/gid and
+//!   refused with the protocol's normal `ERROR` path when it differs. On a platform that cannot report peer
+//!   credentials the check is skipped and `socket_security.zig` says so; the mode is then the only control.
+//!
+//! The `{{` executable dialect is **off unless the operator opts in** (`ServeOptions.allow_exec`, which is
+//! `fsmeta serve --allow-exec`). Off is not a parse error: the opener is recognised, answered on the normal error
+//! path, and the connection ends without a child. The switch is process state, never a client's request — a frame
+//! that could turn the dialect on would be an unrestricted exec bypass with extra steps. Note that `--live` never
+//! offered the dialect at all — its handshake reads a frame prefix directly, so `{{` is `unknown-kind` there —
+//! and this gate makes the replay path match that strictness rather than loosening it.
 
 const std = @import("std");
 const format = @import("format.zig");
@@ -55,6 +77,7 @@ const batch = @import("batch.zig");
 const wire = @import("wire.zig");
 const engine = @import("engine.zig");
 const filter_mod = @import("filter.zig");
+const socket_security = @import("socket_security.zig");
 
 /// The protocol major/minor this server speaks, as `HELLO.protocol` (`major << 8 | minor`). It is `wire.zig`'s
 /// constant, not a second copy: the daemon's `STATE` frame moved it to 1.1, and a value written in two places
@@ -110,6 +133,15 @@ pub const LiveOptions = struct {
     poll_ms: u64 = poll_interval_ms,
 };
 
+/// The process-level switches of one server lifetime. Both defaults are the restrictive ones: a caller that
+/// says nothing gets no executable dialect and the same owner-only, peer-checked socket as everyone else.
+pub const ServeOptions = struct {
+    /// Whether the `{{` executable dialect is offered (`fsmeta serve --allow-exec`). **Default false**, because
+    /// a local client that can reach the socket must not be able to ask the server to run a child. `true` is an
+    /// explicit operator decision; it does not weaken the peer check, which still applies to every connection.
+    allow_exec: bool = false,
+};
+
 /// The state the publisher and every subscriber share. `newest` is the newest **batch** on disk; a pass
 /// that publishes a generation but no batch (a touch that changes no entry) does not advance it, because
 /// the stream's unit is the batch.
@@ -129,12 +161,16 @@ const Live = struct {
 ///
 /// A non-null `live` starts the publisher task and keeps subscribers connected; a null one is the
 /// replay-only server this command has always been.
+///
+/// `options` is the operator's decision about the executable dialect; it defaults to off, and nothing a client
+/// sends can change it.
 pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
     cache: *const cache_mod.Cache,
     live: ?LiveOptions,
+    options: ServeOptions,
 ) !void {
     const path = try absoluteSocketPath(io, allocator, root);
     defer allocator.free(path);
@@ -150,14 +186,18 @@ pub fn run(
 
     const address = try std.Io.net.UnixAddress.init(path);
     var server = try address.listen(io, .{});
+    // Owner-only, before the first accept: the mode is the control on a platform that cannot report peer
+    // credentials, and it is the cheaper of the two everywhere else. A socket this process cannot narrow is a
+    // socket it must not serve, so the failure propagates instead of being logged and ignored.
+    try socket_security.restrictSocketFile(io, path);
     defer server.deinit(io);
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
-    const banner = if (live) |options|
+    const banner = if (live) |live_options|
         try std.fmt.allocPrint(
             allocator,
             "fsmeta: listening on {s} ({d} names, generation {d}), live (a pass every {d} ms)\n",
-            .{ path, cache.fileCount() + cache.dirCount(), window.last, options.poll_ms },
+            .{ path, cache.fileCount() + cache.dirCount(), window.last, live_options.poll_ms },
         )
     else
         try std.fmt.allocPrint(
@@ -170,12 +210,12 @@ pub fn run(
     var state: Live = undefined;
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    if (live) |options| {
+    if (live) |live_options| {
         state = .{
             .io = io,
             .root = root,
-            .options = options.engine,
-            .poll_ms = options.poll_ms,
+            .options = live_options.engine,
+            .poll_ms = live_options.poll_ms,
             .newest = std.atomic.Value(u64).init(window.last),
         };
         // One publisher for the whole process: two passes over the same root would race on the trio and
@@ -193,17 +233,35 @@ pub fn run(
                 stream.close(io);
             };
         } else {
-            serveConnection(io, allocator, stream, window) catch {};
+            serveConnection(io, allocator, stream, window, options) catch {};
             stream.close(io);
         }
     }
 }
 
-/// Serve one replay-only connection: greet, check the client's greeting, take its `SUBSCRIBE`, replay, close.
+/// Serve one replay-only connection: check the peer, greet, check the client's greeting, take its `SUBSCRIBE`,
+/// replay, close.
 ///
 /// The error path sends one `ERROR` and returns; a read error is the peer leaving and is propagated so
 /// `run` can ignore it and accept the next connection.
-pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.Stream, window: BatchWindow) !void {
+pub fn serveConnection(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    window: BatchWindow,
+    options: ServeOptions,
+) !void {
+    // Who is this? Before a byte is read or written: a peer that is not the serving user is answered on the
+    // protocol's normal error path and the connection ends. `unavailable` (no peer credentials on this platform)
+    // falls through to the owner-only socket mode, which is the control `socket_security.zig` documents.
+    switch (socket_security.peerAuthentication(stream)) {
+        .same_user, .unavailable => {},
+        .other_user => {
+            refuse(io, stream, .protocol, "{s}", .{socket_security.refusal_detail});
+            return;
+        },
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -219,6 +277,14 @@ pub fn serveConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.St
         else => return err,
     };
     if (std.mem.eql(u8, opening, exec_opening)) {
+        if (!options.allow_exec) {
+            // The dialect is off. Say so and close: a refused opener must not hang, and it must not reach a
+            // child. The wording follows FORMAT.socket.md's `<code>: <detail>` rule, so a client that branches
+            // on the code sees `protocol` and the detail names the reason.
+            refuse(io, stream, .protocol, "exec-dialect-disabled: the {s} dialect is off; start the server with " ++
+                "--allow-exec to enable it", .{"{{"});
+            return;
+        }
         try serveExec(io, arena, stream, &reader.interface);
         return;
     }
@@ -278,6 +344,11 @@ fn readField(reader: *std.Io.Reader, arena: std.mem.Allocator) ![]const u8 {
 /// `{{ exec ` has been consumed; read `argc envc`, then the argv and env fields, and run the program
 /// with the socket as its stdin and stdout.
 ///
+/// **Only reached when the operator passed `--allow-exec`** (`ServeOptions.allow_exec`); the gate is in
+/// `serveConnection`, before this function is called and after the peer check, so "the dialect is off" and "you
+/// are not this user" are two independent refusals. There is no path from a client's bytes to this function other
+/// than the process's own command line — no environment variable, no frame, no control request.
+///
 /// The socket is handed to the child directly rather than relayed: `StdIo.file` passes an open file,
 /// and a unix socket is a file descriptor, so the child's own writes go straight to the peer and the
 /// server needs no copy loop. When the child exits the connection closes.
@@ -285,6 +356,10 @@ fn readField(reader: *std.Io.Reader, arena: std.mem.Allocator) ![]const u8 {
 /// v1 runs argv[0] as given. The environment is parsed and currently ignored — the child inherits the
 /// server's, which is what a daemon should do by default; a client that needs `NAME=VALUE` entries
 /// honoured is talking to a server that has yet to implement them, and `FORMAT.socket.md` says so.
+///
+/// The child runs as the serving user, never as root: N2 (`security.zig`) refused to start this process
+/// privileged, so "a local client can run a program" is bounded by that user's own authority — which is exactly
+/// why the non-root rule is not negotiable.
 fn serveExec(io: std.Io, arena: std.mem.Allocator, stream: std.Io.net.Stream, reader: *std.Io.Reader) !void {
     var line_buffer: [64]u8 = undefined;
     const line = readLine(reader, &line_buffer) catch return;
@@ -461,8 +536,20 @@ fn replay(io: std.Io, allocator: std.mem.Allocator, stream: std.Io.net.Stream, w
 
 // ---------------------------------------------------------------- live streaming
 
-/// One live connection: negotiate, replay what the archive has, then stay subscribed.
+/// One live connection: check the peer, negotiate, replay what the archive has, then stay subscribed.
+///
+/// Live mode never classified the `{{` opener — `negotiate` reads a frame prefix directly, so an exec opener is
+/// `unknown-kind` here — and that is kept: this path is stricter than the replay path, never looser. The operator's
+/// `allow_exec` is therefore not consulted: there is no dialect on this path to allow.
 fn liveConnection(io: std.Io, root: []const u8, stream: std.Io.net.Stream, live: *Live) !void {
+    switch (socket_security.peerAuthentication(stream)) {
+        .same_user, .unavailable => {},
+        .other_user => {
+            refuse(io, stream, .protocol, "{s}", .{socket_security.refusal_detail});
+            return;
+        },
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -921,4 +1008,53 @@ test "a batch bigger than one frame is loaded, not refused" {
     defer load_arena_state.deinit();
     const loaded = try loadBatch(load_arena_state.allocator(), io, batches, 1);
     try std.testing.expectEqual(count, loaded.entries.len);
+}
+
+test "the exec dialect is off by default, and a refused opener gets the protocol's ERROR, not a child" {
+    // N4 of `plans/non-root-daemon.md`: the `{{` dialect is a client's route to running a program, so it is off
+    // unless the operator passed `--allow-exec`. "Off" has to mean three things, and this test is all three:
+    // the default is false, the opener is still recognised (so it is refused rather than misparsed), and the
+    // refusal is the protocol's normal `ERROR` frame with the documented code — no hang, no child, no bypass.
+    const defaults: ServeOptions = .{};
+    try std.testing.expect(!defaults.allow_exec);
+    try std.testing.expectEqual(@as(usize, wire.prefix_size), exec_opening.len);
+
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An AF_UNIX address must be absolute, and the test's temporary directory is relative to the build root.
+    // `std.fs.path.resolve` does not prepend the current directory in Zig 0.17, so the directory is resolved
+    // through the file system instead of being joined by hand.
+    const tmp_rel = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp.sub_path });
+    const tmp_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, tmp_rel, arena);
+    const path = try std.fs.path.join(arena, &.{ tmp_abs, "socket" });
+
+    const address = try std.Io.net.UnixAddress.init(path);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    // The client connects first, so the whole exchange fits in the kernel's buffers and needs no second thread:
+    // the opener is eight bytes, and the refusal is one small frame.
+    const client = try address.connect(io);
+    defer client.close(io);
+    const server_side = try listener.accept(io);
+    defer server_side.close(io);
+
+    try writeBytes(io, client, exec_opening ++ "1 0\n");
+    try serveConnection(io, arena, server_side, .{}, .{});
+
+    var read_buffer: [256]u8 = undefined;
+    var reader = std.Io.net.Stream.Reader.init(client, io, &read_buffer);
+    const frame = try wire.readPrefix(try reader.interface.takeArray(wire.prefix_size));
+    try std.testing.expectEqual(wire.Kind.err, frame.kind);
+    const payload = try reader.interface.take(frame.length);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(ErrorCode.protocol)), std.mem.readInt(u16, payload[0..2], .little));
+    // The detail names the reason and the fix, so a human reading `protocol: …` knows which switch exists.
+    try std.testing.expect(std.mem.indexOf(u8, payload[2..], "exec-dialect-disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload[2..], "--allow-exec") != null);
 }

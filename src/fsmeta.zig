@@ -60,10 +60,11 @@ const usage =
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
     \\  fsmeta merge   <root> <start> [end] [--json]
     \\                                   deprecated: an alias of reconcile, kept for scripts
-    \\  fsmeta serve   <root> [--live] [--http[=<port>]]
+    \\  fsmeta serve   <root> [--live] [--http[=<port>]] [--allow-exec]
     \\                               serve <root>/.fs-meta/socket over the binary protocol of FORMAT.socket.md;
     \\                               --http also exposes an optional HTTP endpoint via the socutil library
     \\                               (port 8765, or <port>; --http=0 asks the OS for any free port)
+    \\                               the socket is owner-only and only a peer of the same uid/gid is served
     \\  fsmeta daemon  start [--base <dir>] [--foreground]
     \\  fsmeta daemon  stop | status [--json]
     \\                               the background daemon: one socket per root, sleep and wake (FORMAT.daemon.md)
@@ -77,6 +78,8 @@ const usage =
     \\  --updated <ISO-8601>         the pass timestamp; the engine has no clock of its own
     \\  --per-file                   naive listing (stat per entry) instead of the batched one
     \\  --live                       serve: keep subscribers connected and publish a pass every 250 ms
+    \\  --allow-exec                 serve: enable the {{ executable dialect (off by default; only a peer of the
+    \\                               same uid/gid is served either way, and the child runs as this user)
     \\  --http[=<port>]              serve: also expose an HTTP endpoint via the socutil library
     \\                               (port 8765; --http=0 asks the OS for any free port)
     \\  --stats                      print where the pass spent its time
@@ -122,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     var json_output = false;
     var baseline_root: ?[]const u8 = null;
     var live = false;
+    var allow_exec = false;
     var http_port: ?u16 = null;
     var include_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
     var exclude_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -155,6 +159,14 @@ pub fn main(init: std.process.Init) !void {
             options.keep_batches = std.fmt.parseInt(usize, value, 10) catch return fail(io, gpa, "--keep-batches needs a count");
         } else if (std.mem.eql(u8, arg, "--live")) {
             live = true;
+        } else if (std.mem.eql(u8, arg, "--allow-exec")) {
+            // N4 of `plans/non-root-daemon.md`: the `{{` dialect hands the connection to a child program, so it
+            // is off unless the operator asks for it on the command line. Only `serve` has such a dialect, and a
+            // global parse would silently accept `refresh --allow-exec` and do nothing — refuse it instead, the
+            // same rule `--http` follows. There is deliberately no environment variable and no frame that turns
+            // it on: an opt-in a client can flip is not a gate.
+            if (!std.mem.eql(u8, command, "serve")) return fail(io, gpa, "--allow-exec is only valid for the serve command");
+            allow_exec = true;
         } else if (std.mem.eql(u8, arg, "--include")) {
             const value = args.next() orelse return fail(io, gpa, "--include needs a pattern");
             try include_patterns.append(gpa, value);
@@ -258,11 +270,14 @@ pub fn main(init: std.process.Init) !void {
         security.ensureUnprivileged() catch |err| {
             return fail(io, gpa, security.refusalMessage(err));
         };
+        security.hardenAfterStart() catch |err| {
+            return fail(io, gpa, security.hardeningMessage(err));
+        };
         // The live publisher runs the same pass `refresh` does, so it must see the same options the
         // user gave the command (`--hash`, `--no-gitignore`, `--per-file`).
         options.respect_gitignore = respect_gitignore;
         options.hash_mode = hash_mode;
-        return runServe(io, arena, gpa, target, options, live, http_port);
+        return runServe(io, arena, gpa, target, options, live, http_port, allow_exec);
     }
     return fail(io, gpa, "unknown command");
 }
@@ -279,6 +294,9 @@ pub fn main(init: std.process.Init) !void {
 /// With `http_port`, the server also exposes an optional HTTP endpoint via the socutil library: a browser
 /// UI that can connect to the fs-meta unix socket and relay bytes. The HTTP server runs in its own thread
 /// with its own I/O context, so it does not interfere with the unix socket server's I/O.
+///
+/// `allow_exec` is the operator's opt-in for the `{{` executable dialect. It defaults to false and is a
+/// process-level decision: `server.ServeOptions` carries it, no frame or environment variable can change it.
 fn runServe(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -287,6 +305,7 @@ fn runServe(
     options: engine.Options,
     live: bool,
     http_port: ?u16,
+    allow_exec: bool,
 ) !void {
     var cache = loadCache(arena, io, root) catch |err| {
         const message = switch (err) {
@@ -298,6 +317,7 @@ fn runServe(
     };
     defer cache.deinit();
     const live_options: ?server.LiveOptions = if (live) .{ .engine = options } else null;
+    const serve_options: server.ServeOptions = .{ .allow_exec = allow_exec };
 
     // The optional HTTP endpoint: a socutil server that exposes the fs-meta unix socket through a browser
     // UI. It runs in its own thread with its own I/O context, so it does not share the unix socket server's
@@ -321,7 +341,7 @@ fn runServe(
         };
     } else {
         // No `--http`: the ordinary path, unchanged. Serve the unix socket until the process is killed.
-        return server.run(io, arena, root, &cache, live_options);
+        return server.run(io, arena, root, &cache, live_options, serve_options);
     }
 
     // `--http`: do not return into `main`'s unwind once the unix-socket server stops. Once `server.run`
@@ -330,7 +350,7 @@ fn runServe(
     // defers would run `safe_allocator.deinit()` — which asserts in Debug if another thread is
     // mid-allocation and frees the backing memory regardless. So terminate the process from here, where
     // nothing is unwound, and let the OS reclaim everything the HTTP thread was handed.
-    server.run(io, arena, root, &cache, live_options) catch |err| {
+    server.run(io, arena, root, &cache, live_options, serve_options) catch |err| {
         std.debug.print("fsmeta: cannot serve {s}: {s}\n", .{ root, @errorName(err) });
         std.process.exit(1);
     };

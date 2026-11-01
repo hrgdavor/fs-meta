@@ -1,0 +1,79 @@
+# fs-meta daemon as a dedicated, unprivileged system account.
+#
+# The rule is not optional: the daemon walks project trees, writes .fs-meta and
+# serves a local Unix socket with an executable dialect. A bug in any of those
+# paths must stay at this account's ordinary privilege, never become root.
+#
+# Do not change User=/Group= to root and do not add a root override: the daemon
+# refuses uid 0 and an elevated token before it opens anything (src/security.zig),
+# so an accidental root unit fails rather than serving. This template is written
+# to be deployable as-is; see doc/service-deployment.md for the full procedure.
+#
+# Adjust before installing:
+#   * ExecStart= to the installed fsmeta binary (built from this repository)
+#   * ReadWritePaths= to every served root (one line per root, or a common parent)
+#   * ProtectHome= if a served root lives under /home (then remove ProtectHome=yes
+#     and list those roots in ReadWritePaths=; ProtectHome hides /home entirely)
+#   * RestrictAddressFamilies= if a git hook needs AF_INET/AF_INET6. The daemon
+#     itself only listens on AF_UNIX; `fsmeta serve --http` is a different
+#     command and would also need AF_INET.
+#   * Any hardening line that breaks a hook; the table in the deployment guide
+#     names the trade-off for each one.
+
+[Unit]
+Description=fs-meta daemon (non-root file watcher)
+After=local-fs.target
+# A misconfigured unit (for example one edited to run as root) refuses at
+# startup; stop retrying it instead of looping every RestartSec=.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=fsmeta
+Group=fsmeta
+ExecStart=/usr/local/bin/fsmeta daemon start --foreground
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# The daemon's two host-state directories. FSMETA_CONFIG_HOME is a prefix:
+# the durable list is $FSMETA_CONFIG_HOME/fsmeta/roots.json, so the value below
+# makes it /var/lib/fsmeta/roots.json. StateDirectory= creates it owned by
+# User= and makes it writable under ProtectSystem=strict. Explicit paths are
+# used instead of %S/%t so the unit reads the same on every systemd version.
+Environment=FSMETA_RUNTIME_DIR=/run/fsmeta
+Environment=FSMETA_CONFIG_HOME=/var/lib
+RuntimeDirectory=fsmeta
+RuntimeDirectoryMode=0700
+StateDirectory=fsmeta
+StateDirectoryMode=0700
+
+# Hardening for a file watcher. NoNewPrivileges= does not disable the daemon's
+# executable dialect; it only blocks setuid/setgid escalation from the process
+# and its children. See the hardening table in doc/service-deployment.md.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Every served root is written (the trio and batches/ live inside it), so each
+# one must be reachable from a ReadWritePaths= entry. systemd makes
+# StateDirectory= and RuntimeDirectory= writable automatically; nothing else is
+# writable under ProtectSystem=strict. This example serves /srv/fsmeta/<repo>.
+ReadWritePaths=/srv/fsmeta
+
+[Install]
+WantedBy=multi-user.target

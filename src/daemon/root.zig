@@ -59,6 +59,7 @@ const paths = @import("paths.zig");
 const registry = @import("registry.zig");
 const reaper = @import("reaper.zig");
 const state = @import("state.zig");
+const socket_security = @import("../socket_security.zig");
 
 /// The watcher every root uses: nightwatch's recommended backend for this platform (ReadDirectoryChangesW on
 /// Windows, FSEvents/kqueue on macOS, inotify on Linux), all of which deliver from their own thread.
@@ -572,6 +573,10 @@ pub const RootRuntime = struct {
         std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
         const address = try std.Io.net.UnixAddress.init(self.socket_path);
         self.server = try address.listen(io, .{});
+        // N3 (`plans/non-root-daemon.md` § 4C): the consumer socket is owner-only. `<base>/roots` is `0700`
+        // (the host's `prepareDirectories`), so the window between this bind and the `chmod` is already closed
+        // to another user; the mode is still set before the accept loop starts.
+        try socket_security.restrictSocketFile(io, self.socket_path);
         self.subscribers.clearRetainingCapacity();
 
         // The newest batch the archive holds is the head: a returning client gets the diff from it, not a
@@ -1881,6 +1886,17 @@ pub const RootRuntime = struct {
     /// Greet, subscribe, replay, and stay: the consumer-facing half of the daemon.
     fn serveConnection(self: *RootRuntime, stream: std.Io.net.Stream, subscriber: *Subscriber) !void {
         const io = self.io;
+        // N3 (§ 4C): the consumer socket is not "anyone who can reach it". A peer whose uid/gid is not this
+        // daemon's is answered with the protocol's normal `ERROR` and the connection ends; a platform that cannot
+        // report peer credentials answers `unavailable`, and the `0600` socket mode is the control there.
+        switch (socket_security.peerAuthentication(stream)) {
+            .same_user, .unavailable => {},
+            .other_user => {
+                server.refuse(io, stream, .protocol, "{s}", .{socket_security.refusal_detail});
+                return;
+            },
+        }
+
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();

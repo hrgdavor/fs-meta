@@ -1,10 +1,12 @@
 # Run the fs-meta daemon as a non-root user — and enforce it
 
-**Status: N1 (docs) and N2 (startup refusal) done; N3–N7 open (2026-11-01).** The rule is at the top of
-[`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md) and [`doc/daemon.md`](../doc/daemon.md). `src/security.zig`
-now refuses `serve` and `daemon start` for uid 0, an elevated Administrator token, or an undeterminable privilege
-level. Socket permissions/peer credentials, privilege dropping, filesystem hardening, packaging and negative tests
-remain open; see § 6.
+**Status: N1–N6 implemented with documented platform gaps; N7 docs/packaging done, N7 negative/CI tests open
+(2026-11-01).** The rule is at the top of [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
+[`doc/daemon.md`](../doc/daemon.md) and the operator guide [`doc/service-deployment.md`](../doc/service-deployment.md).
+`src/security.zig` refuses `serve`/`daemon start` for uid 0, an elevated Administrator token or service SIDs;
+`socket_security.zig` makes POSIX sockets owner-only and peer-checked; `safe_dir.zig` refuses a symlinked `.fs-meta`;
+the `{{` dialect is off unless `serve --allow-exec`. The Windows socket DACL/peer gap and the remaining negative tests
+are called out below and in § 6.
 
 ## 1.1 What N2 implemented
 
@@ -16,8 +18,31 @@ remain open; see § 6.
 - `zig build` and the focused `security.zig` test compile; the normal non-elevated daemon integration test still
   passes.
 
-**Not yet enforced:** socket modes/peer identity, the `{{` exec dialect, privilege dropping, `.fs-meta` no-follow
-writes, service templates, and a true root/elevated-token negative test in CI.
+## 1.2 What N3–N6 implemented
+
+- **N3 / sockets:** `src/socket_security.zig` creates the daemon runtime directories `0700` (and narrows existing
+  ones), narrows `serve`/daemon sockets to `0600` before accept, and compares peer uid+gid on Linux
+  (`SO_PEERCRED`) and macOS/BSD (`getpeereid`). A different peer is refused on the normal `ERROR` path. **Windows has
+  no mode bits and no AF_UNIX peer credentials in Zig 0.17**, so the per-user profile ACL is the only control there;
+  an explicit `--base` outside the profile is a documented gap. Same uid + different gid is deliberately refused.
+- **N4 / `{{`:** `fsmeta serve --allow-exec` is the only way to offer the executable dialect; the default is off and a
+  refused opener gets `protocol: exec-dialect-disabled`, no child. The daemon never implemented the dialect, and
+  `serve --live` never classified it, so neither can be loosened. No env var or client frame can enable it.
+- **N5 / process hardening:** `security.hardenAfterStart()` runs after the non-root gate in `daemonStart` and in the
+  `serve` branch. Linux sets and verifies `PR_SET_NO_NEW_PRIVS`, clears the ambient capability set and sets umask
+  `077`; macOS/BSD set umask `077` only; Windows applies a best-effort extension-point mitigation. It is defense in
+  depth, not a privilege drop.
+- **N6 / `.fs-meta`:** `src/safe_dir.zig` classifies the final component with no-follow stat/open and refuses a
+  symlink/junction/reparse point (`error.MetaDirSymlink`) or a non-directory (`error.MetaDirNotDirectory`). Fresh
+  `.fs-meta` is `0700` / fresh trio files `0600`; existing modes are inherited. Temp files are created exclusively so
+  a pre-planted `files.*.tmp` cannot redirect the write.
+- **N7 / packaging:** `doc/service-deployment.md` and `packaging/` cover systemd, launchd, Windows service wrapper and
+  containers, with non-root service users and verification commands.
+
+**Still open / explicitly not claimed:** the Windows socket DACL and peer check; UID+GID clients started through
+`sg`/`newgrp` when the primary gid differs; `batch.zig`'s batch-file writes and `ignores.zig`'s own `.fs-meta` open
+still follow symlinks (engine/publish are covered); the `{{` child path on Windows is pre-existing and unverified; and
+the N7 negative tests (root/elevated refusal, socket modes, second-user refusal, exec gate) in CI.
 
 ## 1. Why this is a hard rule
 
@@ -48,15 +73,15 @@ run a child, so socket access must never imply elevated execution.
 
 ## 3. What is exposed today
 
-| Area              | Current state                                                      | Risk if daemon is root                                         |
-| ----------------- | ------------------------------------------------------------------ | -------------------------------------------------------------- |
-| Startup identity  | no check                                                           | any `sudo fsmeta daemon` runs with root                        |
-| Unix socket       | filesystem permissions are the only gate; `<base>/roots/<id>.sock` | a local user who can reach it can subscribe, and possibly exec |
-| `{{` exec dialect | hands the connection to a child program                            | local socket access becomes code execution as the daemon user  |
-| Peer identity     | not checked by the binary protocol                                 | any local user with socket access is a client                  |
-| `.fs-meta` writes | follow the root path                                               | a crafted layout/symlink may influence where root writes       |
-| Packaging         | no service-user template                                           | an operator can install a root service without noticing        |
-| Windows           | no elevation-token check                                           | “Administrator” consoles run it elevated by default            |
+| Area              | Current state                                                                                      | Risk if daemon is root                                         |
+| ----------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Startup identity  | N2 refuses uid 0, elevated Administrator and service SIDs; fail-closed query                       | any `sudo fsmeta daemon` is refused                            |
+| Unix socket       | N3: `0700` dirs / `0600` sockets and uid+gid peer checks on Linux/macOS/BSD; Windows DACL/peer gap | an elevated daemon would hand a local client root-level access |
+| `{{` exec dialect | N4: off by default; only `serve --allow-exec`; daemon/live never had it                            | a local client could run a child as the daemon user            |
+| Peer identity     | N3: `.other_user` refused on POSIX; Windows gap documented                                         | any local user with socket access would be a client            |
+| `.fs-meta` writes | N6: engine/publish no-follow and exclusive temp creation; batch/ignores gaps remain                | a crafted layout could redirect root writes                    |
+| Packaging         | N7: non-root service/container templates and operator guide done; negative/CI tests open           | an operator could install a root service without noticing      |
+| Windows           | N2 token/SID refusal done; no POSIX modes, no AF_UNIX peer credentials/DACL in Zig 0.17            | socket access relies on the inherited profile ACL              |
 
 The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's socket is
 `<runtime>/roots/<id>.sock`. Both are filesystem objects, so ownership and mode are the first control, not the last.
@@ -147,18 +172,22 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 
 1. **N1 (docs):** the rule at the top of README/AGENTS/daemon docs. **Done.**
 2. **N2:** POSIX/Windows startup refusal, with a precise error and tests. **Done.**
-3. **N3:** socket directory/mode + peer credentials; Windows DACL.
-4. **N4:** exec dialect off/opt-in and peer-gated.
-5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing.
-6. **N6:** filesystem no-follow/handle checks.
-7. **N7:** packaging templates and the negative tests above; run them in CI.
+3. **N3:** socket directory/mode + peer credentials; Windows DACL. **Done on POSIX; Windows gap.**
+4. **N4:** exec dialect off/opt-in and peer-gated. **Done for `serve`; daemon/live never had it.**
+5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing. **Done as hardening, not a drop.**
+6. **N6:** filesystem no-follow/handle checks. **Done for engine/publish; batch/ignores gaps.**
+7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates done; tests open.**
 
 ## 7. Acceptance
 
-- The daemon refuses to serve when running as root, elevated Administrator, or SYSTEM.
-- A normal unprivileged daemon creates an owner-only socket and rejects a different uid.
-- The exec dialect is not reachable without the explicit opt-in and same-user peer check.
-- `.fs-meta` creation refuses a symlink and uses owner-only modes.
-- Service templates and docs never suggest root/LocalSystem.
+- The daemon refuses to serve when running as root, elevated Administrator, or SYSTEM. **Done (N2).**
+- A normal unprivileged daemon creates an owner-only socket and rejects a different uid. **Done on Linux/macOS/BSD;
+  Windows has no peer credentials/DACL in this implementation.**
+- The exec dialect is not reachable without the explicit opt-in and same-user peer check. **Done for `serve`; the
+  daemon never had the dialect.**
+- `.fs-meta` creation refuses a symlink and uses owner-only modes. **Done for engine/publish; batch and ignores
+  remain, and Windows has no POSIX modes.**
+- Service templates and docs never suggest root/LocalSystem. **Done in `packaging/` and
+  `doc/service-deployment.md`.**
 - Tests cover refusal, permissions, peer rejection and the exec gate; the rule is in the top-level README, AGENTS.md
-  and daemon guide.
+  and daemon guide. **Partial: module-level tests exist; the true root/elevated and second-user CI tests remain open.**
