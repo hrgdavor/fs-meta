@@ -674,9 +674,9 @@ fn batchExists(io: std.Io, root: []const u8, generation: u64) bool {
 
     var root_dir = openRootDir(io, root) catch return false;
     defer root_dir.close(io);
-    var meta_dir = root_dir.openDir(io, format.directory_name, .{}) catch return false;
+    var meta_dir = (safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{}) catch return false) orelse return false;
     defer meta_dir.close(io);
-    var batches = meta_dir.openDir(io, "batches", .{}) catch return false;
+    var batches = (safe_dir.openExistingDirectory(io, meta_dir, "batches", .{}) catch return false) orelse return false;
     defer batches.close(io);
     var dir = batches.openDir(io, name, .{}) catch return false;
     dir.close(io);

@@ -38,6 +38,7 @@ const daemon_cli = @import("daemon/cli.zig");
 const security = @import("security.zig");
 const socutil = @import("socutil");
 const filter_mod = @import("filter.zig");
+const safe_dir = @import("safe_dir.zig");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -465,9 +466,9 @@ fn openRoot(io: std.Io, root: []const u8) !std.Io.Dir {
 fn openBatchesDir(io: std.Io, root: []const u8) !std.Io.Dir {
     var root_dir = try openRoot(io, root);
     defer root_dir.close(io);
-    const meta_dir: std.Io.Dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return error.BatchesMissing;
+    const meta_dir: std.Io.Dir = (try safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true })) orelse return error.BatchesMissing;
     defer meta_dir.close(io);
-    return meta_dir.openDir(io, "batches", .{ .iterate = true }) catch return error.BatchesMissing;
+    return (try safe_dir.openExistingDirectory(io, meta_dir, "batches", .{ .iterate = true })) orelse error.BatchesMissing;
 }
 
 /// Escape a string for JSON output.
@@ -497,7 +498,7 @@ fn loadCache(arena: std.mem.Allocator, io: std.Io, root: []const u8) !cache_mod.
     var root_dir = openRoot(io, root) catch return error.TrioMissing;
     defer root_dir.close(io);
 
-    var meta_dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch return error.TrioMissing;
+    var meta_dir = (try safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true })) orelse return error.TrioMissing;
     defer meta_dir.close(io);
 
     const meta = try readOptional(io, meta_dir, format.meta_file, arena) orelse return error.TrioMissing;
@@ -525,9 +526,9 @@ fn readOptional(io: std.Io, dir: std.Io.Dir, name: []const u8, allocator: std.me
 fn verify(io: std.Io, arena: std.mem.Allocator, root: []const u8) !void {
     var root_dir = openRoot(io, root) catch return write(io, "no .fs-meta directory\n");
     defer root_dir.close(io);
-    var dir = root_dir.openDir(io, format.directory_name, .{ .iterate = true }) catch {
+    var dir = (safe_dir.openExistingDirectory(io, root_dir, format.directory_name, .{ .iterate = true }) catch {
         return write(io, "no .fs-meta directory\n");
-    };
+    }) orelse return write(io, "no .fs-meta directory\n");
     defer dir.close(io);
 
     const names = [_][]const u8{ format.meta_file, format.txt_file, format.json_file };

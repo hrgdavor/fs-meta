@@ -29,6 +29,7 @@ const engine = @import("engine.zig");
 const watch = @import("watch.zig");
 const tuning = @import("watch_tuning.zig");
 const watch_run = @import("watch_run.zig");
+const safe_dir = @import("safe_dir.zig");
 
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.real.now(io).nanoseconds;
@@ -120,14 +121,9 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const root = try gpa.dupe(u8, ".");
 
-    // The tuning lives with the trio, in a directory the walker never lists.
-    var meta_dir = std.Io.Dir.cwd().openDir(io, ".fs-meta", .{}) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            try std.Io.Dir.cwd().createDirPath(io, ".fs-meta");
-            break :blk try std.Io.Dir.cwd().openDir(io, ".fs-meta", .{});
-        },
-        else => return err,
-    };
+    // The tuning lives with the trio, in a directory the walker never lists. N6: create/open it no-follow, so a
+    // symlinked `.fs-meta` cannot redirect the tuning write outside the watched tree.
+    var meta_dir = try safe_dir.openOrCreateDirectory(io, std.Io.Dir.cwd(), ".fs-meta", .{});
     defer meta_dir.close(io);
 
     var tuning_arena_state = std.heap.ArenaAllocator.init(gpa);

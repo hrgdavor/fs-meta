@@ -47,7 +47,7 @@ pub fn trySeed(arena: std.mem.Allocator, io: std.Io, base_root: []const u8, new_
 
     const base_dir = try openRoot(io, base_root);
     defer base_dir.close(io);
-    var base_meta = base_dir.openDir(io, ".fs-meta", .{ .iterate = true }) catch return false;
+    var base_meta = (safe_dir.openExistingDirectory(io, base_dir, ".fs-meta", .{ .iterate = true }) catch return false) orelse return false;
     defer base_meta.close(io);
     const base_meta_bytes = base_meta.readFileAlloc(io, format.meta_file, arena, std.Io.Limit.limited(1 << 28)) catch return false;
     const base_txt_bytes = base_meta.readFileAlloc(io, format.txt_file, arena, std.Io.Limit.limited(1 << 28)) catch return false;
