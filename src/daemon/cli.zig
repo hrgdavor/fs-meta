@@ -26,6 +26,7 @@ const paths = @import("paths.zig");
 const control = @import("control.zig");
 const registry = @import("registry.zig");
 const host = @import("host.zig");
+const security = @import("../security.zig");
 const hooks = @import("hooks.zig");
 const gitwatch = @import("gitwatch.zig");
 
@@ -172,6 +173,10 @@ fn daemonCommand(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, env
 }
 
 fn daemonStart(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, env: *const std.process.Environ.Map, args: Args) !void {
+    security.ensureUnprivileged() catch |err| {
+        printError(io, "{s}\n", .{security.refusalMessage(err)});
+        std.process.exit(control.Exit.refused);
+    };
     if (args.foreground) {
         // The test and debug path: the daemon runs in this process, on this terminal.
         host.Host.run(io, arena, .{ .base = layout.base, .env = .{ .map = env } }) catch |err| switch (err) {

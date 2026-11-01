@@ -1,8 +1,23 @@
 # Run the fs-meta daemon as a non-root user — and enforce it
 
-**Status: open (2026-11-01).** The rule is documented at the top of [`README.md`](../README.md),
-[`AGENTS.md`](../AGENTS.md) and [`doc/daemon.md`](../doc/daemon.md); this plan is the enforcement work. No enforcement
-exists yet.
+**Status: N1 (docs) and N2 (startup refusal) done; N3–N7 open (2026-11-01).** The rule is at the top of
+[`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md) and [`doc/daemon.md`](../doc/daemon.md). `src/security.zig`
+now refuses `serve` and `daemon start` for uid 0, an elevated Administrator token, or an undeterminable privilege
+level. Socket permissions/peer credentials, privilege dropping, filesystem hardening, packaging and negative tests
+remain open; see § 6.
+
+## 1.1 What N2 implemented
+
+- `security.ensureUnprivileged()` runs before `runServe` and at the start of `daemonStart`, so both the single-root
+  `fsmeta serve` and the multi-root `fsmeta daemon start` (foreground and detached) are covered.
+- POSIX checks the effective uid; Windows checks `TokenElevation` and rejects the LocalSystem/LocalService/
+  NetworkService SIDs explicitly. A failed token query is a refusal, not a pass.
+- The refusal message states the deployment rule and points here. There is no `--allow-root` escape hatch.
+- `zig build` and the focused `security.zig` test compile; the normal non-elevated daemon integration test still
+  passes.
+
+**Not yet enforced:** socket modes/peer identity, the `{{` exec dialect, privilege dropping, `.fs-meta` no-follow
+writes, service templates, and a true root/elevated-token negative test in CI.
 
 ## 1. Why this is a hard rule
 
@@ -130,8 +145,8 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 
 ## 6. Suggested order
 
-1. **N1 (docs, this change):** the rule at the top of README/AGENTS/daemon docs.
-2. **N2:** POSIX/Windows startup refusal, with a precise error and tests.
+1. **N1 (docs):** the rule at the top of README/AGENTS/daemon docs. **Done.**
+2. **N2:** POSIX/Windows startup refusal, with a precise error and tests. **Done.**
 3. **N3:** socket directory/mode + peer credentials; Windows DACL.
 4. **N4:** exec dialect off/opt-in and peer-gated.
 5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing.

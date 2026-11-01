@@ -35,6 +35,7 @@ const boundary_mod = @import("boundary.zig");
 const gitdir = @import("gitdir.zig");
 const ignores = @import("ignores.zig");
 const daemon_cli = @import("daemon/cli.zig");
+const security = @import("security.zig");
 const socutil = @import("socutil");
 const filter_mod = @import("filter.zig");
 
@@ -254,6 +255,9 @@ pub fn main(init: std.process.Init) !void {
         return runReconcile(io, arena, gpa, target, from_arg, third, baseline_root, json_output, include_patterns.items, exclude_patterns.items);
     }
     if (std.mem.eql(u8, command, "serve")) {
+        security.ensureUnprivileged() catch |err| {
+            return fail(io, gpa, security.refusalMessage(err));
+        };
         // The live publisher runs the same pass `refresh` does, so it must see the same options the
         // user gave the command (`--hash`, `--no-gitignore`, `--per-file`).
         options.respect_gitignore = respect_gitignore;

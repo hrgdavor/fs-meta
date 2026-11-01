@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     // Every module, so one command proves the whole reference.
     const test_step = b.step("test", "Run every module's tests");
     const modules = [_][]const u8{
-        "format", "json_doc", "validate", "cache", "coldstart", "scan", "lister", "boundary", "gitdir", "ignores", "nesting", "seed", "publish", "engine", "watch", "watch_tuning", "watch_run", "reconcile", "batch", "wire", "pair", "query", "server",
+        "format", "security", "json_doc", "validate", "cache", "coldstart", "scan", "lister", "boundary", "gitdir", "ignores", "nesting", "seed", "publish", "engine", "watch", "watch_tuning", "watch_run", "reconcile", "batch", "wire", "pair", "query", "server",
         // The daemon's modules are rooted at `src/daemon_tests.zig`, because a Zig module root fixes how far an
         // `@import` may reach: a root inside `src/daemon/` could not import the engine's `../format.zig`.
         "daemon_tests",
