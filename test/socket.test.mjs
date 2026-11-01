@@ -9,12 +9,14 @@
 // replay is compared against batches the engine itself wrote.
 import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { binary } from './binary.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const binary = join(here, '..', 'zig-out', 'bin', process.platform === 'win32' ? 'fsmeta.exe' : 'fsmeta');
+// `binary.mjs` is the one place that resolves the build under test: `FSMETA_BIN` when several builds share a
+// checkout, otherwise `zig-out/bin` (the convention this suite follows with every other test).
 if (!existsSync(binary)) {
   throw new Error(`build the engine first: zig build (expected ${binary})`);
 }
@@ -169,6 +171,16 @@ class Peer {
     return this.closed;
   }
 
+  /**
+   * Everything received until the server closes, as text. The `{{` dialect's response is the child's raw
+   * stdout with no frame around it, so a length cannot be known in advance and the close is the delimiter.
+   */
+  async textUntilClosed(timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.closed && Date.now() < deadline) await Bun.sleep(20);
+    return this.#buffer.toString();
+  }
+
   end() {
     try { this.#socket.end(); } catch {}
   }
@@ -179,7 +191,7 @@ class Peer {
  * Retries on connect until the server's address exists, so readiness is bounded by `timeoutMs` rather than a
  * fixed sleep. The last error is reported with the server's captured output by `startServer`'s caller.
  */
-async function connect(root, fromBatch, { subscribe = true, timeoutMs = 5000 } = {}) {
+async function connect(root, fromBatch, { subscribe = true, greet = true, timeoutMs = 5000 } = {}) {
   const path = socketPath(root);
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
@@ -218,8 +230,12 @@ async function connect(root, fromBatch, { subscribe = true, timeoutMs = 5000 } =
                 return;
               }
               settled = true;
-              peer.send(helloFrame());
-              if (subscribe) peer.send(subscribeFrame(fromBatch));
+              // `greet: false` is for a client that speaks a different dialect: the `{{` opener has to be the
+              // first bytes on the wire, so a HELLO sent here would make the server classify it as a frame.
+              if (greet) {
+                peer.send(helloFrame());
+                if (subscribe) peer.send(subscribeFrame(fromBatch));
+              }
               resolve(peer);
             })
             .catch((error) => {
@@ -236,9 +252,9 @@ async function connect(root, fromBatch, { subscribe = true, timeoutMs = 5000 } =
   throw new Error(`socket ${path} did not become reachable in ${timeoutMs}ms: ${lastError ?? 'no address'}`);
 }
 
-/** Start `fsmeta serve <root>`; its output is captured for a failure message. */
-function startServer(root) {
-  const child = Bun.spawn([binary, 'serve', root], { cwd: here, stdout: 'pipe', stderr: 'pipe' });
+/** Start `fsmeta serve <root> [extra...]`; its output is captured for a failure message. */
+function startServer(root, extra = []) {
+  const child = Bun.spawn([binary, 'serve', root, ...extra], { cwd: here, stdout: 'pipe', stderr: 'pipe' });
   children.push(child);
   const output = { text: '' };
   const decoder = new TextDecoder();
@@ -554,4 +570,299 @@ describe('serve refuses to start without a usable trio', () => {
     expect(text).toContain('fsmeta verify');
     expect(existsSync(socketPath(root))).toBe(false);
   });
+});
+
+// ──────────────────────────────────────────────
+// N7 of plans/non-root-daemon.md § 4G/§ 7: the exec gate, the owner-only socket and the peer check
+//
+// The plan's open items are the negative cases here. The `{{` dialect must be off unless the operator passed
+// `serve --allow-exec`, the refusal must be the protocol's `ERROR` and not a child, the switch must not be a
+// global option, the socket must be `0600`, and a peer the kernel says is not this uid/gid must be refused.
+// The platform-specific cases skip with the condition they need, rather than passing on a host that cannot
+// provide it: Windows has no POSIX modes and Zig 0.17 exposes no AF_UNIX peer credentials there.
+// ──────────────────────────────────────────────
+
+const POSIX = process.platform !== 'win32';
+const WINDOWS_MODES_REASON =
+  'this host is win32; Windows has no POSIX mode bits and Zig 0.17 exposes no AF_UNIX peer credentials (socket_security.zig documents the Windows gap)';
+const WINDOWS_EXEC_REASON =
+  "this host is win32; the `{{` child path on Windows is pre-existing and unverified (plans/non-root-daemon.md § 1.2), so a child-output assertion would be a false success";
+
+const posixModeTest = POSIX
+  ? test
+  : (name, fn, ...rest) => test.skip(`${name} [skipped: ${WINDOWS_MODES_REASON}]`, fn, ...rest);
+const posixExecTest = POSIX
+  ? test
+  : (name, fn, ...rest) => test.skip(`${name} [skipped: ${WINDOWS_EXEC_REASON}]`, fn, ...rest);
+
+/**
+ * The `{{` dialect's request header (FORMAT.socket.md § The `{{` dialect): the fixed eight-byte opener, then
+ * `<argc> <envc>\n`, then one `<byte length> <bytes>\n` field per argv entry. The refused and the allowed case
+ * send the same bytes, so the only difference between them is the server's `--allow-exec`.
+ */
+function execRequest(argv) {
+  let text = `{{ exec ${argv.length} 0\n`;
+  for (const arg of argv) text += `${Buffer.byteLength(arg)} ${arg}\n`;
+  return Buffer.from(text, 'utf8');
+}
+
+/** A supplementary group this process may switch into with `sg`, or `null` when there is only the primary one. */
+function secondGroup() {
+  if (!POSIX) return null;
+  try {
+    const all = Bun.spawnSync(['id', '-Gn'], { stdout: 'pipe', stderr: 'pipe' });
+    const primary = Bun.spawnSync(['id', '-gn'], { stdout: 'pipe', stderr: 'pipe' });
+    if (all.exitCode !== 0 || primary.exitCode !== 0) return null;
+    const primaryName = primary.stdout.toString().trim();
+    const names = all.stdout.toString().trim().split(/\s+/).filter(Boolean);
+    // `id -Gn` includes the primary group; any other name is a group the user really is a member of, which is
+    // what `sg` requires. Switching to it changes the effective gid and leaves the uid alone.
+    return names.find((name) => name !== primaryName) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** POSIX single-quote for a command `sg` will hand to a shell. */
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+/** Whether `sg` can switch to `group` on this host, probed before the case is defined. */
+function sgWorks(group) {
+  if (group === null) return false;
+  try {
+    const probe = Bun.spawnSync(['sg', group, '-c', 'true'], { stdout: 'pipe', stderr: 'pipe', timeout: 5000 });
+    return probe.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a blocking Perl client is available. It is used to read the peer refusal's `ERROR` frame: Bun's
+ * `node:net` can drop a frame when the server accepts, writes and closes before the client's readable side is
+ * armed (observed on Linux; the frame is on the wire — a blocking client reads it). The case still runs, and
+ * asserts the connection was refused, when Perl is absent.
+ */
+const PERL_AVAILABLE = (() => {
+  if (!POSIX) return false;
+  try {
+    const probe = Bun.spawnSync(['perl', '-MIO::Socket::UNIX', '-e', '1'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 5000,
+    });
+    return probe.exitCode === 0;
+  } catch {
+    return false;
+  }
+})();
+
+const peerGroup = POSIX ? secondGroup() : null;
+const PEER_REASON = !POSIX
+  ? WINDOWS_MODES_REASON
+  : peerGroup === null
+    ? 'this POSIX host has no supplementary group to switch into (`id -Gn` lists only the primary group), so a same-uid/different-gid peer cannot be created without root; run this in the CI job that starts the suite as an unprivileged user that belongs to a second group, or that may `sudo -n -u fsmeta-peer` as a second account'
+    : '`sg` is unavailable or cannot switch to the supplementary group, so a same-uid/different-gid peer cannot be created without root; run this in the CI job that starts the suite as an unprivileged user with a second group (or `sudo -n -u fsmeta-peer` for a second account)';
+const peerTest = peerGroup !== null && sgWorks(peerGroup)
+  ? test
+  : (name, fn, ...rest) => test.skip(`${name} [skipped: ${PEER_REASON}]`, fn, ...rest);
+
+describe('N7: the {{ exec dialect is opt-in, process-wide, and never reached by a refusal', () => {
+  unixTest(
+    'serve refuses the {{ opener by default and spawns no child',
+    async () => {
+      const root = twoGenerationTree();
+      // If the gate were missing, the child would be `fsmeta refresh wouldBeChild` and would publish a trio
+      // there. The would-be child is the binary under test, so the evidence is the same on every platform.
+      const wouldBeChild = scratch();
+      const server = startServer(root);
+      try {
+        // A dialect client sends its opener as the first bytes: no HELLO, because HELLO would be a frame.
+        const peer = await connect(root, 0, { greet: false });
+        peer.send(execRequest([binary, 'refresh', wouldBeChild]));
+        const error = await peer.frame();
+        expect(error.kind).toBe(KIND.ERROR);
+        expect(error.flags).toBe(0);
+        expect(error.length).toBeGreaterThan(2);
+        expect(error.payload.readUInt16LE(0)).toBe(1); // ErrorCode.protocol
+        const detail = error.payload.subarray(2).toString();
+        expect(detail.startsWith('protocol: ')).toBe(true);
+        expect(detail.slice('protocol: '.length).startsWith('exec-dialect-disabled')).toBe(true);
+        expect(detail).toContain('--allow-exec');
+        // The refusal closes the connection; it does not leave a child holding it.
+        expect(await peer.waitClosed()).toBe(true);
+        await Bun.sleep(400);
+        expect(existsSync(join(wouldBeChild, '.fs-meta'))).toBe(false);
+        peer.end();
+      } catch (error) {
+        throw new Error(`${error.message}\nserver output:\n${server.output.text}`);
+      } finally {
+        await stopServer(server);
+      }
+    },
+    20000,
+  );
+
+  test('--allow-exec is not a global switch: every command but serve exits 2 before writing', () => {
+    const root = scratch();
+    writeFileSync(join(root, 'a.txt'), 'one\n');
+    for (const command of ['refresh', 'scan', 'verify']) {
+      const result = Bun.spawnSync([binary, command, root, '--allow-exec'], {
+        cwd: here,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const text = `${result.stdout.toString()}${result.stderr.toString()}`;
+      expect({ command, code: result.exitCode }).toEqual({ command, code: 2 });
+      expect(text).toContain('--allow-exec is only valid for the serve command');
+    }
+    // The refusal is the option parser's, before the command runs: a misplaced switch must not publish a trio.
+    expect(existsSync(join(root, '.fs-meta'))).toBe(false);
+  });
+
+  posixExecTest(
+    'serve --allow-exec runs a same-user child and streams its raw stdout',
+    async () => {
+      const root = twoGenerationTree();
+      const server = startServer(root, ['--allow-exec']);
+      try {
+        const peer = await connect(root, 0, { greet: false });
+        peer.send(execRequest(['/bin/sh', '-c', 'printf child-ok']));
+        // The dialect's response is the child's stdout with no envelope; the close is the delimiter.
+        expect(await peer.textUntilClosed(8000)).toBe('child-ok');
+        expect(await peer.waitClosed()).toBe(true);
+        peer.end();
+      } catch (error) {
+        throw new Error(`${error.message}\nserver output:\n${server.output.text}`);
+      } finally {
+        await stopServer(server);
+      }
+    },
+    20000,
+  );
+});
+
+describe('N7: the serving socket is owner-only and peer-checked', () => {
+  posixModeTest(
+    'serve creates <root>/.fs-meta/socket 0600 inside a 0700 state directory',
+    async () => {
+      const root = twoGenerationTree();
+      const server = startServer(root);
+      try {
+        // A greeting proves the accept loop started. `restrictSocketFile` runs after `bind` and before the first
+        // accept, so once a HELLO has arrived the mode assertion cannot race the chmod.
+        const peer = await connect(root, 1);
+        expectHello(await peer.frame(), 2);
+        expect(statSync(socketPath(root)).mode & 0o777).toBe(0o600);
+        // N6 creates a fresh `.fs-meta` owner-only; the socket lives inside it, not in the served tree.
+        expect(statSync(join(root, '.fs-meta')).mode & 0o777).toBe(0o700);
+        expectBatch(await readBatch(peer), EXPECTED_BATCH_2);
+        expect(await peer.waitClosed()).toBe(true);
+        peer.end();
+      } catch (error) {
+        throw new Error(`${error.message}\nserver output:\n${server.output.text}`);
+      } finally {
+        await stopServer(server);
+      }
+    },
+    20000,
+  );
+
+  peerTest(
+    'a peer in another gid is refused even with --allow-exec',
+    async () => {
+      // A different *uid* is stopped earlier, by the socket's 0600 mode (`connect` gets EACCES), and needs a second
+      // account to exercise. The same uid with another gid still has the owner bits, so this case reaches the peer
+      // check itself — the boundary `socket_security.sameCredentials` adds on top of the mode.
+      const root = twoGenerationTree();
+      const script = join(scratch(), PERL_AVAILABLE ? 'peer-client.pl' : 'peer-client.mjs');
+      // A blocking client is used when it exists. The server refuses before it reads, sends the protocol's
+      // `ERROR` and closes; Bun's `node:net` can lose that frame when the close wins the race with its readable
+      // side, while a blocking `sysread` does not. Without Perl the case still asserts the refusal.
+      const perlClient = `
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+my $socket = IO::Socket::UNIX->new(Peer => $ARGV[0], Type => SOCK_STREAM)
+    or do { print STDERR "connect: $!\\n"; exit 3 };
+$SIG{ALRM} = sub { print STDERR "peer-client-timeout\\n"; exit 4 };
+alarm 6;
+my $frame = '';
+while (1) {
+    my $chunk = '';
+    my $count = sysread($socket, $chunk, 4096);
+    last if !defined $count || $count == 0;
+    $frame .= $chunk;
+}
+close($socket);
+print $frame;
+exit 0;
+`;
+      const bunClient = `
+const net = require('node:net');
+const socket = net.connect(process.argv[2]);
+let text = '';
+let failure = null;
+socket.setEncoding('utf8');
+socket.on('data', (chunk) => { text += chunk; });
+socket.on('error', (error) => { failure = error; });
+socket.on('close', () => {
+  if (text.length > 0) { process.stdout.write(text); process.exit(0); }
+  if (failure !== null) { process.stderr.write(String(failure.code ?? failure.message)); process.exit(3); }
+  process.exit(0);
+});
+setTimeout(() => { process.stderr.write('peer-client-timeout'); process.exit(4); }, 6000);
+`;
+      writeFileSync(script, PERL_AVAILABLE ? perlClient : bunClient);
+
+      const server = startServer(root, ['--allow-exec']);
+      try {
+        // Readiness is the accept loop, not the file's existence: a client this user may create with a HELLO
+        // proves the socket is narrowed and serving, so the `sg` client below is not racing bind or chmod.
+        const probe = await connect(root, 1);
+        expectHello(await probe.frame(), 2);
+        probe.end();
+        await probe.waitClosed();
+
+        const runner = PERL_AVAILABLE ? 'perl' : process.execPath;
+        const command = `${shellQuote(runner)} ${shellQuote(script)} ${shellQuote(socketPath(root))}`;
+        const client = Bun.spawnSync(['sg', peerGroup, '-c', command], {
+          cwd: here,
+          timeout: 15000,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const stdout = client.stdout.toString();
+        const stderr = client.stderr.toString();
+        if (PERL_AVAILABLE) {
+          if (client.exitCode !== 0) {
+            throw new Error(
+              `the ${peerGroup} client exited ${client.exitCode} (signal ${client.signalCode}): ${stderr || 'no stderr'}`,
+            );
+          }
+          expect(stdout).toContain('protocol: refused a peer that is not the serving user');
+        } else {
+          // Bun may see the close instead of the frame; either is a refusal, and the same-user probe below shows
+          // the server is still serving, so this is the peer check rather than a dead process.
+          const byFrame = stdout.includes('refused a peer that is not the serving user');
+          const byClose = client.exitCode === 3 && /ECONNRESET|EPIPE/.test(stderr);
+          expect({ byFrame, byClose }).not.toEqual({ byFrame: false, byClose: false });
+          if (byFrame) expect(stdout).toContain('protocol: ');
+        }
+
+        // The refusal is the peer's, not the process's: this user is served on the same socket afterwards.
+        const after = await connect(root, 1);
+        expectHello(await after.frame(), 2);
+        after.end();
+        await after.waitClosed();
+      } catch (error) {
+        throw new Error(`${error.message}\nserver output:\n${server.output.text}`);
+      } finally {
+        await stopServer(server);
+      }
+    },
+    30000,
+  );
 });

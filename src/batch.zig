@@ -16,6 +16,7 @@ const format = @import("format.zig");
 const reconcile = @import("reconcile.zig");
 const json_doc = @import("json_doc.zig");
 const pair = @import("pair.zig");
+const safe_dir = @import("safe_dir.zig");
 
 /// A name that did not exist in the parent generation.
 pub const CHANGE_ADDED: u32 = 0x20;
@@ -466,6 +467,12 @@ pub const Context = struct {
 /// A batch is derived output: a torn batch fails its own hashes and is reported, never repaired, because a repaired
 /// batch would be a guessed change record. The main trio keeps the section 9 rename order, which is where a torn
 /// write would matter.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): `batches` and the generation directory are opened and created through
+/// `safe_dir.openOrCreateDirectory`, and each of the three files is created exclusively under its final name, so a
+/// planted symlink, junction or other reparse point at a directory or at a file name is refused instead of
+/// receiving the bytes. The archive layout itself is unchanged: a directory named for the generation, then its
+/// three files.
 pub fn write(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -510,17 +517,38 @@ pub fn write(
     defer allocator.free(json_bytes);
 
     // The batch id is the generation in **lowercase hex**, zero-padded to eight digits. Hex is not cosmetic: a
-// bit count divided by four is a digit count, so padding, parsing and modulo are shifts and masks rather than
-// divisions by ten, and the digits line up with the bits a consumer already has.
-const relative = try std.fmt.allocPrint(allocator, "batches/{x:0>8}", .{context.generation});
-    defer allocator.free(relative);
-    try meta_dir.createDirPath(io, relative);
-    const dir = try meta_dir.openDir(io, relative, .{});
+    // bit count divided by four is a digit count, so padding, parsing and modulo are shifts and masks rather than
+    // divisions by ten, and the digits line up with the bits a consumer already has.
+    const generation_name = try std.fmt.allocPrint(allocator, "{x:0>8}", .{context.generation});
+    defer allocator.free(generation_name);
+
+    // One component at a time, each through a no-follow handle: a link planted at `batches` or at the generation
+    // name is refused rather than opened through. An existing directory is used as it is (never chmod-ed); a fresh
+    // one is owner-only on POSIX, like the `.fs-meta` handle the caller already holds.
+    var batches = try safe_dir.openOrCreateDirectory(io, meta_dir, "batches", .{});
+    defer batches.close(io);
+    var dir = try safe_dir.openOrCreateDirectory(io, batches, generation_name, .{});
     defer dir.close(io);
 
-    try dir.writeFile(io, .{ .sub_path = format.meta_file, .data = encoded.meta });
-    try dir.writeFile(io, .{ .sub_path = format.txt_file, .data = encoded.txt });
-    try dir.writeFile(io, .{ .sub_path = format.json_file, .data = json_bytes });
+    try writeBatchFile(io, dir, format.meta_file, encoded.meta);
+    try writeBatchFile(io, dir, format.txt_file, encoded.txt);
+    try writeBatchFile(io, dir, format.json_file, json_bytes);
+}
+
+/// Write one of a batch's three files without following anything that already occupies its name.
+///
+/// The names are fixed by the format, so a tree that ships a prepared `.fs-meta` can plant an entry at
+/// `batches/<generation>/files.meta`. `safe_dir.createExclusiveFile` removes such an entry *as an entry* (never
+/// through it) and creates the file `O_EXCL`/`FILE_CREATE`, so the bytes cannot be redirected through a symlink or
+/// junction; an entry that cannot be unlinked (a non-empty directory) makes the pass fail instead. A batch has no
+/// rename step, so there is no temporary name to guard: the three files are the layout, and a torn batch is
+/// reported by its hashes rather than repaired.
+fn writeBatchFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    // A retried generation keeps the mode of a file a previous attempt left; a fresh one is owner-only on POSIX.
+    const permissions = safe_dir.filePermissionsFor(io, dir, name);
+    var file = try safe_dir.createExclusiveFile(io, dir, name, permissions);
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
 }
 
 // ---------------------------------------------------------------- retention (FORMAT.md § 17.6)
@@ -582,16 +610,21 @@ pub fn toDrop(allocator: std.mem.Allocator, numbers: []const u64, keep_requested
 /// stops and returns the error: everything already removed is older than everything that remains, so the
 /// archive is still a contiguous suffix of the sequence, and a later pass retries. A missing `batches/`
 /// directory is not an error — a trio can exist before its first change batch.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): a rotation renames and deletes, so it opens `batches` through a no-follow
+/// handle as well. The no-follow open creates a missing directory, which a rotation must not do, hence the stat
+/// probe first: a missing archive returns before anything is created.
 pub fn rotate(
     allocator: std.mem.Allocator,
     io: std.Io,
     meta_dir: std.Io.Dir,
     keep_requested: usize,
 ) !Rotation {
-    var batches = meta_dir.openDir(io, "batches", .{ .iterate = true }) catch |err| switch (err) {
+    _ = meta_dir.statFile(io, "batches", .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
+    var batches = try safe_dir.openOrCreateDirectory(io, meta_dir, "batches", .{ .iterate = true });
     defer batches.close(io);
 
     var numbers: std.ArrayListUnmanaged(u64) = .empty;
@@ -651,15 +684,19 @@ pub const ByteRotation = struct {
 ///
 /// A generation is three files, so its size is their sum; anything else in the directory (a leftover
 /// `.trash-…`, a foreign entry) is not a generation and is not counted as one.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): `batches` is opened through `safe_dir`'s no-follow handle, and the stat
+/// probe keeps "no archive yet" from creating one as a side effect of measuring.
 pub fn measureArchive(allocator: std.mem.Allocator, io: std.Io, meta_dir: std.Io.Dir) !struct {
     numbers: []u64,
     sizes: []u64,
     bytes: u64,
 } {
-    var batches = meta_dir.openDir(io, "batches", .{ .iterate = true }) catch |err| switch (err) {
+    _ = meta_dir.statFile(io, "batches", .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return .{ .numbers = try allocator.alloc(u64, 0), .sizes = try allocator.alloc(u64, 0), .bytes = 0 },
         else => return err,
     };
+    var batches = try safe_dir.openOrCreateDirectory(io, meta_dir, "batches", .{ .iterate = true });
     defer batches.close(io);
 
     var numbers: std.ArrayListUnmanaged(u64) = .empty;
@@ -735,7 +772,13 @@ pub fn rotateToBytes(
         }
     }
 
-    var batches = try meta_dir.openDir(io, "batches", .{ .iterate = true });
+    // The archive was measured a moment ago, so a missing `batches/` now is a vanished archive: keep the old
+    // `FileNotFound` rather than letting the no-follow create make a fresh directory for a rotation to grow into.
+    _ = meta_dir.statFile(io, "batches", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    var batches = try safe_dir.openOrCreateDirectory(io, meta_dir, "batches", .{ .iterate = true });
     defer batches.close(io);
 
     // Finish an interrupted rotation before starting this one: the rename below must not collide.
@@ -910,6 +953,98 @@ test "a batch directory is named in lowercase hex, so the id arithmetic is nibbl
     // apart, which is why the test uses it: a base-ten padding passes every smaller number.
     var dir = try tmp.dir.openDir(io, "batches/00000010", .{});
     defer dir.close(io);
+}
+
+/// A file's bytes, for the refusal tests below: the allocator is the testing one, so a forgotten free is a leak.
+fn readTestFile(io: std.Io, dir: std.Io.Dir, name: []const u8) ![]u8 {
+    return dir.readFileAlloc(io, name, testing.allocator, std.Io.Limit.limited(1 << 16));
+}
+
+test "a batch refuses a non-directory where its archive or generation directory belongs" {
+    // N6 (`plans/non-root-daemon.md` § 4E). A regular file where a directory belongs is the shape this host can
+    // exercise without `SeCreateSymbolicLinkPrivilege` (which the test process does not have): a symlink or a
+    // junction needs that privilege or a POSIX host, and belongs to the integrator's guarded test. What this
+    // asserts is that the entry is refused and left exactly as the tree shipped it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plan = try diff(testing.allocator, &.{}, &.{
+        item("a.txt", 10, format.flags.regular_file | format.flags.content_known),
+    });
+    defer {
+        testing.allocator.free(plan.entries);
+        testing.allocator.free(plan.names);
+    }
+
+    // `batches` is a file: the archive directory is refused, never created through or over it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "batches", .data = "not a directory\n" });
+    try testing.expectError(error.MetaDirNotDirectory, write(testing.allocator, io, tmp.dir, plan, .{
+        .generation = 3,
+        .parent = 2,
+    }));
+    const batches = try readTestFile(io, tmp.dir, "batches");
+    defer testing.allocator.free(batches);
+    try testing.expectEqualStrings("not a directory\n", batches);
+
+    // The same shape one component down: `batches/<generation>` is a file, so the generation directory is refused
+    // and the entry survives too.
+    try tmp.dir.deleteFile(io, "batches");
+    try tmp.dir.createDirPath(io, "batches");
+    try tmp.dir.writeFile(io, .{ .sub_path = "batches/00000003", .data = "occupied\n" });
+    try testing.expectError(error.MetaDirNotDirectory, write(testing.allocator, io, tmp.dir, plan, .{
+        .generation = 3,
+        .parent = 2,
+    }));
+    const generation = try readTestFile(io, tmp.dir, "batches/00000003");
+    defer testing.allocator.free(generation);
+    try testing.expectEqualStrings("occupied\n", generation);
+}
+
+test "a batch file is created exclusively under its final name, never through a planted entry" {
+    // N6 (`plans/non-root-daemon.md` § 4E): the three batch file names are fixed, so a tree that ships a prepared
+    // `.fs-meta` can plant an entry at one. A non-empty directory stands in for the link this host cannot create
+    // without `SeCreateSymbolicLinkPrivilege` — it is exactly the shape an exclusive create must refuse rather
+    // than delete into — and the empty directory that follows is the shape it must remove *as an entry*.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plan = try diff(testing.allocator, &.{}, &.{
+        item("a.txt", 10, format.flags.regular_file | format.flags.content_known),
+    });
+    defer {
+        testing.allocator.free(plan.entries);
+        testing.allocator.free(plan.names);
+    }
+    const context: Context = .{ .generation = 3, .parent = 2 };
+
+    try tmp.dir.createDirPath(io, "batches/00000003/files.meta");
+    try tmp.dir.writeFile(io, .{ .sub_path = "batches/00000003/files.meta/decoy", .data = "keep me\n" });
+
+    // Refused: the pass fails instead of deleting into the directory or truncating through it.
+    if (write(testing.allocator, io, tmp.dir, plan, context)) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+    const decoy = try readTestFile(io, tmp.dir, "batches/00000003/files.meta/decoy");
+    defer testing.allocator.free(decoy);
+    try testing.expectEqualStrings("keep me\n", decoy);
+
+    // Removed as an entry: an empty directory can be unlinked, so the name becomes a brand-new regular file that
+    // carries the batch's own bytes, not a write through whatever was there.
+    try tmp.dir.deleteTree(io, "batches/00000003/files.meta");
+    try tmp.dir.createDirPath(io, "batches/00000003/files.meta");
+    try write(testing.allocator, io, tmp.dir, plan, context);
+
+    const meta = try readTestFile(io, tmp.dir, "batches/00000003/files.meta");
+    defer testing.allocator.free(meta);
+    const txt = try readTestFile(io, tmp.dir, "batches/00000003/files.txt");
+    defer testing.allocator.free(txt);
+    try testing.expectEqual(@as(usize, format.entry_size), meta.len);
+    try testing.expectEqualStrings("a.txt\n", txt);
+
+    const stat = try tmp.dir.statFile(io, "batches/00000003/files.meta", .{ .follow_symlinks = false });
+    try testing.expectEqual(std.Io.File.Kind.file, stat.kind);
 }
 
 // ---------------------------------------------------------------- retention tests

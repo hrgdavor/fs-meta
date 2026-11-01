@@ -1,12 +1,12 @@
 # Run the fs-meta daemon as a non-root user — and enforce it
 
-**Status: N1–N6 implemented with documented platform gaps; N7 docs/packaging done, N7 negative/CI tests open
-(2026-11-01).** The rule is at the top of [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md),
-[`doc/daemon.md`](../doc/daemon.md) and the operator guide [`doc/service-deployment.md`](../doc/service-deployment.md).
-`src/security.zig` refuses `serve`/`daemon start` for uid 0, an elevated Administrator token or service SIDs;
-`socket_security.zig` makes POSIX sockets owner-only and peer-checked; `safe_dir.zig` refuses a symlinked `.fs-meta`;
-the `{{` dialect is off unless `serve --allow-exec`. The Windows socket DACL/peer gap and the remaining negative tests
-are called out below and in § 6.
+**Status: N1–N6 implemented with documented platform gaps; N7 docs/packaging and the in-tree negative tests are
+done, with the second-uid/privileged CI jobs still open (2026-11-01).** The rule is at the top of
+[`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md), [`doc/daemon.md`](../doc/daemon.md) and the operator guide
+[`doc/service-deployment.md`](../doc/service-deployment.md). `src/security.zig` refuses `serve`/`daemon start` for uid
+0, an elevated Administrator token or service SIDs; `socket_security.zig` makes POSIX sockets owner-only and
+peer-checked; `safe_dir.zig` refuses a symlinked `.fs-meta`; the `{{` dialect is off unless `serve --allow-exec`.
+The Windows socket DACL/peer gap and the remaining CI-host cases are called out below and in § 6.
 
 ## 1.1 What N2 implemented
 
@@ -35,14 +35,20 @@ are called out below and in § 6.
 - **N6 / `.fs-meta`:** `src/safe_dir.zig` classifies the final component with no-follow stat/open and refuses a
   symlink/junction/reparse point (`error.MetaDirSymlink`) or a non-directory (`error.MetaDirNotDirectory`). Fresh
   `.fs-meta` is `0700` / fresh trio files `0600`; existing modes are inherited. Temp files are created exclusively so
-  a pre-planted `files.*.tmp` cannot redirect the write.
-- **N7 / packaging:** `doc/service-deployment.md` and `packaging/` cover systemd, launchd, Windows service wrapper and
-  containers, with non-root service users and verification commands.
+  a pre-planted `files.*.tmp` cannot redirect the write. `batch.zig` now opens `batches`/`<gen>` no-follow and writes
+  its three files exclusively; `ignores.zig` uses the same safe open and exclusive `ignore.tmp` create.
+- **N7 / packaging and tests:** `doc/service-deployment.md` and `packaging/` cover systemd, launchd, Windows service
+  wrapper and containers, with non-root service users and verification commands. `test/socket.test.mjs` covers the
+  default `{{` refusal, `--allow-exec` serve-only behavior, POSIX socket modes and the same-uid/other-gid peer
+  refusal; `test/daemon.test.mjs` covers POSIX runtime/socket modes and the root/elevated refusal when the runner is
+  privileged. Those tests skip with an explicit reason on Windows/non-root hosts.
 
 **Still open / explicitly not claimed:** the Windows socket DACL and peer check; UID+GID clients started through
-`sg`/`newgrp` when the primary gid differs; `batch.zig`'s batch-file writes and `ignores.zig`'s own `.fs-meta` open
-still follow symlinks (engine/publish are covered); the `{{` child path on Windows is pre-existing and unverified; and
-the N7 negative tests (root/elevated refusal, socket modes, second-user refusal, exec gate) in CI.
+`sg`/`newgrp` when the primary gid differs; a **different-uid** peer test (needs a second unprivileged account) and
+execution of the root/elevated refusal tests on a root/elevated CI runner; writer-path `.fs-meta` opens in
+`seed.zig`, `main.zig`, `fsmeta.zig`, `daemon/host.zig` and `server.zig` still use the follow-open path and have not
+been routed through `safe_dir` (engine/publish/batch/ignores are covered); the `{{` child path on Windows is
+pre-existing and unverified; and direct unit tests for `safe_dir.zig` itself.
 
 ## 1. Why this is a hard rule
 
@@ -175,8 +181,8 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
 3. **N3:** socket directory/mode + peer credentials; Windows DACL. **Done on POSIX; Windows gap.**
 4. **N4:** exec dialect off/opt-in and peer-gated. **Done for `serve`; daemon/live never had it.**
 5. **N5:** privilege-drop path for service managers; `no_new_privs`/capability clearing. **Done as hardening, not a drop.**
-6. **N6:** filesystem no-follow/handle checks. **Done for engine/publish; batch/ignores gaps.**
-7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates done; tests open.**
+6. **N6:** filesystem no-follow/handle checks. **Done for engine/publish/batch/ignores; other writer paths remain.**
+7. **N7:** packaging templates and the negative tests above; run them in CI. **Docs/templates and in-tree tests done; second-uid/root CI jobs open.**
 
 ## 7. Acceptance
 
@@ -185,9 +191,10 @@ The existing `serve` socket is `<root>/.fs-meta/socket`; the multi-root daemon's
   Windows has no peer credentials/DACL in this implementation.**
 - The exec dialect is not reachable without the explicit opt-in and same-user peer check. **Done for `serve`; the
   daemon never had the dialect.**
-- `.fs-meta` creation refuses a symlink and uses owner-only modes. **Done for engine/publish; batch and ignores
-  remain, and Windows has no POSIX modes.**
+- `.fs-meta` creation refuses a symlink and uses owner-only modes. **Done for engine/publish/batch/ignores; Windows
+  has no POSIX modes and a few other writer paths still use a follow open.**
 - Service templates and docs never suggest root/LocalSystem. **Done in `packaging/` and
   `doc/service-deployment.md`.**
 - Tests cover refusal, permissions, peer rejection and the exec gate; the rule is in the top-level README, AGENTS.md
-  and daemon guide. **Partial: module-level tests exist; the true root/elevated and second-user CI tests remain open.**
+  and daemon guide. **Partial: socket/daemon tests are in the tree and pass on POSIX/privileged runners; a genuine
+  different-uid peer and root/elevated execution still need their CI hosts.**

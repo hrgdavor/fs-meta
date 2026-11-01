@@ -25,6 +25,7 @@
 const std = @import("std");
 const gitignore = @import("gitignore.zig");
 const gitdir = @import("gitdir.zig");
+const safe_dir = @import("safe_dir.zig");
 
 /// The source tokens used in `files.json`'s `scan.ignoreSources` and by `fsmeta ignored`. They name the source, not
 /// necessarily the file: the `.gitignore` chain is a source even when no file in the tree is named that.
@@ -260,18 +261,18 @@ pub fn rewriteManaged(arena: std.mem.Allocator, io: std.Io, root: []const u8, pa
 
     var root_dir = openRoot(io, root) catch return error.RootMissing;
     defer root_dir.close(io);
-    var meta_dir = root_dir.openDir(io, ".fs-meta", .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            if (entries.items.len == 0) return;
-            try root_dir.createDirPath(io, ".fs-meta");
-            var created = try root_dir.openDir(io, ".fs-meta", .{});
-            defer created.close(io);
-            const text = try renderManaged(arena, "", entries.items);
-            try writeAtomic(created, io, text);
-            return;
-        },
-        else => return err,
-    };
+
+    // N6 (`plans/non-root-daemon.md` § 4E): `.fs-meta` is opened — and, when there is something to manage,
+    // created — through `safe_dir`, so a planted symlink, junction or other reparse point at `.fs-meta` is refused
+    // instead of followed. An absent `.fs-meta` with nothing to manage stays absent: the probe is a no-follow stat,
+    // not a create, and only the write below creates the directory.
+    if (entries.items.len == 0) {
+        _ = root_dir.statFile(io, ".fs-meta", .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+    }
+    var meta_dir = try safe_dir.openOrCreateDirectory(io, root_dir, ".fs-meta", .{});
     defer meta_dir.close(io);
 
     const existing = readIgnore(arena, io, meta_dir) catch |err| switch (err) {
@@ -332,7 +333,10 @@ pub fn appendExclude(arena: std.mem.Allocator, io: std.Io, common_dir: []const u
         if (hasExcludeBlock(text)) return false;
         break :blk try appendExcludeBlock(arena, text);
     } else try std.fmt.allocPrint(arena, "{s}\n{s}\n", .{ exclude_marker, exclude_entry });
-    try writeAtomicNamed(info, io, "exclude", updated);
+    // `info/exclude` is git's file, not our state directory: keep the default creation mode (what `writeFile`
+    // used before the exclusive create) instead of the owner-only one `.fs-meta` gets. An existing file's mode is
+    // inherited either way.
+    try writeAtomicNamed(info, io, "exclude", updated, .default_file);
     return true;
 }
 
@@ -395,14 +399,14 @@ fn renderManaged(arena: std.mem.Allocator, user: []const u8, entries: []const []
     return out.toOwnedSlice();
 }
 
+/// Open `<root>/.fs-meta`, creating it when it is absent.
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): the open and the create are `safe_dir`'s no-follow ones, so a `.fs-meta`
+/// that is a symlink, a directory junction or another reparse point — or that exists but is not a directory — is
+/// refused rather than opened through, and a fresh directory is owner-only on POSIX. An existing directory is used
+/// as it is and never chmod-ed.
 fn openOrCreateMeta(io: std.Io, root_dir: std.Io.Dir) !std.Io.Dir {
-    return root_dir.openDir(io, ".fs-meta", .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try root_dir.createDirPath(io, ".fs-meta");
-            return root_dir.openDir(io, ".fs-meta", .{});
-        },
-        else => return err,
-    };
+    return safe_dir.openOrCreateDirectory(io, root_dir, ".fs-meta", .{});
 }
 
 fn readIgnore(arena: std.mem.Allocator, io: std.Io, meta_dir: std.Io.Dir) ![]u8 {
@@ -478,14 +482,33 @@ fn appendUnderBlock(arena: std.mem.Allocator, text: []const u8, entry: []const u
 }
 
 fn writeAtomic(meta_dir: std.Io.Dir, io: std.Io, bytes: []const u8) !void {
-    return writeAtomicNamed(meta_dir, io, ignore_file_name, bytes);
+    // `.fs-meta/ignore` is state this module owns: a fresh file is owner-only on POSIX, while an existing one keeps
+    // its mode so a reader that could read the previous bytes can still read the next ones.
+    const permissions = safe_dir.filePermissionsFor(io, meta_dir, ignore_file_name);
+    return writeAtomicNamed(meta_dir, io, ignore_file_name, bytes, permissions);
 }
 
 /// Write `name` through `name.tmp` and a rename, beside the file that is being replaced.
-fn writeAtomicNamed(dir: std.Io.Dir, io: std.Io, name: []const u8, bytes: []const u8) !void {
+///
+/// N6 (`plans/non-root-daemon.md` § 4E): the temporary name is fixed (`ignore.tmp`), so a tree could plant an entry
+/// there. `safe_dir.createExclusiveFile` removes whatever occupies it *as an entry* (never through it) and creates
+/// the file `O_EXCL`/`FILE_CREATE`, so the bytes cannot be redirected through a symlink or junction; an entry that
+/// cannot be unlinked makes the write fail. The rename then replaces the final name rather than opening through it,
+/// which is the same discipline `publish.writeTemp` uses for the trio.
+fn writeAtomicNamed(
+    dir: std.Io.Dir,
+    io: std.Io,
+    name: []const u8,
+    bytes: []const u8,
+    permissions: std.Io.File.Permissions,
+) !void {
     var buffer: [256]u8 = undefined;
     const temporary = std.fmt.bufPrint(&buffer, "{s}.tmp", .{name}) catch return error.NameTooLong;
-    try dir.writeFile(io, .{ .sub_path = temporary, .data = bytes });
+    {
+        var file = try safe_dir.createExclusiveFile(io, dir, temporary, permissions);
+        defer file.close(io);
+        try file.writeStreamingAll(io, bytes);
+    }
     try std.Io.Dir.rename(dir, temporary, dir, name, io);
 }
 
@@ -718,6 +741,64 @@ test "appendManaged recreates a deleted parent" {
     try appendManaged(allocator, io, root, "child");
     const text = try readText(allocator, io, tmp.dir, ".fs-meta/ignore");
     try testing.expectEqualStrings("# fsmeta-managed\nchild/\n", text);
+}
+
+test "the state directory is refused when it is not a directory, and never replaced" {
+    // N6 (`plans/non-root-daemon.md` § 4E). A regular file at `.fs-meta` is the shape this host can exercise
+    // without `SeCreateSymbolicLinkPrivilege`: a symlink or a junction needs that privilege or a POSIX host, and
+    // belongs to the integrator's guarded test. Both writers go through `safe_dir` now, so both refuse, and the
+    // entry the tree shipped survives byte for byte.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".fs-meta", .data = "not a directory\n" });
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+    var arena = TestArena.init();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try testing.expectError(error.MetaDirNotDirectory, appendManaged(allocator, io, root, "nested/root"));
+    try testing.expectError(error.MetaDirNotDirectory, rewriteManaged(allocator, io, root, &.{"nested/root"}));
+    // Even with nothing to manage: the probe is a no-follow stat, so a hijacked `.fs-meta` is an error rather
+    // than a silent success. A genuinely absent `.fs-meta` still stays absent (covered above).
+    try testing.expectError(error.MetaDirNotDirectory, rewriteManaged(allocator, io, root, &.{}));
+    try testing.expectEqualStrings("not a directory\n", try readText(allocator, io, tmp.dir, ".fs-meta"));
+}
+
+test "a pre-planted ignore.tmp is refused or replaced as an entry, never written through" {
+    // N6 (`plans/non-root-daemon.md` § 4E): the temporary name is fixed, so a tree could plant an entry at
+    // `.fs-meta/ignore.tmp`. A non-empty directory stands in for the link this host cannot create without
+    // `SeCreateSymbolicLinkPrivilege`: the exclusive create cannot unlink it, so the write is refused and neither
+    // the directory nor its child is touched.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, io, ".fs-meta/ignore.tmp/decoy", "keep me\n");
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &path_buffer);
+    var arena = TestArena.init();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    if (appendManaged(allocator, io, root, "nested/root")) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+    try testing.expectEqualStrings("keep me\n", try readText(allocator, io, tmp.dir, ".fs-meta/ignore.tmp/decoy"));
+    try testing.expectError(error.FileNotFound, readText(allocator, io, tmp.dir, ".fs-meta/ignore"));
+
+    // An entry the create can unlink is removed *as an entry*, and the bytes land in a brand-new file before the
+    // rename replaces the final name. Here the empty directory takes the place of the planted link.
+    try tmp.dir.deleteTree(io, ".fs-meta/ignore.tmp");
+    try tmp.dir.createDirPath(io, ".fs-meta/ignore.tmp");
+    try appendManaged(allocator, io, root, "nested/root");
+    try testing.expectEqualStrings(
+        "# fsmeta-managed\nnested/root/\n",
+        try readText(allocator, io, tmp.dir, ".fs-meta/ignore"),
+    );
+    try testing.expectError(error.FileNotFound, readText(allocator, io, tmp.dir, ".fs-meta/ignore.tmp"));
 }
 
 test "appendManaged escapes spaces, a leading ! and a character class" {

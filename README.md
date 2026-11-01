@@ -5,9 +5,10 @@
 > executable dialect that hands the connection to a child program. Any exploit in that attack surface would
 > otherwise run with **elevated permissions**. This is a hard deployment rule, not a recommendation. The startup
 > refusal, owner-only sockets and peer checks (POSIX), the `--allow-exec` gate, startup hardening and no-follow
-> `.fs-meta` creation are implemented; Windows socket/peer gaps and the remaining negative tests are tracked in
-> [`plans/non-root-daemon.md`](plans/non-root-daemon.md). The operator procedures and service templates are in
-> [`doc/service-deployment.md`](doc/service-deployment.md) and [`packaging/`](packaging/README.md).
+> `.fs-meta` creation are implemented; Windows socket/peer gaps and the two CI-host cases (different uid, root/elevated
+> execution) are tracked in [`plans/non-root-daemon.md`](plans/non-root-daemon.md). The operator procedures and
+> service templates are in [`doc/service-deployment.md`](doc/service-deployment.md) and
+> [`packaging/`](packaging/README.md).
 
 The file-system state of one codebase folder, as a **trio of files** a watcher maintains and every other tool
 reads — so a tool that kept an index can ask *"is this file still what I indexed last time?"* by reading one

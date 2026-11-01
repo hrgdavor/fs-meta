@@ -11,7 +11,7 @@
 // The environment is deliberately hermetic: `FSMETA_RUNTIME_DIR` and `FSMETA_CONFIG_HOME` point into `.tmp/`,
 // so a test never reads or writes the developer's own `roots.json` or runtime directory.
 import { afterAll, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { binary } from './binary.mjs';
@@ -3209,4 +3209,133 @@ describe('the two M4 gaps: a failed finish, and what a hook cannot say about a w
     },
     60000,
   );
+});
+
+// ──────────────────────────────────────────────
+// N7 of plans/non-root-daemon.md § 4G/§ 7: runtime modes and the privileged-start refusal
+//
+// The two negative cases the plan lists as open for the daemon. The mode case needs POSIX mode bits; the
+// refusal case needs a process that is actually root (POSIX) or elevated (Windows). This suite never elevates
+// itself: without that identity the case skips with the reason, and the CI job that can provide it is named.
+// ──────────────────────────────────────────────
+
+const POSIX = process.platform !== 'win32';
+
+const posixModeTest = POSIX
+  ? test
+  : (name, fn, ...rest) => test.skip(
+      `${name} [skipped: this host is win32; Windows has no POSIX mode bits, so 0700/0600 cannot be asserted (socket_security.zig documents the gap)]`,
+      fn,
+      ...rest,
+    );
+
+/** This process's privilege in N2's sense: uid 0 on POSIX, an elevated or service token on Windows. */
+function privilege() {
+  if (process.platform === 'win32') {
+    try {
+      const whoami = Bun.spawnSync(['whoami', '/groups'], { stdout: 'pipe', stderr: 'pipe' });
+      if (whoami.exitCode !== 0) {
+        return { known: false, privileged: false, detail: '`whoami /groups` failed' };
+      }
+      const text = whoami.stdout.toString();
+      // High (S-1-16-12288) and System (S-1-16-16384) mandatory levels, or the LocalSystem SID: the identities
+      // `security.zig` refuses. A Medium mandatory level is an ordinary filtered token and is allowed.
+      const elevated = /S-1-16-(12288|16384)\b/.test(text) || /\bS-1-5-18\b/.test(text);
+      return {
+        known: true,
+        privileged: elevated,
+        detail: elevated ? 'an elevated/System token' : 'a Medium (non-elevated) token',
+      };
+    } catch (error) {
+      return { known: false, privileged: false, detail: `the token query failed: ${error.message}` };
+    }
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (uid === null) return { known: false, privileged: false, detail: 'process.getuid is unavailable' };
+  return { known: true, privileged: uid === 0, detail: `uid ${uid}` };
+}
+
+const privilegeState = privilege();
+const privilegeSkip = privilegeState.known
+  ? `this process is not root/elevated (${privilegeState.detail})`
+  : `this process's privilege could not be determined (${privilegeState.detail})`;
+const privilegedTest = privilegeState.privileged
+  ? test
+  : (name, fn, ...rest) => test.skip(
+      `${name} [skipped: ${privilegeSkip}; the N7 refusal needs a runner that is — a Linux container CI job that runs the suite as uid 0, or an elevated Administrator Windows runner — and the test never elevates itself]`,
+      fn,
+      ...rest,
+    );
+
+describe('N7: the daemon runtime directory and its sockets are owner-only', () => {
+  posixModeTest(
+    'base, roots and logs are 0700, and daemon.sock and each root .sock are 0600',
+    async () => {
+      const m = machine();
+      writeFileSync(join(m.root, 'a.txt'), 'one\n');
+      // An operator's (or an older release's) runtime directory is commonly 0755; N3 narrows an existing one.
+      chmodSync(m.runtime, 0o755);
+
+      const daemon = startDaemon(m);
+      try {
+        await waitForDaemon(m);
+        const id = addRoot(m, m.root);
+        const mode = (path) => statSync(path).mode & 0o777;
+        expect(mode(m.runtime)).toBe(0o700);
+        expect(mode(join(m.runtime, 'roots'))).toBe(0o700);
+        expect(mode(join(m.runtime, 'logs'))).toBe(0o700);
+        expect(mode(join(m.runtime, 'daemon.sock'))).toBe(0o600);
+
+        // The root socket is bound by `root add`; wait for the narrow, so this does not race the bind.
+        const rootSocket = join(m.runtime, 'roots', `${id}.sock`);
+        await eventually(
+          () => existsSync(rootSocket) && mode(rootSocket) === 0o600,
+          'the root socket never became 0600',
+        );
+        expect(mode(rootSocket)).toBe(0o600);
+
+        // Same-user serving still works: the modes restrict the socket, not the protocol.
+        const peer = await connect(rootSocket);
+        expectHello(await peer.frame());
+        peer.end();
+      } catch (error) {
+        throw new Error(`${error.message}\ndaemon output:\n${daemon.output.text}`);
+      } finally {
+        await stopDaemon(daemon);
+      }
+    },
+    60000,
+  );
+});
+
+describe('N7: a privileged process is refused before it serves', () => {
+  privilegedTest('serve is refused as root/elevated, before the trio is read', () => {
+    const m = machine();
+    // No trio: a missing refusal would surface as "no usable trio" instead. Both paths exit 2, so the message
+    // is what distinguishes the N2 gate from the loader's failure.
+    const result = cli(m, 'serve', m.root);
+    expect(result.code).toBe(2);
+    expect(result.text).toContain('refusing to serve as a privileged user');
+    expect(result.text).not.toContain('no usable trio');
+    expect(existsSync(join(m.root, '.fs-meta'))).toBe(false);
+  });
+
+  privilegedTest('daemon start is refused as root/elevated, before the base is created', () => {
+    const m = machine();
+    const base = join(m.home, 'refused-base');
+    const result = Bun.spawnSync([binary, 'daemon', 'start', '--foreground', '--base', base], {
+      cwd: here,
+      env: m.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 5000,
+    });
+    // A privileged runner must be refused immediately. A timeout (SIGTERM) would mean the daemon started and
+    // kept running, which is exactly the failure this case exists to catch. Bun reports a normal exit's signal
+    // as `undefined` and an interrupted one as the signal name, so both are normalised here.
+    expect({ code: result.exitCode, signal: result.signalCode ?? null }).toEqual({ code: 4, signal: null }); // control.Exit.refused
+    const text = `${result.stdout.toString()}${result.stderr.toString()}`;
+    expect(text).toContain('refusing to serve as a privileged user');
+    expect(existsSync(base)).toBe(false);
+  });
 });

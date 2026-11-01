@@ -5,8 +5,10 @@
 > or an identity whose privilege level cannot be determined. **N3–N6 are implemented** in this checkout:
 > `socket_security.zig` makes POSIX sockets owner-only and peer-checked (Windows has a documented gap),
 > `server.zig`/`fsmeta.zig` gate the `{{` dialect behind `serve --allow-exec` (default off), `security.zig` hardens
-> the process after the gate, and `safe_dir.zig` refuses a symlinked `.fs-meta`. The N7 **negative tests and CI
-> checks are still open**; the authoritative status is [`plans/non-root-daemon.md`](../plans/non-root-daemon.md) § 6.
+> the process after the gate, and `safe_dir.zig` refuses a symlinked `.fs-meta`. The in-tree N7 **negative tests are
+> added** (socket modes, peer mismatch, exec gate, privileged refusal when the runner allows it); the different-uid
+> and root/elevated **CI hosts remain open**. The authoritative status is
+> [`plans/non-root-daemon.md`](../plans/non-root-daemon.md) § 6.
 > The templates in [`packaging/`](../packaging/README.md) are safe defaults regardless of which binary you deploy.
 
 > **The rule.** Run `fsmeta daemon`, `fsmeta serve`, and every other serving or watching process as an ordinary,
@@ -577,7 +579,7 @@ user. If the served root is not writable, fix the host ownership or the build ar
 - That the POSIX refusal checks capabilities, or that the Windows refusal enumerates every privilege. Neither is
   claimed by `src/security.zig`; the account choice remains the real control.
 - That these templates are an installer. They are examples with comments; the commands in this guide are the
-  procedure, and the N7 packaging tests are still open. Verify the checklist on the target host before trusting a
+  procedure, and the second-uid/root CI execution is still open. Verify the checklist on the target host before trusting a
   deployment.
 - That a third-party service wrapper (WinSW) is supported or shipped. It is an example of the only practical shape
   for a Windows service in this checkout; pin and review the wrapper you install.
