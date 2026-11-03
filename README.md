@@ -17,23 +17,27 @@ reads — so a tool that kept an index can ask *"is this file still what I index
 **The format is specified in [`FORMAT.md`](FORMAT.md).** That document is the authority; this one is about the
 subproject: what is here, how to run it, and where it plugs in.
 
-| In this subproject                | What it is                                                                                   |
-| --------------------------------- | -------------------------------------------------------------------------------------------- |
+| In this subproject                | What it is                                                                                          |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`FORMAT.md`](FORMAT.md)          | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
 | `src/main.zig` + `build.zig*`     | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
 | `src/main/java/hr/hrg/fsmeta/`    | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.6`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
-| `js/`                             | the **Bun client/reader** — dependency-free ESM, no build step                               |
-| `conformance/`                    | the shared vector file every reader asserts, and the generator that produces it              |
+| `js/`                             | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
+| `conformance/`                    | the shared vector file every reader asserts, and the generator that produces it                     |
 
 **Not a `jcodebuddy` artifact.** The module has its own group id, artifact id and version and **no parent** — it
 does not inherit `jcodebuddy-parent`, and it names no `jcodebuddy`/`hipster` type. It is listed in the root POM's
 `<modules>` so the reactor (and the recorded gate) builds and tests it, which is a build relationship rather than
-a namespace. Its one dependency is the hash: the artifact `hr.hrg:wyhash:1.1.0-SNAPSHOT`, from the project's own
-repository (installed locally until it is published — DEC-050), so both of this project's ports hash with the same
-code rather than with the same algorithm. **`java-watch*` may depend on this project** — the watcher is the writer
-of the trio — which is the 2026-10-16 amendment recorded in AGENTS.md § 2.
+a namespace. Its one dependency is the hash: the artifact `hr.hrg:wyhash:1.2.0`, already on Maven Central, so both
+of this project's ports hash with the same code rather than with the same algorithm. **`java-watch*` may depend on
+this project** — the watcher is the writer of the trio — which is the 2026-10-16 amendment recorded in AGENTS.md § 2.
 
 ## The watcher is the Zig engine; tools connect over a Unix socket
+
+**Only the Zig engine implements the daemon.** The Java port, the Bun/Node port and every future port are
+**clients**: they read and validate the trio and speak the socket protocol, and they must not implement a watcher,
+scheduler, scan-on-change loop, socket server, control plane or second daemon. The JS entry point `js/daemon.mjs`
+is a client for the Zig daemon, not a daemon.
 
 This is the intended deployment, not an implementation detail:
 
@@ -47,9 +51,10 @@ This is the intended deployment, not an implementation detail:
   stream across all of them. That is why the Zig variant is the intended one: it is the most lightweight and
   fastest option when several Java, Bun, editor and codegen processes are open, and it avoids each of them
   carrying its own event loop, debounce and hashing.
-- **The Java and Bun ports are clients/readers, not watchers.** They validate and decode the trio and can speak
-  the socket protocol. They do not run a second watch loop in-process; that would duplicate the engine and defeat
-  the point. The Java port's writer exists for repair/tests, not as a production watcher.
+- **The Java, Bun and Node ports are clients/readers, never daemons.** They validate and decode the trio and can
+  speak the socket protocol. They do not run a second watch loop in-process and do not start a daemon; that would
+  duplicate the engine and defeat the point. The Java port's writer exists for repair/tests, not as a production
+  watcher.
 
 
 ## The trio, in one paragraph
@@ -80,7 +85,7 @@ zig-out/bin/fsmeta.exe glob <root> <pattern> [--since <ts>] [--json]   # git wil
 zig-out/bin/fsmeta.exe changed <root> <since> [--json]
 zig-out/bin/fsmeta.exe reconcile <root> <from> [to] [--json] [--baseline <root>] [--include <pat>] [--exclude <pat>]
 
-# the Bun port (no build step)
+# the Bun port (no build step); under Node, install `@hrg/wyhash` for the trio reader
 bun fs-meta/js/fsmeta-cli.mjs scan --root .          # walk the tree, write .fs-meta/
 bun fs-meta/js/fsmeta-cli.mjs verify                 # is the trio usable?
 bun fs-meta/js/fsmeta-cli.mjs names                  # the files it knows, in format order
@@ -90,7 +95,7 @@ bun fs-meta/js/fsmeta-cli.mjs repair                 # re-pair entries and names
 
 # the Java port (same commands; needs the module built and JDK 25)
 bun scripts/mvn-fast.js -pl :fs-meta package
-java -cp fs-meta/target/fs-meta-1.0-SNAPSHOT.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
+java -cp fs-meta/target/fs-meta-0.3.6.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
 
 # both implementations' tests
 bun test fs-meta/js                                  # 26 tests: vectors, round trip, CLI
@@ -99,6 +104,9 @@ bun scripts/mvn-fast.js -pl :fs-meta package          # 63 JUnit tests
 # do the ports really produce one format? one tree, scanned by both, compared byte for byte
 bun fs-meta/check-ports.mjs                          # needs the module built (above) and JDK 25
 ```
+
+`hr.hrg:wyhash:1.2.0` is on Maven Central, so a local Maven build resolves it; no local install or version
+override is needed.
 
 `scan` honours `.gitignore` files in the tree unless `--no-gitignore` is given; `--normalize none|lf|text`
 chooses the content-hash mode (`text` is the default, which makes a CRLF and an LF checkout agree), and
@@ -174,6 +182,31 @@ if (load.ok) {
 }
 ```
 
+```js
+// Ask the daemon for the names it currently has — the whole state, not a change set
+import { namesForRoot } from './fs-meta/js/daemon.mjs';
+
+const current = await namesForRoot('.');       // null when no daemon serves the tree
+if (current) {
+  console.log(current.names);                  // workspace-relative, sorted
+  console.log(current.generation, current.source); // 'trio', 'trio+replay' or 'replay'
+}
+```
+
+`namesForRoot` reads the root's trio as the baseline at generation `g` (when the reader is available) and asks the
+daemon for only the batches after `g`, so the answer stays complete after batch retention has pruned generation 1 and
+for an `auto` root that was asleep (subscribing wakes it; the wake scan is the next batch). Without a trio reader it
+replays from 0, which is complete only while batch 1 is retained. The daemon module imports Node builtins only, so
+Node can use the socket even though `layout.mjs` needs Bun's native hash or the published `@hrg/wyhash`; without
+either, the trio baseline is skipped. A `null` answer means "no daemon, or no complete answer": the caller reads the
+trio or walks, and never presents a partial list. The package exports the entry points as `@hrg/fs-meta`,
+`@hrg/fs-meta/daemon`, `@hrg/fs-meta/layout` and `@hrg/fs-meta/cli`.
+
+Under Node the trio reader itself needs the wyhash project's JavaScript port, published as `@hrg/wyhash`; a Node
+process without it gets an explicit error from `layout.mjs` and can still use `@hrg/fs-meta/daemon` (which does not
+import `layout.mjs` for the socket path). With the port installed, the Node reader computes the same values as Bun's
+native hash — measured against the same vectors, and used as the trio baseline in `namesForRoot`.
+
 A client does not publish. The engine owns the publish, and a tool that needs the live path asks the daemon over
 its Unix socket; a tool without a daemon reads the trio. The Java port's writer exists for repair and tests, not as
 the production path.
@@ -203,6 +236,19 @@ no workspace dependency of its own, so a `watch/*` module **may** depend on it. 
 recorded in AGENTS.md § 2 and in the check's own header, and it is what lets the watcher be the writer of the
 trio this project defines instead of growing a copy of it.
 
+## Publishing
+
+Maven releases go through [`pom-release.xml`](pom-release.xml), never a bare `mvn deploy`; [publishing.md](publishing.md)
+has the prerequisites (JDK 25, real Maven 3.9.9, the `central` token and GPG), the commands, the two-POM guard, and
+the npm and Zig release notes.
+
+`hr.hrg:wyhash:1.2.0` and `hr.hrg:gitignore:0.3.5` are both on Maven Central; fs-meta pins those releases.
+
+`@hrg/fs-meta@0.3.6` is on npm, but the current checkout is ahead of it: the published 0.3.6 still imports the bare
+`wyhash` package and has no `files`/`publishing.md` entries, while this tree imports `@hrg/wyhash` and ships the
+whitelist. Publish `0.3.7` to ship those. The Java artifact `hr.hrg:fs-meta` is not on Maven Central yet; it is a
+local `mvn install` for now.
+
 ## Next
 
 See [ROADMAP.md](ROADMAP.md) for the remaining daemon/socket hardening and worktree work. The watcher itself is
@@ -225,7 +271,7 @@ FSMETA_PORT_WRITER=1 bun test js       # also the writer tests (gated)
 | ---------- | ------------------------ | ------------------------------------------- |
 | Zig        | `gitignore` v0.3.5       | `build.zig.zon`, the tagged tarball         |
 | Java       | `hr.hrg:gitignore:0.3.5` | **Maven Central** — no local install needed |
-| JavaScript | `@hrg/gitignore@0.3.5`   | **npm**                                     |
+| JavaScript | `@hrg/gitignore@0.3.6`   | **npm**                                     |
 
 The Java artifact was verified the way a fresh machine would use it: the local copy was deleted and
 `mvn dependency:get -Dartifact=hr.hrg:gitignore:0.3.5` repopulated it from Central, then the test suite ran against that

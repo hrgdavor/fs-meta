@@ -25,7 +25,8 @@ hatch must be narrow, explicit, and documented as unsafe.
 The Zig implementation is the **only writer**. A port (Bun, Java, and anything added later) validates, decodes and loads
 what the engine published; it never lays a trio out. A port's tests are therefore a **reader** suite, and its
 writing-side tests are kept but gated (`FSMETA_PORT_WRITER=1`) rather than deleted, so that porting the writing side stays
-possible. Do not add a writer to a port to make a test pass.
+possible. Do not add a writer to a port to make a test pass. A port's writer is a **repair/test path, never a service**:
+a port does not publish in production and does not run a watcher around its writer.
 
 **The watcher is the Zig engine, and tools talk to it over a Unix socket.** The intended deployment is one
 long-lived `fsmeta daemon` for the served roots; each root has its own socket and its own trio. A tool asks the
@@ -34,6 +35,14 @@ without a daemon it reads the trio. Multiple tools are expected to be active at 
 the intended watcher: one native process performs the scan, hash, batch and git-transaction handling once, and every
 Java, Bun, editor or codegen client shares it. A Java or Bun watcher in-process would duplicate that work and be
 heavier; do not add one, and do not move the watcher into a port.
+
+**Only the Zig implementation may implement or run a daemon.** The Java port, the Bun/Node port and every future
+port are **clients**: they may read and validate the trio and connect to the Zig daemon's socket, and nothing more.
+A port must not implement a watcher, event loop, scheduler, debounce/grace window, scan-on-change loop, socket
+server, control plane, publish service, or a second daemon — not even behind a flag. The name of the JS entry point
+`js/daemon.mjs` means "the client for the Zig daemon"; it is not permission to add a daemon to the JS port. A tool
+that needs live updates subscribes to the Zig daemon (`SUBSCRIBE` / `CHANGE_ENTRY`) or polls the trio; it never
+starts a competing watcher.
 
 ## 2. Format invariants that must not drift
 
@@ -125,3 +134,19 @@ configurations in one run** rather than comparing two runs, and do not report a 
   `Copyright (c) 2026 Davor Hrg`.
 - **Zig is 0.17** (`D:\wrk\zig\17\zig.exe` on this machine); `build.zig` refuses other minors on purpose, because 0.17
   moved the `std.Io` surface.
+
+## 6. Releases
+
+- **Maven releases go through `pom-release.xml`, never a bare `mvn deploy`.** [publishing.md](publishing.md) is the
+  authority for the prerequisites, the commands and the Central token/GPG setup. The publisher is deliberately absent
+  from `pom.xml`, and `maven.deploy.skip=true` makes a normal `mvn deploy` a no-op.
+- **`pom.xml` and `pom-release.xml` are copies.** Edit `pom.xml`, copy the change into the release POM, then run
+  `bun scripts/check-poms.mjs`. The check also asserts that neither POM has a SNAPSHOT dependency.
+- **Central rejects a release whose POM depends on a SNAPSHOT.** fs-meta pins `hr.hrg:wyhash:1.2.0`, which is on
+  Maven Central; bump the pin only to a released version, never to a SNAPSHOT.
+- **The version is one version.** `pom.xml`, `package.json` and `build.zig.zon` must agree, and the tag must point at
+  the released commit. `bun scripts/check-poms.mjs` checks all three; bump them together before a release.
+- **npm:** `package.json` is non-private with `publishConfig.access: public`. The optional hash peer is
+  **`@hrg/wyhash`** (1.2.0 is on npm; the bare `wyhash` name is an unrelated package). The published fs-meta 0.3.6
+  still imports the bare name, so a 0.3.7 npm release is needed to ship the scoped import and the `files` whitelist.
+  See [publishing.md](publishing.md).

@@ -7,6 +7,10 @@
 > [`plans/non-root-daemon.md`](../plans/non-root-daemon.md), and deployment is covered by
 > [`service-deployment.md`](service-deployment.md).
 
+**Only the Zig engine implements this daemon.** The Java and Bun/Node ports are **clients**: they read the trio and
+speak the socket protocol, and they must not implement a watcher, scheduler, scan-on-change loop, socket server,
+control plane or a second daemon. `js/daemon.mjs` is a client for this daemon, not a daemon.
+
 `fsmeta serve <root>` owns one tree for its lifetime; its optional `--http` flag also serves a browser UI (socutil)
 over the same unix socket the binary protocol uses ([`FORMAT.socket.md`](../FORMAT.socket.md)). Bare `--http` binds
 port 8765, `--http=<port>` the port you name, and `--http=0` asks the operating system for any free port; the bound
@@ -94,3 +98,12 @@ worktree whose metadata disappears is reported `missing` with its batch history 
 pass `--force`, or run `fsmeta exclude <root>` once: it appends a marked, idempotent block (`# fsmeta: our own
 directory` + `.fs-meta/`, LF, atomic write) to `<common>/info/exclude`. That is git's own file, so the command is never
 automatic; a **later** `!` line in that file overrides the block, as git's last-match-wins rule says.
+
+### A client in JavaScript
+
+`js/daemon.mjs` is the consumer side of this document. `namesForRoot(directory)` resolves the served root from
+`roots.json`, reads its trio as a baseline at generation `g`, subscribes from `g`, and applies only the batches after
+it — so the answer survives batch retention and an `auto` root that was asleep (the wake scan is the next batch). It
+returns `null` rather than a partial list when no daemon answers or the window cannot be reconstructed. The module
+imports only Node builtins and `@hrg/gitignore`, so it runs under Node; the trio baseline additionally needs
+`@hrg/wyhash` (or Bun's native hash), and is skipped when that reader cannot load.

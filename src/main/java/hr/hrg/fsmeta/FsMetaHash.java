@@ -17,7 +17,7 @@ import hr.hrg.wyhash.Wyhash64;
  * {@code std.hash.Wyhash} produces the same values, which is what lets a Zig implementation land later
  * against the same vectors.</p>
  *
- * <p>{@link #ofText} and {@link #normalizeLf} reproduce the watch agent's normaliser byte for byte:
+ * <p>{@link #of(byte[])} and {@link #normalizeLf} reproduce the watch agent's normaliser byte for byte:
  * {@code \r\n} becomes {@code \n}, and a lone {@code \r} becomes {@code \n}.</p>
  */
 public final class FsMetaHash {

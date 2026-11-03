@@ -1,10 +1,32 @@
 {
     "name":  "@hrg/fs-meta",
-    "version":  "0.3.6",
-    "private":  true,
+    "version":  "0.3.7",
+    "private":  false,
+    "publishConfig":  {
+                           "access":  "public"
+                       },
+    "files":  [
+                  "js/fsmeta.mjs",
+                  "js/layout.mjs",
+                  "js/daemon.mjs",
+                  "js/fsmeta-cli.mjs",
+                  "README.md",
+                  "FORMAT.md",
+                  "FORMAT.socket.md",
+                  "FORMAT.daemon.md",
+                  "publishing.md"
+              ],
     "type":  "module",
+    "main":  "./js/fsmeta.mjs",
+    "exports":  {
+                    ".":  "./js/fsmeta.mjs",
+                    "./layout":  "./js/layout.mjs",
+                    "./daemon":  "./js/daemon.mjs",
+                    "./cli":  "./js/fsmeta-cli.mjs",
+                    "./package.json":  "./package.json"
+                },
     "description":  "The Bun/Node reader for the fs-meta trio: files.meta, files.txt and files.json.",
-    "comment":  "The port needs the wyhash JavaScript implementation only under Node: under Bun the native Bun.hash.wyhash is the same std.hash.Wyhash the engine calls and is used instead, so the dependency is a fallback rather than a second algorithm. It is fetched from the project\u0027s own repository, which is the same posture the Java port takes with the published artifact.",
+    "comment":  "The port needs the wyhash JavaScript implementation only under Node: under Bun the native Bun.hash.wyhash is the same std.hash.Wyhash the engine calls and is used instead, so the dependency is a fallback rather than a second algorithm. The fallback is the wyhash project's own JavaScript port, published as @hrg/wyhash and declared as an optional peer; fs-meta never carries a second implementation of the hash.",
     "comment-gitignore":  "The .gitignore matcher is gitignore\u0027s code, not fs-meta\u0027s: this project implements no matcher of its own (AGENTS.md, the core-dependency rule). The dependency is the published @hrg/gitignore package, pinned exactly; the library itself lives at github.com/hrgdavor/gitignore and is consumed as an artifact in every language, never as a copy.",
     "scripts":  {
                     "build":  "bun build.mjs",
@@ -12,6 +34,14 @@
                     "conformance":  "bun js/conformance.mjs"
                 },
     "dependencies":  {
-                         "@hrg/gitignore": "0.3.5"
-                     }
+                         "@hrg/gitignore": "0.3.6"
+                     },
+    "peerDependencies":  {
+                             "@hrg/wyhash": ">=1.2.0"
+                         },
+    "peerDependenciesMeta":  {
+                                 "@hrg/wyhash":  {
+                                                "optional":  true
+                                            }
+                             }
 }

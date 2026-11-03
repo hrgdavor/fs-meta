@@ -57,7 +57,7 @@ class FsMetaConformanceTest {
     @Test
     void everyVectorCaseReachesTheVerdictItRecords(@TempDir Path temporary) throws IOException {
         List<Object> cases = asList(vectors().get("cases"));
-        Assertions.assertEquals(14, cases.size(), "the v2 vector file carries the fourteen conformance cases");
+        Assertions.assertEquals(15, cases.size(), "the v2 vector file carries the fifteen conformance cases");
 
         int checked = 0;
         for (Object element : cases) {

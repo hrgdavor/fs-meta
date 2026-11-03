@@ -22,14 +22,20 @@
 // fall back to the JS port. The export names are unchanged, so every call site in this module and its consumers
 // keeps working.
 const nativeWyhash = globalThis.Bun?.hash?.wyhash ?? null;
+let jsWyhash = null;
 if (!nativeWyhash) {
-  throw new Error(
-    'the fs-meta Bun/Node port hashes with Bun.hash.wyhash, which is the same std.hash.Wyhash the engine calls. ' +
-      'Run it under Bun, or supply the wyhash project\'s JavaScript port explicitly: the published wyhash repository ' +
-      'ships only the Java implementation today.',
-  );
+  try {
+    // The wyhash project owns the JS port; fs-meta imports it instead of keeping
+    // a second algorithm (AGENTS.md, the core-dependency rule). It is published
+    // as the scoped `@hrg/wyhash` package.
+    jsWyhash = await import('@hrg/wyhash');
+  } catch {
+    throw new Error(
+      'the fs-meta Bun/Node port hashes with Bun.hash.wyhash, which is the same std.hash.Wyhash the engine calls. ' +
+        'Run it under Bun, or install the wyhash project\'s JavaScript port as `@hrg/wyhash`.',
+    );
+  }
 }
-const jsWyhash = null;
 
 /** wyhash of `bytes`, seed 0 by default: Bun’s built-in under Bun, the JS port everywhere else. */
 export const wyhash64 = (bytes, seed = 0n) =>
@@ -40,7 +46,7 @@ export const wyhash64Hex = (bytes, seed = 0n) =>
   nativeWyhash ? BigInt(nativeWyhash(bytes, Number(seed))).toString(16).padStart(16, '0') : jsWyhash.wyhash64Hex(bytes, seed);
 
 /** Which implementation answers `wyhash64` here — reported by the port so a run says what it used. */
-export const wyhashProvider = () => (nativeWyhash ? 'bun (native std.hash.Wyhash)' : 'js port (wyhash/js/wyhash64.mjs)');
+export const wyhashProvider = () => (nativeWyhash ? 'bun (native std.hash.Wyhash)' : 'js port (@hrg/wyhash)');
 
 export const FORMAT = 'fs-meta';
 export const VERSION = 1;

@@ -32,7 +32,7 @@ import { fileURLToPath } from 'node:url';
 // This generator only assembles the format's layout — and it refuses to emit anything until the shared
 // implementation reproduces the library-produced golden vectors, so a broken hash cannot become part of this
 // format's contract.
-import { assertLibraryGoldenVectors, wyhash64Hex } from 'wyhash/js/wyhash64.mjs';
+import { assertLibraryGoldenVectors, wyhash64Hex } from '@hrg/wyhash';
 import { reportDuration, stopwatch } from '../../scripts/lib/timing.js';
 
 const here = dirname(fileURLToPath(import.meta.url));

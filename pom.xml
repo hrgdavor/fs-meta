@@ -4,32 +4,9 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <!--
-        STANDALONE, AND DELIBERATELY NOT A `jcodebuddy` ARTIFACT.
-
-        This project has its own group id, its own artifact id, its own version and no parent: it does not
-        inherit `jcodebuddy-parent`, and nothing about it belongs to the JCodeBuddy namespace. That is a
-        decision about what it is, not tidiness — the file-system state contract is not a JCodeBuddy feature.
-        It is a small library a watcher and any number of other tools share, it depends on nothing from this
-        checkout except the `wyhash` project's Java artifact once that lands, and a tool that wants it should
-        be able to take it without taking anything else.
-
-        WHERE IT SITS AND WHY. The directory is at the root of this checkout and the root POM still lists it
-        as a `<module>`: the reactor is how it is built and how the recorded gate runs its tests, while the
-        *coordinates* are what make it standalone. Being in a reactor is a build relationship, not a
-        namespace — the same distinction the `watch/` standalone rule makes about the shared build parent.
-
-        `java-watch*` MAY DEPEND ON THIS PROJECT. The watcher family's rule is that it must not know about
-        Jackson, OpenRewrite, or this workspace's `jcodebuddy-*` / `hipster-*` / `metadata-*` / `jwa-*`
-        artifacts (AGENTS.md § 2, `scripts/check-watch-standalone.js`). `fs-meta` is none of those: it is a
-        standalone package with its own identity, no workspace dependency and no JCodeBuddy vocabulary, so the
-        watcher may consume it — which is the point, because the watcher is the writer of the trio. The
-        amendment is recorded in `AGENTS.md` and in the check's own header.
-    -->
-
     <groupId>hr.hrg</groupId>
     <artifactId>fs-meta</artifactId>
-    <version>0.3.6</version>
+    <version>0.3.7</version>
     <packaging>jar</packaging>
 
     <name>fs-meta</name>
@@ -40,6 +17,29 @@
         without walking the tree. The format is specified in FORMAT.md; the Java, Bun and (later) Zig
         implementations all assert the same conformance vectors.
     </description>
+    <url>https://github.com/hrgdavor/fs-meta</url>
+
+    <licenses>
+        <license>
+            <name>GPL-3.0 with the Commons Clause</name>
+            <url>https://github.com/hrgdavor/fs-meta</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>hrgdavor</id>
+            <name>Davor Hrg</name>
+            <url>https://github.com/hrgdavor</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:git://github.com/hrgdavor/fs-meta.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com:hrgdavor/fs-meta.git</developerConnection>
+        <url>https://github.com/hrgdavor/fs-meta</url>
+    </scm>
 
     <!--
         No parent means no managed versions, so everything this build uses is pinned here. The values are the
@@ -51,7 +51,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>25</maven.compiler.release>
 
-        <wyhash.version>1.1.0-SNAPSHOT</wyhash.version>
+        <wyhash.version>1.2.0</wyhash.version>
         <gitignore.version>0.3.5</gitignore.version>
         <junit.version>5.10.2</junit.version>
 
@@ -60,24 +60,42 @@
         <maven.jar.plugin.version>3.3.0</maven.jar.plugin.version>
         <maven.install.plugin.version>3.1.4</maven.install.plugin.version>
         <maven.deploy.plugin.version>3.1.2</maven.deploy.plugin.version>
+        <maven.source.plugin.version>3.3.1</maven.source.plugin.version>
+        <maven.javadoc.plugin.version>3.11.2</maven.javadoc.plugin.version>
+        <maven.gpg.plugin.version>3.2.7</maven.gpg.plugin.version>
+        <central.publishing.plugin.version>0.6.0</central.publishing.plugin.version>
+
+        <!-- Signing is off by default so local builds never wait on a passphrase; a release passes -Dgpg.skip=false. -->
+        <gpg.skip>true</gpg.skip>
+        <!--
+            PUBLISHING GUARD. The Central publisher lives in pom-release.xml, not here: its <extensions> is
+            read only from a top-level <build>, and keeping it out of pom.xml means a normal build never loads
+            it. maven.deploy.skip=true is the second half of the guard: maven-deploy-plugin is bound to the
+            deploy phase, so without it `mvn deploy` would upload to the distributionManagement URL in this
+            POM. It stays true in pom-release.xml too, because that skips maven-deploy-plugin, not the Central
+            publisher (a separate goal at the same phase): a release therefore cannot fall back to a direct
+            deploy if the publisher extension ever fails to load. See pom-release.xml.
+        -->
+        <maven.deploy.skip>true</maven.deploy.skip>
     </properties>
 
     <dependencies>
         <!--
             The one hash the format uses: `wyhash64`, seed 0 — the same coordinates this file has always
-            resolved, now at `1.1.0-SNAPSHOT` because the implementation this project needs (zero-allocation
-            `String`, `MemorySegment`, the generated vectors) lives there and `1.0.0` did not have it.
+            resolved, now at `1.2.0` because the implementation this project needs (zero-allocation `String`,
+            `MemorySegment`, the generated vectors) lives there and `1.0.0` did not have it.
 
             THE HASH IS NOT BUILT HERE (DEC-050). `hr.hrg:wyhash` has its own repository
-            (github.com/hrgdavor/wyhash); this dependency resolves from the local repository, so a machine needs
-            it installed once — `cd <wyhash checkout> && mvn -o install -Dgpg.skip=true` — or, once 1.1.0 is
-            published, from Maven Central. `mvn -pl :fs-meta` therefore does NOT build its own dependency, and
-            `-am` no longer reaches it: a "cannot resolve hr.hrg:wyhash" failure means the install is missing,
-            not that the POM is wrong.
+            (github.com/hrgdavor/wyhash); this dependency resolves from Maven Central at the released `1.2.0`.
+            `mvn -pl :fs-meta` therefore does NOT build its own dependency, and `-am` no longer reaches it: a
+            "cannot resolve hr.hrg:wyhash" failure means the artifact or the repository is missing, not that the
+            POM is wrong.
+
+            `1.2.0` is the release version, not a snapshot: Central rejects a release whose POM depends on
+            a SNAPSHOT; `hr.hrg:wyhash:1.2.0` is on Maven Central. Do not put a SNAPSHOT back into a release POM.
 
             Both ports of this format still hash with the SAME CODE rather than with the same algorithm: this
-            artifact is the Java half, and the Bun half imports the same project's `js/wyhash64.mjs` through the
-            package link the root `package.json` declares. The vectors prove it either way —
+            artifact is the Java half, and the Bun half imports the same project's `@hrg/wyhash` package. The vectors prove it either way —
             `conformance/fsmeta-vectors.json`'s `hashCases` pin the values, and the wyhash project's own
             generated vectors pin them against the Zig builtin reference.
         -->
@@ -145,6 +163,92 @@
                 <artifactId>maven-deploy-plugin</artifactId>
                 <version>${maven.deploy.plugin.version}</version>
             </plugin>
+            <!--
+                The Central publisher is deliberately NOT here. It lives in pom-release.xml, in that POM's
+                top-level <build>, because Maven reads <extensions> only from the build and never from a
+                profile: declared in the publish profile it was silently never loaded, and `deploy` staged a
+                bundle without uploading it or saying "central". It must also not be in pom.xml's <build>,
+                because then every build would load it and a bare `mvn deploy` would publish by default.
+                maven.deploy.skip=true above makes a bare `mvn deploy` a no-op instead; pom-release.xml keeps
+                that skip and adds the publisher.
+            -->
         </plugins>
     </build>
+    <profiles>
+        <profile>
+            <id>publish</id>
+            <build>
+                <plugins>
+                    <!-- Central requires a sources jar and a javadoc jar next to the binary. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>${maven.source.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>${maven.javadoc.plugin.version}</version>
+                        <configuration>
+                            <doclint>none</doclint>
+                            <additionalOptions>
+                                <additionalOption>--no-fonts</additionalOption>
+                            </additionalOptions>
+                            <source>${maven.compiler.release}</source>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Signing: skipped unless -Dgpg.skip=false. The passphrase comes from MAVEN_GPG_PASSPHRASE,
+                         so a headless build never waits on a prompt. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>${maven.gpg.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <skip>${gpg.skip}</skip>
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+    <distributionManagement>
+        <snapshotRepository>
+            <id>central</id>
+            <url>https://central.sonatype.com/repository/maven-snapshots/</url>
+        </snapshotRepository>
+        <repository>
+            <id>central</id>
+            <url>https://central.sonatype.com/repository/maven-releases/</url>
+        </repository>
+    </distributionManagement>
 </project>

@@ -21,6 +21,11 @@ The daemon exists for two reasons, and both are about cost:
 commit record, the batch and the rotation are the engine's. The daemon decides *when* a pass runs and *who* hears
 about it; it never lays a trio out itself.
 
+**Only the Zig engine implements this daemon.** The Java port, the Bun/Node port and every future port are
+**clients**: they read the trio and speak the socket protocol, and they must not implement a daemon, watcher,
+scheduler, scan-on-change loop, socket server, control plane or second writer. `js/daemon.mjs` is a client for this
+daemon, not a daemon.
+
 ---
 
 ## 1. Two directories, and the difference matters

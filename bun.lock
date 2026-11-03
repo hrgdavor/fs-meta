@@ -5,11 +5,17 @@
     "": {
       "name": "@hrg/fs-meta",
       "dependencies": {
-        "@hrg/gitignore": "0.3.5",
+        "@hrg/gitignore": "0.3.6",
       },
+      "peerDependencies": {
+        "@hrg/wyhash": ">=1.2.0",
+      },
+      "optionalPeers": [
+        "@hrg/wyhash",
+      ],
     },
   },
   "packages": {
-    "@hrg/gitignore": ["@hrg/gitignore@0.3.5", "", {}, "sha512-kf4c1d+4G+GFqhuPVj4m+a3vHYZV+33TqlbYZr+EjN76Yimupc7XFbHjNlNnrr+/qyiaKqEWHOoSlIvIhmlWkQ=="],
+    "@hrg/gitignore": ["@hrg/gitignore@0.3.6", "", {}, "sha512-C9aW3lMGmhOP5lRYr0sPOETYCln/7bVpeiwvtg8QT+oUi/TLNzDBsX4dPWT3+INRs/zhif8aA8gbwoD5JqfVcg=="],
   }
 }

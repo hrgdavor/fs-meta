@@ -25,6 +25,9 @@ are in [`doc/service-deployment.md`](../doc/service-deployment.md).** The system
 wrapper config are examples: adjust the binary path, the served-root paths and any options marked in their comments
 before installing. None of them has a root or LocalSystem variant, and none should be given one.
 
+**Releasing the artifacts is separate.** Maven Central, npm and the Zig tag are covered by
+[`publishing.md`](../publishing.md); this directory is only about running the daemon, not about publishing it.
+
 ## The short version
 
 1. Create a dedicated unprivileged account; give it no shell and no administrator group.

@@ -2,8 +2,10 @@
 
 **Status: the Zig `fsmeta daemon` is the server and the intended watcher; this is its live transport.** One daemon
 per watched root serves one Unix socket; multiple tools connect as clients and subscribe to the same change stream.
-The Java and Bun ports are clients/readers; they do not host the watcher or publish a trio. The format below is
-implemented by the Zig side (`src/wire.zig`, `src/server.zig`) and is the contract a client implements.
+The Java and Bun/Node ports are clients/readers; they do not host the watcher, implement a server, or publish a
+trio. **Only the Zig implementation is a server or daemon**; every other port is a client of this protocol. The
+format below is implemented by the Zig side (`src/wire.zig`, `src/server.zig`) and is the contract a client
+implements.
 
 **The socket is owner-only and peers are checked, not assumed.** The daemon creates its runtime directories `0700`
 and its sockets `0600`; on Linux (`SO_PEERCRED`) and macOS/BSD (`getpeereid`) a connection whose uid/gid is not the
