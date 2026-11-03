@@ -21,7 +21,7 @@ subproject: what is here, how to run it, and where it plugs in.
 | --------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`FORMAT.md`](FORMAT.md)          | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
 | `src/main.zig` + `build.zig*`     | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
-| `src/main/java/hr/hrg/fsmeta/`    | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.6`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
+| `src/main/java/hr/hrg/fsmeta/`    | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.7`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
 | `js/`                             | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
 | `conformance/`                    | the shared vector file every reader asserts, and the generator that produces it                     |
 
@@ -95,7 +95,7 @@ bun fs-meta/js/fsmeta-cli.mjs repair                 # re-pair entries and names
 
 # the Java port (same commands; needs the module built and JDK 25)
 bun scripts/mvn-fast.js -pl :fs-meta package
-java -cp fs-meta/target/fs-meta-0.3.6.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
+java -cp fs-meta/target/fs-meta-0.3.7.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
 
 # both implementations' tests
 bun test fs-meta/js                                  # 26 tests: vectors, round trip, CLI
@@ -242,12 +242,9 @@ Maven releases go through [`pom-release.xml`](pom-release.xml), never a bare `mv
 has the prerequisites (JDK 25, real Maven 3.9.9, the `central` token and GPG), the commands, the two-POM guard, and
 the npm and Zig release notes.
 
-`hr.hrg:wyhash:1.2.0` and `hr.hrg:gitignore:0.3.5` are both on Maven Central; fs-meta pins those releases.
-
-`@hrg/fs-meta@0.3.6` is on npm, but the current checkout is ahead of it: the published 0.3.6 still imports the bare
-`wyhash` package and has no `files`/`publishing.md` entries, while this tree imports `@hrg/wyhash` and ships the
-whitelist. Publish `0.3.7` to ship those. The Java artifact `hr.hrg:fs-meta` is not on Maven Central yet; it is a
-local `mvn install` for now.
+`hr.hrg:wyhash:1.2.0`, `hr.hrg:gitignore:0.3.5` and `hr.hrg:fs-meta:0.3.7` are on Maven Central; fs-meta pins the
+first two releases and publishes the third there. `@hrg/fs-meta@0.3.7` is on npm, with the scoped `@hrg/wyhash`
+import and the `files` whitelist; `md-fix-tables` depends on it. No local install is needed for either port.
 
 ## Next
 

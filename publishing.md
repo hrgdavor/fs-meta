@@ -26,9 +26,10 @@ The version is pinned in three places and must agree: `pom.xml`, `package.json` 
 6. **A GPG key and `MAVEN_GPG_PASSPHRASE`.** Signing is off by default (`gpg.skip=true`); a release passes
    `-Dgpg.skip=false`. The profile passes `--pinentry-mode loopback`, so gpg reads `MAVEN_GPG_PASSPHRASE` instead of
    opening a prompt a batch build cannot answer. A passphrase stored in `settings.xml` is not used.
-7. **A release version and a tag.** The POM and `package.json` are `0.3.6`. The `v0.3.6` tag predates the JavaScript
-   daemon client and this publishing setup, so the first release that includes them should bump the version and be
-   tagged from the released commit. Do not publish an artifact whose tag points at different code.
+7. **A release version and a tag.** The POM and `package.json` are `0.3.7`, and the annotated `v0.3.7` tag points at
+   the published commit `90e97a3`. The older `v0.3.6` predates the JavaScript daemon client and this publishing
+   setup. Tag the released commit for every future release; do not publish an artifact whose tag points at different
+   code.
 
 ## Publishing the Maven artifact
 
@@ -83,10 +84,9 @@ publisher does not use `altDeploymentRepository`.
 ### After the release
 
 - Check the artifact under `https://repo1.maven.org/maven2/hr/hrg/fs-meta/<version>/`.
-- Update consumers that still install locally: the watcher/driver project should depend on
-  `hr.hrg:fs-meta:<version>` from Central, not on a local `mvn install`.
-- `md-fix-tables` already depends on `@hrg/fs-meta` (0.3.6) from npm; bump that pin to the new version after
-  this release. Its walk fallback stays useful when no daemon answers.
+- Consumers should depend on `hr.hrg:fs-meta:<version>` from Central, not on a local `mvn install`.
+- `md-fix-tables` depends on `@hrg/fs-meta` 0.3.7 from npm and `@hrg/wyhash` 1.2.0; bump both pins after a new
+  release. Its walk fallback stays useful when no daemon answers.
 
 ### Common failures
 
@@ -103,10 +103,9 @@ publisher does not use `altDeploymentRepository`.
 
 `package.json` is non-private (`private: false`) and declares `publishConfig.access: public`.
 
-**0.3.6 is on npm, but it is an earlier snapshot.** Its `layout.mjs` still imports the bare `wyhash` package, its
-peer dependency is `wyhash`, and it has no `files`/`publishing.md` entries. The current checkout (scoped
-`@hrg/wyhash` import, `@hrg/wyhash >=1.2.0` peer, `files` whitelist, these docs) is **ahead of the published
-0.3.6**, so a 0.3.7 publish is needed to ship those changes. `@hrg/wyhash` 1.2.0 is already on npm.
+**0.3.7 is on npm and matches this checkout** (scoped `@hrg/wyhash` import, `@hrg/wyhash >=1.2.0` peer, `files`
+whitelist, `publishing.md`). `@hrg/wyhash` 1.2.0 is on npm. For a later release, bump `pom.xml`,
+`pom-release.xml`, `package.json` and `build.zig.zon` together, tag the commit, then:
 
 ```text
 bun test js
@@ -114,9 +113,8 @@ bun pm pack --dry-run
 npm publish
 ```
 
-Bump `pom.xml`, `pom-release.xml`, `package.json` and `build.zig.zon` together to `0.3.7` first, and tag the
-released commit. A live token that can publish to the `@hrg` scope is required; npm reports a `404` when a token
-cannot publish to a scope, which is a token problem rather than a missing package.
+A live token that can publish to the `@hrg` scope is required; npm reports a `404` when a token cannot publish to a
+scope, which is a token problem rather than a missing package.
 
 The wyhash JavaScript port is published as the scoped **`@hrg/wyhash`** package; the bare `wyhash` name on npm is an
 unrelated package by lemon-mint. `js/layout.mjs` imports `@hrg/wyhash`, and `package.json` declares it as an optional

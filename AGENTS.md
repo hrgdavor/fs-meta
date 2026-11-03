@@ -147,6 +147,5 @@ configurations in one run** rather than comparing two runs, and do not report a 
 - **The version is one version.** `pom.xml`, `package.json` and `build.zig.zon` must agree, and the tag must point at
   the released commit. `bun scripts/check-poms.mjs` checks all three; bump them together before a release.
 - **npm:** `package.json` is non-private with `publishConfig.access: public`. The optional hash peer is
-  **`@hrg/wyhash`** (1.2.0 is on npm; the bare `wyhash` name is an unrelated package). The published fs-meta 0.3.6
-  still imports the bare name, so a 0.3.7 npm release is needed to ship the scoped import and the `files` whitelist.
-  See [publishing.md](publishing.md).
+  **`@hrg/wyhash`** (1.2.0 is on npm; the bare `wyhash` name is an unrelated package). `0.3.7` is on npm with the
+  scoped import and the `files` whitelist. See [publishing.md](publishing.md).
