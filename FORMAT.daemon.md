@@ -263,11 +263,24 @@ such a root (§ 6), because a hook that writes a mailbox nobody reads is a trap.
 
 ### 2c. Each root schedules itself
 
-**There is no daemon-wide scheduler.** Every root owns a task that wakes every `tick_interval_ms` (100 ms) and
-checks *that* root: its idle deadline, its event burst, its wake. A batch belongs to one root, so its latency must
-not depend on the other roots: with one loop over every root, a slow pass — or worse, a client that stopped reading,
-which blocks the write into its socket — would put every other root's tick behind it, and therefore its batches.
-A pass holds only its own root's mutex, and a blocked write blocks only its own root.
+**There is no daemon-wide scheduler.** Every root owns a task that wakes on **its own `tick_ms`** and checks *that*
+root: its idle deadline, its event burst, its wake. The tick is per-root configuration (§ 3): **default 50 ms**,
+valid **5–1000 ms**, set with `root add --tick <ms>` or `root set <id> tick <ms>`, and reported as `tick_ms` in the
+root object (§ 4). A batch belongs to one root, so its latency must not depend on the other roots: with one loop over
+every root, a slow pass — or worse, a client that stopped reading, which blocks the write into its socket — would put
+every other root's tick behind it, and therefore its batches. A pass holds only its own root's mutex, and a blocked
+write blocks only its own root.
+
+The tick is an **upper bound on how long a due event waits**, not a publish deadline. The burst scheduler's own quiet
+period has a **25 ms floor** (`watch.zig`'s `min_delay_ms`): a save is published after that quiet period, and a tick
+below 25 ms only checks for the deadline more often. That is why the range starts at 5 rather than at 1 — below the
+quiet floor a faster tick buys nothing on a fast machine — and why a tick of 50 is less conservative than the 100 ms
+the daemon used to hard-code without being reckless: on a fast SSD and a small tree the pass itself is a few
+milliseconds, and the old constant was often the largest part of a save's latency.
+
+The tick is also what bounds the daemon's other per-root timer work: the idle deadline, the git latch poll, the hook
+spool read and the metadata watch are all looked at once per tick. A larger tick therefore trades batch latency for
+fewer wakeups; it never changes a trio byte.
 
 The cost is one sleeping task per root (a `Group` task, not a thread per connection), which is the price of that
 independence and is what makes the plan's `RootHost` seam honest: a root is already independent enough to become a
@@ -291,6 +304,7 @@ One document. `version`, an optional `defaults` block, and one record per root.
   "defaults": {
     "mode": "auto",
     "idle_timeout_ms": 300000,
+    "tick_ms": 50,
     "retention": { "max_batches": 32, "max_bytes": 67108864 },
     "on_remove": "keep",
     "worktrees": true,
@@ -303,6 +317,7 @@ One document. `version`, an optional `defaults` block, and one record per root.
       "root": "/home/u/projects/app",
       "mode": "auto",
       "idle_timeout_ms": 300000,
+      "tick_ms": 50,
       "retention": { "max_batches": 32, "max_bytes": 67108864 },
       "on_remove": "keep",
       "worktrees": true,
@@ -322,6 +337,7 @@ One document. `version`, an optional `defaults` block, and one record per root.
 | `root`            | the canonical root path. Host state, never trio content                                         |
 | `mode`            | `off`, `always` or `auto` (§ 2)                                                                 |
 | `idle_timeout_ms` | how long an `auto` root with no clients keeps watching; `0` = never sleep                       |
+| `tick_ms`         | how often this root's scheduler wakes to check its timers and event burst; default 50, range 5–1000 (§ 2c) |
 | `retention`       | `max_batches` and `max_bytes`, both enforced (§ 3a)                                             |
 | `on_remove`       | `keep` (default) or `delete`: what `root remove` does with the batch history (§ 3a)             |
 | `worktrees`       | the worktree handling switch (§ 5h); copied from `defaults` at add time                         |
@@ -332,9 +348,17 @@ One document. `version`, an optional `defaults` block, and one record per root.
 | `created_at`      | when the record was created, RFC3339 UTC                                                        |
 
 **Defaults are copied, not inherited.** `root add` writes the current `defaults` values into the new record, including
-the two switches and `on_worktree`. A later change to a default therefore never silently mutates an existing root. A
-record written before a field existed resolves it from `defaults`, or from the built-in default (`on` for the switches,
-`ignore` for `on_worktree`) when the default itself is absent.
+the two switches, `on_worktree` and `tick_ms`. A later change to a default therefore never silently mutates an existing
+root. A record written before a field existed resolves it from `defaults`, or from the built-in default (`on` for the
+switches, `ignore` for `on_worktree`, **50 ms** for `tick_ms`) when the default itself is absent — an old `roots.json`
+stays valid and serves with the documented tick, never with `0`.
+
+**`tick_ms` is a whole number of milliseconds in `5..1000`.** A value outside that range is a **malformed record**:
+it is reported and that root is skipped, exactly as an unreadable `mode` is — never silently clamped, because a
+tuning value nobody honours is worse than one that is refused with a reason. The same range is enforced at the edges
+(`--tick`, `root set <id> tick`), so a wrong value is caught before it reaches the file. `tick_ms` here is
+configuration, not the burst scheduler's quiet period: that one is measured from pass durations and keeps its own
+25 ms floor (§ 2c, [`doc/watch-mode.md`](doc/watch-mode.md)).
 
 **A malformed record is reported and skipped**, never fatal to the other roots: the daemon prints the reason, keeps
 serving what it can, and `fsmeta daemon status` lists the notes it collected.
@@ -372,17 +396,17 @@ first: `{"v":1,"cmd":…}`.
 A reply is one line: `{"v":1,"ok":true,…}` or `{"v":1,"ok":false,"code":N,"message":"…"}`. The `code` is the number
 the CLI exits with (§ 6), so the two halves of one contract are one table.
 
-| `cmd`              | fields                                                                                        | reply payload                                                            |
-| ------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `status`           | —                                                                                             | `pid`, `base`, `config`, `protocol`, `uptime_ms`, `roots`, `diagnostics` |
-| `roots`            | —                                                                                             | `roots`: an array of root objects                                        |
-| `root.add`         | `path`; optional `mode`, `idle_timeout_ms`, `retention`, `on_remove`, `worktrees`, `gitwatch`, `on_worktree`, `worktree`, `nested` | `root`: the new root object         |
-| `root.remove`      | `root`; optional `force`                                                                      | `removed`, `root`, `history`                                             |
-| `root.set`         | `root`; at least one of `mode`, `idle_timeout_ms`, `retention`, `worktrees`, `gitwatch`       | `root`                                                                   |
-| `root.sleep`       | `root`                                                                                        | `root`                                                                   |
-| `root.wake`        | `root`                                                                                        | `root`                                                                   |
-| `root.status`      | `root`                                                                                        | `root`                                                                   |
-| `daemon.shutdown`  | —                                                                                             | `message`                                                                |
+| `cmd`              | fields                                                                                             | reply payload                                                            |
+| ------------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `status`           | —                                                                                                  | `pid`, `base`, `config`, `protocol`, `uptime_ms`, `roots`, `diagnostics` |
+| `roots`            | —                                                                                                  | `roots`: an array of root objects                                        |
+| `root.add`         | `path`; optional `mode`, `idle_timeout_ms`, `tick_ms`, `retention`, `on_remove`, `worktrees`, `gitwatch`, `on_worktree`, `worktree`, `nested` | `root`: the new root object   |
+| `root.remove`      | `root`; optional `force`                                                                           | `removed`, `root`, `history`                                             |
+| `root.set`         | `root`; at least one of `mode`, `idle_timeout_ms`, `tick_ms`, `retention`, `worktrees`, `gitwatch` | `root`                                                                   |
+| `root.sleep`       | `root`                                                                                             | `root`                                                                   |
+| `root.wake`        | `root`                                                                                             | `root`                                                                   |
+| `root.status`      | `root`                                                                                             | `root`                                                                   |
+| `daemon.shutdown`  | —                                                                                                  | `message`                                                                |
 
 `root` is an id or a root path; both are accepted because a person types whichever they have.
 
@@ -481,6 +505,7 @@ is not repaired in place; the next `root add`/start reconciliation reports the f
   "reason": "idle",
   "clients": 0,
   "idle_timeout_ms": 300000,
+  "tick_ms": 50,
   "retention": { "max_batches": 32, "max_bytes": 67108864 },
   "on_remove": "keep",
   "socket": "/run/user/1000/fsmeta/roots/a1b2c3d4.sock",
@@ -518,6 +543,10 @@ is not repaired in place; the next `root add`/start reconciliation reports the f
 the root considers published; `passes`, `wakes`, `event_passes` and `safety_passes` are diagnostics, not protocol.
 `on_worktree` is the root's recorded discovery policy (`ignore` by default, `serve` to adopt); it is copied from
 `defaults` at add time like the two switches. `worktrees` and `gitwatch` are the root's effective switches.
+`tick_ms` is this root's **effective** scheduler tick: the record's `tick_ms` clamped to `5..1000` (§ 2c, § 3). It is
+present in every root object — `roots list --json` and `root status --json` both use this writer — so an operator can
+read the setting that is actually in force instead of a hand-edited `roots.json`. `root status` prints it as
+`idle <duration>, tick 50 ms, head batch …`.
 
 **`worktree` and `common_dir` are host state from the resolved git location.** `worktree` says the root is a linked
 worktree (`.git` is a gitfile) and `common_dir` is the `$GIT_COMMON_DIR` it shares with the other worktrees of its
@@ -652,12 +681,13 @@ fsmeta daemon start [--base <dir>] [--foreground]   # daemonize by default; --fo
 fsmeta daemon stop                                  # asks politely, then waits for the socket to go
 fsmeta daemon status [--json]                       # pid, base, roots, uptime, both switches, overrides, notes
 fsmeta roots list [--json] [--state watching,asleep]
-fsmeta root add <path> [--mode off|always|auto] [--idle 5m] [--keep-batches 32] [--max-bytes 64M]
+fsmeta root add <path> [--mode off|always|auto] [--idle 5m] [--tick 50] [--keep-batches 32] [--max-bytes 64M]
                        [--on-remove keep|delete] [--worktrees on|off] [--gitwatch on|off]
                        [--on-worktree ignore|serve] [--worktree] [--nested]
 fsmeta root remove <id|path> [--force]
 fsmeta root set <id> mode off|always|auto
 fsmeta root set <id> idle <duration>                # 0 = never sleep
+fsmeta root set <id> tick <ms>                      # scheduler check interval, 5..1000; live from the next wake
 fsmeta root set <id> keep-batches <n>
 fsmeta root set <id> worktrees on|off               # live: adoption/seed/events/removal; never the boundary rule
 fsmeta root set <id> gitwatch on|off                # live: releases/arms the metadata watch; clears the git fields
@@ -679,6 +709,13 @@ carries `worktree` and `common_dir` per root.
 
 Durations: `500ms`, `30s`, `10m`, `2h`, or a bare number of milliseconds; `0` means "never". Byte budgets:
 `1024`, `64K`, `64M`, `2G`.
+
+A **tick** is not a duration in that sense: `--tick <ms>` and `root set <id> tick <ms>` take a whole number of
+milliseconds in `5..1000` (default 50), and `0` is a refusal, not "never" — a tick of zero would spin. `root add
+--tick` records it (copied from `defaults` when omitted); `root set <id> tick` changes it live, and the scheduler
+picks the new value up at its next wake. `root status` prints `idle <duration>, tick <n> ms, head batch …`, and
+`--json` carries `tick_ms` (§ 4). It controls how often **that root's** scheduler checks its timers and event burst;
+the burst scheduler's own 25 ms quiet floor still applies (§ 2c).
 
 ### 6a. Hooks: what the commands write, and what they refuse
 

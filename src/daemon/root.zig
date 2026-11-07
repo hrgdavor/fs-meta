@@ -111,15 +111,6 @@ const PassKind = enum {
     }
 };
 
-/// How often a root's own scheduler wakes to check its idle deadline and its event burst.
-///
-/// **Each root has its own scheduler task**, not one loop over every root. A batch belongs to one root, and its
-/// latency must not depend on what the other roots are doing: with a shared loop, a slow scan (or a stuck socket
-/// write) in one root delayed every other root's tick — and so its batches. A task per root costs one sleeping
-/// thread each, which is what `Group` is for, and it makes the plan's `RootHost` seam honest: a root is already
-/// independent enough to become a child process later.
-pub const tick_interval_ms: u64 = 100;
-
 /// What a client sees about a root, without the lock held. Plain data: the daemon formats it as JSON, and a
 /// test asserts the fields rather than parsing the wire.
 pub const Snapshot = struct {
@@ -130,6 +121,9 @@ pub const Snapshot = struct {
     reason: state.Reason,
     clients: u32,
     idle_timeout_ms: u64,
+    /// The root's effective scheduler tick, in milliseconds: its record's `tick_ms`, clamped to the registry's range.
+    /// A tuning value, not a protocol field — it says how often this root's task checks its timers and event burst.
+    tick_ms: u64 = registry.default_tick_ms,
     retention: registry.Retention,
     on_remove: registry.OnRemove,
     /// The root's discovery policy for worktrees of its repository (`plans/worktrees.md` § 5, M6).
@@ -610,7 +604,7 @@ pub const RootRuntime = struct {
         self.syncWatcherLocked();
 
         try self.group.concurrent(io, acceptLoop, .{self});
-        // The root's own scheduler: its timer, its idle deadline, its event bursts. See `tick_interval_ms`.
+        // The root's own scheduler: its timer, its idle deadline, its event bursts. See `schedulerTickMs`.
         try self.group.concurrent(io, scheduleLoop, .{self});
     }
 
@@ -696,6 +690,7 @@ pub const RootRuntime = struct {
             .reason = self.machine.reason,
             .clients = self.machine.clients,
             .idle_timeout_ms = self.machine.idle_timeout_ms,
+            .tick_ms = self.schedulerTickMs(),
             .retention = self.record.retention,
             .on_remove = self.record.on_remove,
             .on_worktree = self.record.on_worktree,
@@ -783,6 +778,19 @@ pub const RootRuntime = struct {
         self.record.idle_timeout_ms = idle_timeout_ms;
         self.machine.setIdleTimeout(idle_timeout_ms, now_ms);
         self.broadcastState();
+    }
+
+    /// Change this root's scheduler tick (`root set <id> tick <ms>`).
+    ///
+    /// `scheduleLoop` reads `schedulerTickMs` at the top of every iteration, so the new value is in force from the
+    /// next wake — no task is restarted and no watcher is touched. The tick is not part of a `STATE` frame (it is a
+    /// scheduling choice, not an observable state), so nothing is broadcast; the caller's snapshot reports it.
+    /// Validation is `registry.isValidTick`'s; a value outside the range never reaches here (the CLI and the host
+    /// both refuse it), and `schedulerTickMs` clamps as a last line of defence.
+    pub fn setTick(self: *RootRuntime, tick_ms: u64, budget_ms: i64) Busy!void {
+        if (!self.lockWithin(budget_ms)) return error.Busy;
+        defer self.unlock();
+        self.record.tick_ms = tick_ms;
     }
 
     pub fn setRetention(self: *RootRuntime, retention: registry.Retention, budget_ms: i64) Busy!void {
@@ -908,6 +916,26 @@ pub const RootRuntime = struct {
     }
 
     // ---------------------------------------------------------------- the scheduler
+
+    /// The tick this root's scheduler actually sleeps: its record's `tick_ms`, clamped to the registry's range.
+    ///
+    /// **Each root has its own scheduler task**, not one loop over every root. A batch belongs to one root, and its
+    /// latency must not depend on what the other roots are doing: with a shared loop, a slow scan (or a stuck socket
+    /// write) in one root delayed every other root's tick — and so its batches. A task per root costs one sleeping
+    /// thread each, which is what `Group` is for, and it makes the plan's `RootHost` seam honest: a root is already
+    /// independent enough to become a child process later. The tick is the per-root knob for that task.
+    ///
+    /// The default (50 ms) and the 5..1000 ms range live in `registry.zig` beside the field they describe; a record
+    /// that predates the field reads that default. The burst scheduler's own 25 ms quiet floor (`watch.zig`) still
+    /// applies, so a smaller tick checks sooner without publishing sooner than the floor allows.
+    ///
+    /// Read at the top of **every** `scheduleStep`, so `root set <id> tick` takes effect at the next wake without
+    /// rebuilding the task; the clamp is defence for a record built in code (or by a future version), not the
+    /// validation path — `registry` refuses an out-of-range `tick_ms` in `roots.json` and the CLI refuses one typed
+    /// on the command line.
+    pub fn schedulerTickMs(self: *const RootRuntime) u64 {
+        return std.math.clamp(self.record.tick_ms, registry.min_tick_ms, registry.max_tick_ms);
+    }
 
     /// One scheduler step for **this** root, driven by this root's own task.
     ///
@@ -1869,12 +1897,20 @@ pub const RootRuntime = struct {
     /// The root's scheduler task: sleep, check, repeat. It ends when `stopping` is set, which is what lets
     /// `deinit` wait for it without cancelling a blocked `accept` (see `deinit`).
     fn scheduleLoop(self: *RootRuntime) void {
-        const io = self.io;
-        while (true) {
-            io.sleep(.fromMilliseconds(tick_interval_ms), .real) catch return; // only `Canceled`
-            if (self.stopping.load(.acquire)) return;
-            self.tick(nowMs(io));
-        }
+        while (self.scheduleStep()) {}
+    }
+
+    /// One turn of the scheduler: sleep this root's tick, notice a stop, run one `tick`. `false` ends the loop —
+    /// a cancelled sleep and a stopping root both mean "there is no next turn".
+    ///
+    /// The sleep duration is read **inside** the loop, not captured before it: a `root set <id> tick` therefore
+    /// applies to the next wake with no task restart, and a root can be tuned without losing its watcher or its
+    /// subscribers.
+    fn scheduleStep(self: *RootRuntime) bool {
+        self.io.sleep(.fromMilliseconds(@intCast(self.schedulerTickMs())), .real) catch return false; // only `Canceled`
+        if (self.stopping.load(.acquire)) return false;
+        self.tick(nowMs(self.io));
+        return true;
     }
 
     /// Accept forever. The listener belongs to the root; a connection gets its own task so that one slow
@@ -2261,6 +2297,38 @@ test "a pass kind maps to the wire's reason table without inventing a value" {
     try testing.expectEqual(state.Reason.watcher, PassKind.safety.reason(.client));
     try testing.expectEqual(state.Reason.client, PassKind.wake.reason(.client));
     try testing.expectEqual(state.Reason.none, PassKind.scan.reason(.control));
+}
+
+test "a root's scheduler wakes on its own tick, not one global constant" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+
+    // A record that never heard of `tick_ms` reads the documented default, not 0 and not the retired 100.
+    try testing.expectEqual(registry.default_tick_ms, runtime.record.tick_ms);
+    try testing.expectEqual(@as(u64, 50), runtime.schedulerTickMs());
+
+    // A smaller tick really is what one turn of the loop sleeps. The bound is wide (a 5 ms sleep must finish well
+    // under the retired 100 ms constant), because this asserts the *source* of the duration, not a stopwatch.
+    runtime.record.tick_ms = 5;
+    try testing.expectEqual(@as(u64, 5), runtime.schedulerTickMs());
+    const started_ns = std.Io.Clock.real.now(io).nanoseconds;
+    try testing.expect(runtime.scheduleStep());
+    const elapsed_ms = @divTrunc(std.Io.Clock.real.now(io).nanoseconds - started_ns, std.time.ns_per_ms);
+    try testing.expect(elapsed_ms >= 4);
+    try testing.expect(elapsed_ms < 90);
+
+    // Out of range is clamped here, so a record built in code can never spin at 0 ms or sleep for an hour.
+    runtime.record.tick_ms = 0;
+    try testing.expectEqual(registry.min_tick_ms, runtime.schedulerTickMs());
+    runtime.record.tick_ms = 3_600_000;
+    try testing.expectEqual(registry.max_tick_ms, runtime.schedulerTickMs());
 }
 
 // ---------------------------------------------------------------- SUBSCRIBE filter on the daemon socket

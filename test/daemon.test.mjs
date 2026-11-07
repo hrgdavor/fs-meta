@@ -860,6 +860,60 @@ describe('the daemon, over its control socket and its per-root sockets', () => {
   );
 
   unixTest(
+    'a per-root tick is recorded, validated, persisted and reported',
+    async () => {
+      const m = machine();
+      writeFileSync(join(m.root, 'a.txt'), 'one\n');
+      const daemon = startDaemon(m);
+      try {
+        await waitForDaemon(m);
+
+        // `root add --tick` records the value, and the root object reports the effective one (`roots list --json`
+        // and `root status --json` share the snapshot writer).
+        const id = addRoot(m, m.root, '--tick', '5');
+        expect(rootById(m, id).tick_ms).toBe(5);
+        expect(cliOk(m, 'root', 'status', id).out).toContain('tick 5 ms');
+
+        // The durable list carries it per root, so a restart serves the same tick rather than the default.
+        const listFile = join(m.config, 'fsmeta', 'roots.json');
+        const recordOf = () => JSON.parse(readFileSync(listFile, 'utf8')).roots.find((record) => record.id === id);
+        expect(recordOf().tick_ms).toBe(5);
+        expect(JSON.parse(readFileSync(listFile, 'utf8')).defaults.tick_ms).toBe(50);
+
+        // A live change is applied to the running root at once and written to the durable record.
+        cliOk(m, 'root', 'set', id, 'tick', '200');
+        expect(rootById(m, id).tick_ms).toBe(200);
+        expect(recordOf().tick_ms).toBe(200);
+        expect(cliOk(m, 'root', 'status', id).out).toContain('tick 200 ms');
+
+        // Out of range is a refusal that names the range, on both commands, and changes nothing.
+        for (const args of [
+          ['root', 'set', id, 'tick', '0'],
+          ['root', 'set', id, 'tick', '1001'],
+          ['root', 'set', id, 'tick', 'soon'],
+        ]) {
+          const refusal = cli(m, ...args);
+          expect({ args, code: refusal.code }).toEqual({ args, code: 1 });
+          expect(refusal.text).toContain('between 5 and 1000');
+        }
+        expect(rootById(m, id).tick_ms).toBe(200);
+
+        const other = join(m.home, 'other');
+        mkdirSync(other, { recursive: true });
+        const addRefusal = cli(m, 'root', 'add', other, '--tick', '5000');
+        expect(addRefusal.code).toBe(1);
+        expect(addRefusal.text).toContain('between 5 and 1000');
+        expect(roots(m)).toHaveLength(1);
+      } catch (error) {
+        throw new Error(`${error.message}\ndaemon output:\n${daemon.output.text}`);
+      } finally {
+        await stopDaemon(daemon);
+      }
+    },
+    60000,
+  );
+
+  unixTest(
     'a watching root is driven by events, not by the clock',
     async () => {
       const m = machine();

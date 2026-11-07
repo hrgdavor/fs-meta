@@ -20,11 +20,11 @@
 //! ## Scheduling belongs to the root, not to the host
 //!
 //! There is no daemon-wide scheduler task. Each root owns its own: a sleeping thread that wakes every
-//! `root.tick_interval_ms` and checks that root's idle deadline and event burst. A batch belongs to one root, so
-//! its latency must not depend on another root's scan — with one loop over every root, a slow pass (or a client
-//! that stopped reading) in one root delayed every other root's tick, and therefore its batches. Root lifecycles
-//! (add, remove, mode changes) happen on the control task, so the root list has its own mutex — never held across
-//! a socket write, and never taken while a root's mutex is held.
+//! `root.schedulerTickMs` — that root's recorded `tick_ms`, default 50 ms — and checks that root's idle deadline and
+//! event burst. A batch belongs to one root, so its latency must not depend on another root's scan — with one loop
+//! over every root, a slow pass (or a client that stopped reading) in one root delayed every other root's tick, and
+//! therefore its batches. Root lifecycles (add, remove, mode changes) happen on the control task, so the root list
+//! has its own mutex — never held across a socket write, and never taken while a root's mutex is held.
 
 const std = @import("std");
 const batch_mod = @import("../batch.zig");
@@ -565,6 +565,19 @@ pub const Host = struct {
             return;
         };
 
+        // A tuning value is validated before anything is created or written, so a refused add has no side effect.
+        // The CLI checks the same range; a raw control client is not trusted to have done it.
+        if (request.tick_ms) |tick_ms| {
+            if (!registry.isValidTick(tick_ms)) {
+                const message = try std.fmt.allocPrint(
+                    self.arena,
+                    "tick_ms must be between {d} and {d}", .{ registry.min_tick_ms, registry.max_tick_ms },
+                );
+                try refuse(writer, control.Exit.failure, message);
+                return;
+            }
+        }
+
         const canonical = paths.canonicalRoot(io, self.arena, locator) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => {
                 const message = try std.fmt.allocPrint(self.arena, "no such directory: {s}", .{locator});
@@ -592,6 +605,7 @@ pub const Host = struct {
         var overrides = self.registry.defaults;
         if (request.mode) |mode| overrides.mode = mode;
         if (request.idle_timeout_ms) |value| overrides.idle_timeout_ms = value;
+        if (request.tick_ms) |value| overrides.tick_ms = value;
         if (request.retention) |value| overrides.retention = value;
         if (request.on_remove) |value| overrides.on_remove = value;
         if (request.worktrees) |value| overrides.worktrees = value;
@@ -951,11 +965,22 @@ pub const Host = struct {
 
     fn setRootLocked(self: *Host, index: usize, request: control.Request, now: i64, writer: *std.Io.Writer) !void {
         const io = self.io;
-        if (request.mode == null and request.idle_timeout_ms == null and request.retention == null and
-            request.worktrees == null and request.gitwatch == null)
+        if (request.mode == null and request.idle_timeout_ms == null and request.tick_ms == null and
+            request.retention == null and request.worktrees == null and request.gitwatch == null)
         {
-            try refuse(writer, control.Exit.failure, "root.set needs one of \"mode\", \"idle_timeout_ms\", \"retention\", \"worktrees\" or \"gitwatch\"");
+            try refuse(writer, control.Exit.failure, "root.set needs one of \"mode\", \"idle_timeout_ms\", \"tick_ms\", \"retention\", \"worktrees\" or \"gitwatch\"");
             return;
+        }
+        // Validate before mutating: a refusal must leave the record and the runtime exactly as they were.
+        if (request.tick_ms) |tick_ms| {
+            if (!registry.isValidTick(tick_ms)) {
+                const message = try std.fmt.allocPrint(
+                    self.arena,
+                    "tick_ms must be between {d} and {d}", .{ registry.min_tick_ms, registry.max_tick_ms },
+                );
+                try refuse(writer, control.Exit.failure, message);
+                return;
+            }
         }
         const runtime = self.roots.items[index];
 
@@ -978,6 +1003,13 @@ pub const Host = struct {
                 return;
             };
             self.registry.records.items[registry_index].idle_timeout_ms = value;
+        }
+        if (request.tick_ms) |value| {
+            runtime.setTick(value, control.Budget.mutation) catch {
+                try refuseBusy(writer, self.arena, runtime.record.id);
+                return;
+            };
+            self.registry.records.items[registry_index].tick_ms = value;
         }
         if (request.retention) |value| {
             runtime.setRetention(value, control.Budget.mutation) catch {
@@ -1044,6 +1076,7 @@ pub const Host = struct {
             .root = runtime.record.root,
             .mode = runtime.record.mode,
             .idle_timeout_ms = runtime.record.idle_timeout_ms,
+            .tick_ms = runtime.record.tick_ms,
             .retention = runtime.record.retention,
             .on_remove = runtime.record.on_remove,
             .socket = runtime.record.socket,
@@ -1253,6 +1286,9 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: root_mod.Snapshot) !void 
     try control.stringField(writer, "reason", snapshot.reason.name());
     try control.intField(writer, "clients", snapshot.clients);
     try control.intField(writer, "idle_timeout_ms", snapshot.idle_timeout_ms);
+    // The root's scheduler tick: how often its own task checks timers and its event burst. A tuning value, reported
+    // so an operator can see the effective setting rather than reading `roots.json` and guessing at a clamp.
+    try control.intField(writer, "tick_ms", snapshot.tick_ms);
     try writer.writeAll(",\"retention\":{");
     try writer.print("\"max_batches\":{d},\"max_bytes\":{d}", .{ snapshot.retention.max_batches, snapshot.retention.max_bytes });
     try writer.writeByte('}');
@@ -1350,6 +1386,7 @@ fn sampleSnapshot() root_mod.Snapshot {
         .reason = .idle,
         .clients = 0,
         .idle_timeout_ms = 300_000,
+        .tick_ms = 50,
         .retention = .{ .max_batches = 32, .max_bytes = 64 * 1024 * 1024 },
         .on_remove = .keep,
         .on_worktree = .ignore,
@@ -1398,6 +1435,9 @@ test "a snapshot reply is valid JSON with the documented field names" {
     try testing.expectEqual(@as(i64, 7), root.get("last_pass_hashed").?.integer);
     try testing.expectEqual(@as(i64, 512 * 1024), root.get("last_pass_batch_bytes").?.integer);
     try testing.expectEqual(false, root.get("missing").?.bool);
+    // The scheduler tick is a per-root tuning field, present in every root object (both `roots list --json` and
+    // `root status --json` use this writer), so a caller never has to read `roots.json` for it.
+    try testing.expectEqual(@as(i64, 50), root.get("tick_ms").?.integer);
     try testing.expectEqual(@as(i64, 32), root.get("retention").?.object.get("max_batches").?.integer);
     try testing.expectEqualStrings("keep", root.get("on_remove").?.string);
     try testing.expect(std.mem.endsWith(u8, out.written(), "\n"));

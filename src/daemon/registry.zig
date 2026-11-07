@@ -3,7 +3,7 @@
 //! The durable root list: `roots.json` in the user home.
 //!
 //! This file is **configuration**, not host state. It holds the roots a person chose to serve, their mode,
-//! idle timeout, retention and removal policy — the things that survive a reboot, a crashed daemon and an
+//! idle timeout, scheduler tick, retention and removal policy — the things that survive a reboot, a crashed daemon and an
 //! emptied runtime directory. Sockets, pids and logs are facts about a running process on one machine and
 //! live in the runtime directory instead (`paths.zig`).
 //!
@@ -32,6 +32,31 @@ const paths = @import("paths.zig");
 
 /// How many generations of `batches/` one root retains. The format's own default (FORMAT.md § 17.6).
 pub const default_max_batches: u64 = 32;
+
+/// How often a root's own scheduler wakes, in milliseconds, and the range a record may choose.
+///
+/// The tick is a *tuning* knob, not a protocol one: it decides how soon a root notices that its event burst is
+/// over, or that its idle deadline passed. It cannot make a batch earlier than the burst scheduler's own quiet
+/// floor (`watch.zig`'s `min_delay_ms`, 25 ms), so a tick below that only checks more often; and it cannot starve a
+/// root, because the tick is also the interval at which timers, the hook spool and the git latch are looked at.
+///
+/// The default is deliberately less conservative than the 100 ms the daemon used to hard-code: on a fast SSD and a
+/// small tree a pass costs a few milliseconds, and 100 ms was often the largest part of a save's latency.
+pub const default_tick_ms: u64 = 50;
+
+/// The shortest tick a record may choose. Below this the scheduler would wake more often than a normal pass costs,
+/// spending a core to shave milliseconds off a batch that the 25 ms quiet floor delays anyway.
+pub const min_tick_ms: u64 = 5;
+
+/// The longest tick a record may choose. A slower tick trades latency for wakeups; past a second, the daemon's own
+/// timer checks (the git latch, the hook spool, the idle deadline) stop feeling like "on time".
+pub const max_tick_ms: u64 = 1000;
+
+/// Whether `tick_ms` is inside the documented range. Out of range is a malformed record, reported and skipped, never
+/// silently clamped in `roots.json`: a tuning value nobody honours is worse than one that is refused with a reason.
+pub fn isValidTick(tick_ms: u64) bool {
+    return tick_ms >= min_tick_ms and tick_ms <= max_tick_ms;
+}
 
 /// The byte ceiling on one root's batch archive: 64 MiB. Count alone is a poor ceiling — thirty-two
 /// generations of a huge tree can fill a disk — and bytes alone is a poor one too, because a hundred tiny
@@ -91,6 +116,9 @@ pub const OnWorktree = enum {
 pub const Defaults = struct {
     mode: state.Mode = .auto,
     idle_timeout_ms: u64 = state.default_idle_timeout_ms,
+    /// How often this root's scheduler wakes, in milliseconds (`root.zig`'s `scheduleLoop`). Copied into the record
+    /// at add time like every other default; `min_tick_ms`..`max_tick_ms` is the range.
+    tick_ms: u64 = default_tick_ms,
     retention: Retention = .{},
     on_remove: OnRemove = .keep,
     /// Worktree handling for this root (`plans/worktrees.md` § 5h): adoption, seeding, worktree events and the
@@ -110,6 +138,9 @@ pub const Record = struct {
     root: []const u8,
     mode: state.Mode,
     idle_timeout_ms: u64,
+    /// This root's scheduler tick, in milliseconds. A record written before the field existed reads the default,
+    /// exactly as an old list reads the switches from `defaults` or `true`.
+    tick_ms: u64 = default_tick_ms,
     retention: Retention,
     on_remove: OnRemove,
     /// The effective worktree/gitwatch flags for this root, copied from `Defaults` at add time. A record written
@@ -179,6 +210,7 @@ pub const Registry = struct {
             .root = try self.allocator.dupe(u8, canonical_root),
             .mode = overrides.mode,
             .idle_timeout_ms = overrides.idle_timeout_ms,
+            .tick_ms = overrides.tick_ms,
             .retention = overrides.retention,
             .on_remove = overrides.on_remove,
             .worktrees = overrides.worktrees,
@@ -310,6 +342,7 @@ pub const Registry = struct {
         try writer.writeAll("    \"mode\": ");
         try writeString(writer, self.defaults.mode.name());
         try writer.print(",\n    \"idle_timeout_ms\": {d},\n", .{self.defaults.idle_timeout_ms});
+        try writer.print("    \"tick_ms\": {d},\n", .{self.defaults.tick_ms});
         try writer.print("    \"retention\": {{ \"max_batches\": {d}, \"max_bytes\": {d} }},\n", .{
             self.defaults.retention.max_batches,
             self.defaults.retention.max_bytes,
@@ -353,6 +386,7 @@ fn writeRecord(writer: *std.Io.Writer, record: Record, indent: []const u8) !void
     try writer.writeAll("  \"mode\": ");
     try writeString(writer, record.mode.name());
     try writer.print(",\n{s}  \"idle_timeout_ms\": {d},\n", .{ indent, record.idle_timeout_ms });
+    try writer.print("{s}  \"tick_ms\": {d},\n", .{ indent, record.tick_ms });
     try writer.print("{s}  \"retention\": {{ \"max_batches\": {d}, \"max_bytes\": {d} }},\n", .{
         indent,
         record.retention.max_batches,
@@ -412,6 +446,7 @@ const ParseError = error{
     MissingField,
     WrongType,
     InvalidMode,
+    InvalidTick,
     InvalidRetention,
     InvalidOnRemove,
     InvalidOnWorktree,
@@ -428,6 +463,11 @@ fn parseDefaults(object: *const std.json.ObjectMap) ParseError!Defaults {
     }
     if (object.get("idle_timeout_ms")) |value| {
         defaults.idle_timeout_ms = unsigned(value) orelse return error.WrongType;
+    }
+    if (object.get("tick_ms")) |value| {
+        const tick_ms = unsigned(value) orelse return error.WrongType;
+        if (!isValidTick(tick_ms)) return error.InvalidTick;
+        defaults.tick_ms = tick_ms;
     }
     if (object.get("retention")) |value| {
         defaults.retention = parseRetention(value) orelse return error.InvalidRetention;
@@ -497,6 +537,7 @@ fn parseRecord(object: *const std.json.ObjectMap) ParseError!Record {
         .root = root_path,
         .mode = .auto,
         .idle_timeout_ms = state.default_idle_timeout_ms,
+        .tick_ms = default_tick_ms,
         .retention = .{},
         .on_remove = .keep,
         .worktrees = true,
@@ -512,6 +553,11 @@ fn parseRecord(object: *const std.json.ObjectMap) ParseError!Record {
     }
     if (object.get("idle_timeout_ms")) |value| {
         record.idle_timeout_ms = unsigned(value) orelse return error.WrongType;
+    }
+    if (object.get("tick_ms")) |value| {
+        const tick_ms = unsigned(value) orelse return error.WrongType;
+        if (!isValidTick(tick_ms)) return error.InvalidTick;
+        record.tick_ms = tick_ms;
     }
     if (object.get("retention")) |value| {
         record.retention = parseRetention(value) orelse return error.InvalidRetention;
@@ -556,6 +602,7 @@ test "a written list reads back with every field intact" {
     registry.defaults = .{
         .mode = .always,
         .idle_timeout_ms = 1_000,
+        .tick_ms = 12,
         .on_remove = .delete,
         .retention = .{ .max_batches = 4, .max_bytes = 1024 },
         .worktrees = false,
@@ -565,6 +612,7 @@ test "a written list reads back with every field intact" {
     try registry.add("/home/u/app", "a1b2c3d4", "/run/user/1000/fsmeta/roots/a1b2c3d4.sock", .{
         .mode = .auto,
         .idle_timeout_ms = 300_000,
+        .tick_ms = 8,
         .retention = .{ .max_batches = 32, .max_bytes = 64 * 1024 * 1024 },
         .on_remove = .keep,
         .worktrees = false,
@@ -573,6 +621,7 @@ test "a written list reads back with every field intact" {
     try registry.add("/home/u/lib", "deadbeef", "/run/user/1000/fsmeta/roots/deadbeef.sock", .{
         .mode = .off,
         .idle_timeout_ms = 0,
+        .tick_ms = 1_000,
         .retention = .{ .max_batches = 8, .max_bytes = 4096 },
         .on_remove = .delete,
         .worktrees = true,
@@ -588,6 +637,7 @@ test "a written list reads back with every field intact" {
     // The defaults block survives too, so a later add copies what the person configured, not a built-in.
     try testing.expectEqual(state.Mode.always, loaded.defaults.mode);
     try testing.expectEqual(@as(u64, 1_000), loaded.defaults.idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 12), loaded.defaults.tick_ms);
     try testing.expectEqual(OnRemove.delete, loaded.defaults.on_remove);
     try testing.expectEqual(false, loaded.defaults.worktrees);
     try testing.expectEqual(true, loaded.defaults.gitwatch);
@@ -597,6 +647,7 @@ test "a written list reads back with every field intact" {
     try testing.expectEqualStrings("/home/u/app", first.root);
     try testing.expectEqual(state.Mode.auto, first.mode);
     try testing.expectEqual(@as(u64, 300_000), first.idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 8), first.tick_ms);
     try testing.expectEqual(@as(u64, 32), first.retention.max_batches);
     try testing.expectEqual(@as(u64, 64 * 1024 * 1024), first.retention.max_bytes);
     try testing.expectEqual(OnRemove.keep, first.on_remove);
@@ -609,6 +660,7 @@ test "a written list reads back with every field intact" {
     const second = loaded.records.items[1];
     try testing.expectEqual(state.Mode.off, second.mode);
     try testing.expectEqual(@as(u64, 0), second.idle_timeout_ms);
+    try testing.expectEqual(@as(u64, 1_000), second.tick_ms);
     try testing.expectEqual(OnRemove.delete, second.on_remove);
     try testing.expectEqual(true, second.worktrees);
     try testing.expectEqual(false, second.gitwatch);
@@ -617,6 +669,9 @@ test "a written list reads back with every field intact" {
     defer arena.free(bytes);
     try testing.expect(std.mem.indexOf(u8, bytes, "\"version\": 1") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "\"roots\": [") != null);
+    // The tick is written in both blocks, so a round-trip never falls back to the default by accident.
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"tick_ms\": 12") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"tick_ms\": 8") != null);
 }
 
 test "a missing file is a valid empty list, not an error" {
@@ -673,6 +728,61 @@ test "a malformed record is reported and skipped, and the good ones still load" 
     try testing.expectEqual(true, registry.records.items[0].worktrees);
     try testing.expectEqual(true, registry.records.items[0].gitwatch);
     try testing.expectEqual(true, registry.records.items[1].worktrees);
+    // A record written before `tick_ms` existed reads the documented default, never 0 (which would spin).
+    try testing.expectEqual(default_tick_ms, registry.records.items[0].tick_ms);
+}
+
+test "tick_ms: absent is the default, the range is enforced, and a bad value skips its own record" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The range is one rule, so the test pins both ends and both just-outside values.
+    try testing.expect(isValidTick(min_tick_ms));
+    try testing.expect(isValidTick(max_tick_ms));
+    try testing.expect(!isValidTick(min_tick_ms - 1));
+    try testing.expect(!isValidTick(max_tick_ms + 1));
+    try testing.expectEqual(@as(u64, 50), default_tick_ms);
+
+    const path = try scratchPath(arena, tmp.dir, io, "roots.json");
+    const document =
+        \\{"version":1,"defaults":{"mode":"auto","tick_ms":20},
+        \\ "roots":[
+        \\   {"id":"11111111","root":"/home/u/absent"},
+        \\   {"id":"22222222","root":"/home/u/low","tick_ms":5},
+        \\   {"id":"33333333","root":"/home/u/high","tick_ms":1000},
+        \\   {"id":"44444444","root":"/home/u/zero","tick_ms":0},
+        \\   {"id":"55555555","root":"/home/u/over","tick_ms":1001},
+        \\   {"id":"66666666","root":"/home/u/text","tick_ms":"50"}
+        \\ ]}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "roots.json", .data = document });
+
+    var registry = Registry.init(arena, path);
+    defer registry.deinit();
+    try registry.load(io);
+
+    // The defaults block keeps the chosen value, so a later add copies it rather than the built-in.
+    try testing.expectEqual(@as(u64, 20), registry.defaults.tick_ms);
+    // Three records load; the three with an absent or valid tick are the ones kept.
+    try testing.expectEqual(@as(usize, 3), registry.records.items.len);
+    try testing.expectEqual(@as(usize, 3), registry.diagnostics.items.len);
+    try testing.expectEqualStrings("11111111", registry.records.items[0].id);
+    try testing.expectEqual(default_tick_ms, registry.records.items[0].tick_ms);
+    try testing.expectEqualStrings("22222222", registry.records.items[1].id);
+    try testing.expectEqual(@as(u64, 5), registry.records.items[1].tick_ms);
+    try testing.expectEqualStrings("33333333", registry.records.items[2].id);
+    try testing.expectEqual(@as(u64, 1000), registry.records.items[2].tick_ms);
+    // The rejected ones say why: out-of-range is `InvalidTick`, a non-number is `WrongType`. Both name the record
+    // index, so an operator can find the line without guessing.
+    try testing.expect(std.mem.indexOf(u8, registry.diagnostics.items[0], "skipped") != null);
+    try testing.expect(std.mem.indexOf(u8, registry.diagnostics.items[0], "InvalidTick") != null);
+    try testing.expect(std.mem.indexOf(u8, registry.diagnostics.items[1], "InvalidTick") != null);
+    try testing.expect(std.mem.indexOf(u8, registry.diagnostics.items[2], "WrongType") != null);
 }
 
 test "a save replaces the whole document and leaves no temporary behind" {

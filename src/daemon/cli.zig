@@ -39,12 +39,13 @@ pub const usage =
     \\  fsmeta daemon status [--json]
     \\  fsmeta roots list [--json] [--state watching,asleep]
     \\  fsmeta root add <path> [--mode off|always|auto] [--idle <duration>]
-    \\                         [--keep-batches <n>] [--max-bytes <bytes>] [--on-remove keep|delete]
+    \\                         [--tick <ms>] [--keep-batches <n>] [--max-bytes <bytes>] [--on-remove keep|delete]
     \\                         [--worktrees on|off] [--gitwatch on|off] [--on-worktree ignore|serve]
     \\                         [--worktree] [--nested]
     \\  fsmeta root remove <id|path> [--force]
     \\  fsmeta root set <id> mode off|always|auto
     \\  fsmeta root set <id> idle <duration>
+    \\  fsmeta root set <id> tick <ms>
     \\  fsmeta root set <id> keep-batches <n>
     \\  fsmeta root set <id> worktrees on|off
     \\  fsmeta root set <id> gitwatch on|off
@@ -64,6 +65,9 @@ pub const usage =
     \\root; it is still hidden from every served parent, and the reply says the intent was acknowledged.
     \\
     \\durations: 500ms, 30s, 10m, 0 (0 = never sleep)
+    \\tick: a whole number of milliseconds, 5..1000 (default 50): how often this root's scheduler checks its timers and
+    \\event burst. A smaller tick shortens a save's wait for the next check; the scheduler's own 25 ms quiet floor
+    \\still applies, so it cannot publish sooner than that.
     \\environment: FSMETA_RUNTIME_DIR, FSMETA_CONFIG_HOME (tests and containers); FSMETA_WORKTREES=0 and
     \\FSMETA_GITWATCH=0 at `daemon start` override both switches for every root of that daemon
     \\
@@ -77,6 +81,8 @@ const Args = struct {
     force: bool = false,
     mode: ?[]const u8 = null,
     idle: ?[]const u8 = null,
+    /// `root add --tick <ms>`: this root's scheduler tick, in whole milliseconds (not a duration).
+    tick: ?[]const u8 = null,
     keep_batches: ?[]const u8 = null,
     max_bytes: ?[]const u8 = null,
     on_remove: ?[]const u8 = null,
@@ -128,6 +134,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Args {
             parsed.mode = try valueArg(args, &index);
         } else if (std.mem.eql(u8, arg, "--idle")) {
             parsed.idle = try valueArg(args, &index);
+        } else if (std.mem.eql(u8, arg, "--tick")) {
+            parsed.tick = try valueArg(args, &index);
         } else if (std.mem.eql(u8, arg, "--keep-batches")) {
             parsed.keep_batches = try valueArg(args, &index);
         } else if (std.mem.eql(u8, arg, "--max-bytes")) {
@@ -661,6 +669,10 @@ fn rootAdd(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: Arg
         const value = parseDuration(idle) orelse return fail(io, "--idle needs a duration such as 500ms, 30s, 10m or 0", .{});
         try writer.print(",\"idle_timeout_ms\":{d}", .{value});
     }
+    if (args.tick) |tick| {
+        const value = parseTick(tick) orelse return fail(io, "{s}", .{tickRefusal("--tick")});
+        try writer.print(",\"tick_ms\":{d}", .{value});
+    }
     if (args.keep_batches != null or args.max_bytes != null) {
         try writer.writeAll(",\"retention\":{");
         var first = true;
@@ -733,9 +745,9 @@ fn rootRemove(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: 
 }
 
 fn rootSet(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: Args) !void {
-    // `fsmeta root set <id> mode <value>` / `... idle <duration> / ... keep-batches <n>` / `... worktrees on|off`
-    // / `... gitwatch on|off`: two words, one setting.
-    if (args.positional.items.len < 4) return fail(io, "root set needs <id> <mode|idle|keep-batches|worktrees|gitwatch> <value>\n{s}", .{usage});
+    // `fsmeta root set <id> mode <value>` / `... idle <duration> / ... tick <ms> / ... keep-batches <n>` /
+    // `... worktrees on|off` / `... gitwatch on|off`: two words, one setting.
+    if (args.positional.items.len < 4) return fail(io, "root set needs <id> <mode|idle|tick|keep-batches|worktrees|gitwatch> <value>\n{s}", .{usage});
     const target = args.positional.items[1];
     const what = args.positional.items[2];
     const value = args.positional.items[3];
@@ -750,6 +762,9 @@ fn rootSet(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: Arg
     } else if (std.mem.eql(u8, what, "idle")) {
         const milliseconds = parseDuration(value) orelse return fail(io, "idle needs a duration such as 500ms, 30s, 10m or 0", .{});
         try writer.print(",\"idle_timeout_ms\":{d}", .{milliseconds});
+    } else if (std.mem.eql(u8, what, "tick")) {
+        const milliseconds = parseTick(value) orelse return fail(io, "{s}", .{tickRefusal("tick")});
+        try writer.print(",\"tick_ms\":{d}", .{milliseconds});
     } else if (std.mem.eql(u8, what, "keep-batches")) {
         const count = std.fmt.parseInt(u64, value, 10) catch return fail(io, "keep-batches needs a number", .{});
         try writer.print(",\"retention\":{{\"max_batches\":{d}}}", .{count});
@@ -760,18 +775,19 @@ fn rootSet(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: Arg
         const enabled = parseFlagValue(value) orelse return fail(io, "gitwatch needs on or off", .{});
         try writer.writeAll(if (enabled) ",\"gitwatch\":true" else ",\"gitwatch\":false");
     } else {
-        return fail(io, "root set understands mode, idle, keep-batches, worktrees and gitwatch", .{});
+        return fail(io, "root set understands mode, idle, tick, keep-batches, worktrees and gitwatch", .{});
     }
     try writer.writeByte('}');
 
     const reply = (try request(io, arena, layout, request_bytes.written())) orelse exitNotRunning(io, layout);
     const root = result(reply).object.get("root") orelse result(reply);
     var idle_buffer: [32]u8 = undefined;
-    print(io, "set {s}: mode {s}, state {s}, idle {s}, worktrees {s}, gitwatch {s}", .{
+    print(io, "set {s}: mode {s}, state {s}, idle {s}, tick {d} ms, worktrees {s}, gitwatch {s}", .{
         stringFieldValue(root, "id") orelse target,
         stringFieldValue(root, "mode") orelse what,
         stringFieldValue(root, "state") orelse "?",
         formatDuration(integerFieldValue(root, "idle_timeout_ms") orelse 0, &idle_buffer),
+        integerFieldValue(root, "tick_ms") orelse registry.default_tick_ms,
         onOff(boolFieldValue(root, "worktrees") orelse true),
         onOff(boolFieldValue(root, "gitwatch") orelse true),
     });
@@ -826,8 +842,9 @@ fn rootStatus(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, args: 
         stringFieldValue(root, "reason") orelse "?",
         integerFieldValue(root, "clients") orelse 0,
     });
-    print(io, "  idle {s}, head batch {d}, {d} pass(es), {d} wake(s)", .{
+    print(io, "  idle {s}, tick {d} ms, head batch {d}, {d} pass(es), {d} wake(s)", .{
         formatDuration(integerFieldValue(root, "idle_timeout_ms") orelse 0, &idle_buffer),
+        integerFieldValue(root, "tick_ms") orelse registry.default_tick_ms,
         integerFieldValue(root, "head_batch") orelse 0,
         integerFieldValue(root, "passes") orelse 0,
         integerFieldValue(root, "wakes") orelse 0,
@@ -1046,6 +1063,23 @@ pub fn parseDuration(text: []const u8) ?u64 {
     }
     const amount = std.fmt.parseInt(u64, digits, 10) catch return null;
     return std.math.mul(u64, amount, multiplier) catch null;
+}
+
+/// `--tick <ms>` / `root set <id> tick <ms>`: a whole number of milliseconds inside the registry's range.
+///
+/// Deliberately **not** `parseDuration`: a tick is a millisecond count whose valid range starts at 5, so `0` — which
+/// the duration parser accepts as "never" — is a refusal here, and `5ms`/`1s` are not spellings of one. The field is
+/// `tick_ms` in the record and this reply, so the unit is never ambiguous.
+pub fn parseTick(text: []const u8) ?u64 {
+    const value = std.fmt.parseInt(u64, std.mem.trim(u8, text, " "), 10) catch return null;
+    return if (registry.isValidTick(value)) value else null;
+}
+
+/// The refusal a bad tick gets, shared by `root add --tick` and `root set <id> tick`, so the range is stated once.
+fn tickRefusal(comptime flag: []const u8) []const u8 {
+    return std.fmt.comptimePrint("{s} needs a whole number of milliseconds between {d} and {d} (default {d})", .{
+        flag, registry.min_tick_ms, registry.max_tick_ms, registry.default_tick_ms,
+    });
 }
 
 /// `1024`, `64K`, `64M`, `1G` — a byte budget for `--max-bytes`.

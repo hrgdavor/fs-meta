@@ -39,6 +39,15 @@ engine pass (the quiet period is tuned by how long this machine's passes take). 
 running, and each root schedules itself — one root's scan (or a client that stopped reading) never delays another
 root's batches.
 
+**Each root has its own tick.** A root's scheduler wakes every `tick_ms` to check its idle deadline, its event burst
+and its git/hook timers: **default 50 ms**, valid **5–1000 ms**, recorded per root in `roots.json` and set with
+`root add <path> --tick <ms>` or `root set <id> tick <ms>`. The default is less conservative than the 100 ms the
+daemon used to hard-code, because on a fast SSD and a small tree a pass is a few milliseconds and the wait for the
+next tick was often the largest part of a save's latency. The burst scheduler's own 25 ms quiet floor still applies,
+so a tick below 25 ms checks more often without publishing sooner; a larger tick trades batch latency for fewer
+wakeups. `root status --json` (and `roots list --json`) reports the effective `tick_ms`, and `root status` prints it
+on the `idle …, tick … ms, head batch …` line, so the setting in force never has to be guessed from the file.
+
 Sleeping is the whole point, and waking is what it costs. A returning client triggers **one full scan**, compared
 with the last published generation, published as normal batches — so the client sees the diff of everything that
 happened while the root slept, and the daemon is then watching again. A root nobody uses therefore costs nothing

@@ -100,9 +100,9 @@ pub const Command = enum {
 };
 
 /// One request. Every field but `v` and `cmd` is optional, and which ones a command needs is checked by the
-/// handler: `root.set` needs at least one of `mode`, `idle_timeout_ms`, `retention`, `worktrees` or `gitwatch`, and
-/// `root.add` needs a path. Parsing stays permissive so a future field is ignorable by an older daemon that shares the
-/// version.
+/// handler: `root.set` needs at least one of `mode`, `idle_timeout_ms`, `tick_ms`, `retention`, `worktrees` or
+/// `gitwatch`, and `root.add` needs a path. Parsing stays permissive so a future field is ignorable by an older daemon
+/// that shares the version.
 pub const Request = struct {
     v: u16 = version,
     cmd: Command,
@@ -112,6 +112,9 @@ pub const Request = struct {
     path: ?[]const u8 = null,
     mode: ?state.Mode = null,
     idle_timeout_ms: ?u64 = null,
+    /// `root.add --tick <ms>` / `root.set <id> tick <ms>`: this root's scheduler tick. Validated against
+    /// `registry.min_tick_ms`..`registry.max_tick_ms` by the handler, not here, so one range rule covers both commands.
+    tick_ms: ?u64 = null,
     retention: ?registry.Retention = null,
     on_remove: ?registry.OnRemove = null,
     /// `root.add --worktrees on|off`: the per-root worktree handling switch (`plans/worktrees.md` § 5h).
@@ -176,6 +179,12 @@ pub fn parseRequest(allocator: std.mem.Allocator, line: []const u8) ParseError!R
     }
     if (object.get("idle_timeout_ms")) |value| {
         request.idle_timeout_ms = switch (value) {
+            .integer => |i| if (i < 0) return error.WrongType else @intCast(i),
+            else => return error.WrongType,
+        };
+    }
+    if (object.get("tick_ms")) |value| {
+        request.tick_ms = switch (value) {
             .integer => |i| if (i < 0) return error.WrongType else @intCast(i),
             else => return error.WrongType,
         };
@@ -393,11 +402,12 @@ test "a request parses into the command it names, with the fields it carries" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const add = try parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"path\":\"/home/u/app\",\"mode\":\"always\",\"idle_timeout_ms\":1000,\"retention\":{\"max_batches\":4,\"max_bytes\":1024},\"on_remove\":\"delete\"}");
+    const add = try parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"path\":\"/home/u/app\",\"mode\":\"always\",\"idle_timeout_ms\":1000,\"tick_ms\":8,\"retention\":{\"max_batches\":4,\"max_bytes\":1024},\"on_remove\":\"delete\"}");
     try testing.expectEqual(Command.root_add, add.cmd);
     try testing.expectEqualStrings("/home/u/app", add.path.?);
     try testing.expectEqual(state.Mode.always, add.mode.?);
     try testing.expectEqual(@as(u64, 1_000), add.idle_timeout_ms.?);
+    try testing.expectEqual(@as(u64, 8), add.tick_ms.?);
     try testing.expectEqual(@as(u64, 4), add.retention.?.max_batches);
     try testing.expectEqual(registry.OnRemove.delete, add.on_remove.?);
 
@@ -418,6 +428,8 @@ test "a request parses into the command it names, with the fields it carries" {
     const unset = try parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"path\":\"/home/u/app\"}");
     try testing.expectEqual(@as(?bool, null), unset.worktrees);
     try testing.expectEqual(@as(?bool, null), unset.gitwatch);
+    // Absent `tick_ms` is "copy the default", the same shape as the two switches.
+    try testing.expectEqual(@as(?u64, null), unset.tick_ms);
 }
 
 test "a request that is not this protocol is refused, not guessed at" {
@@ -434,6 +446,9 @@ test "a request that is not this protocol is refused, not guessed at" {
     try testing.expectError(error.WrongType, parseRequest(arena, "{\"v\":1,\"cmd\":\"roots\",\"root\":5}"));
     // A switch is a boolean, not a string: `--worktrees on` is CLI spelling, and the CLI converts it.
     try testing.expectError(error.WrongType, parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"worktrees\":\"on\"}"));
+    // A tick is a number of milliseconds, and the range is the handler's rule (it needs the registry constants).
+    try testing.expectError(error.WrongType, parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"tick_ms\":\"8\"}"));
+    try testing.expectError(error.WrongType, parseRequest(arena, "{\"v\":1,\"cmd\":\"root.add\",\"tick_ms\":-8}"));
 }
 
 test "every command has a wire name, and the name parses back" {
