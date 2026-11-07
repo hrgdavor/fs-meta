@@ -278,6 +278,9 @@ quiet floor a faster tick buys nothing on a fast machine — and why a tick of 5
 the daemon used to hard-code without being reckless: on a fast SSD and a small tree the pass itself is a few
 milliseconds, and the old constant was often the largest part of a save's latency.
 
+**The tick should be chosen per editor/SSD rather than globally.** 50 ms is the new default; 10–25 ms is reasonable
+for a fast local editor, while 50–100 ms is safer for many roots or slower storage.
+
 The tick is also what bounds the daemon's other per-root timer work: the idle deadline, the git latch poll, the hook
 spool read and the metadata watch are all looked at once per tick. A larger tick therefore trades batch latency for
 fewer wakeups; it never changes a trio byte.

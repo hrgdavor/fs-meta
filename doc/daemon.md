@@ -48,6 +48,9 @@ so a tick below 25 ms checks more often without publishing sooner; a larger tick
 wakeups. `root status --json` (and `roots list --json`) reports the effective `tick_ms`, and `root status` prints it
 on the `idle …, tick … ms, head batch …` line, so the setting in force never has to be guessed from the file.
 
+**The tick should be chosen per editor/SSD rather than globally.** 50 ms is the new default; 10–25 ms is reasonable
+for a fast local editor, while 50–100 ms is safer for many roots or slower storage.
+
 Sleeping is the whole point, and waking is what it costs. A returning client triggers **one full scan**, compared
 with the last published generation, published as normal batches — so the client sees the diff of everything that
 happened while the root slept, and the daemon is then watching again. A root nobody uses therefore costs nothing
