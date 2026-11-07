@@ -388,11 +388,10 @@ fn serveExec(io: std.Io, arena: std.mem.Allocator, stream: std.Io.net.Stream, re
     _ = child.wait(io) catch {};
 }
 
-/// The result of a successful `SUBSCRIBE`: the client's `from_batch` and its optional filter.
-const Subscribe = struct {
-    from_batch: u64,
-    filter: filter_mod.Filter,
-};
+/// The result of a successful `SUBSCRIBE`: the client's `from_batch` and its optional filter. The
+/// patterns are copied into the connection arena (`filter.zig`'s decoder owns the copy), so they stay
+/// valid through replay and live streaming after the frame buffer has been reused.
+const Subscribe = filter_mod.Subscribe;
 
 /// The handshake: send `HELLO` for the window's newest batch, read the peer's, then its `SUBSCRIBE`.
 /// Returns the client's `from_batch` and filter, or `null` when the request was refused (an `ERROR` has been sent).
@@ -453,44 +452,20 @@ fn negotiateWith(
     }
     const subscribe_payload = try reader.take(subscribe_frame.length);
 
-    // The original form is 8 bytes (just `from_batch`); the extended form carries filter patterns.
-    if (subscribe_frame.length < 8) {
-        refuse(io, stream, .protocol, "SUBSCRIBE payload too short", .{});
-        return null;
-    }
-    const from_batch = std.mem.readInt(u64, subscribe_payload[0..8], .little);
-
-    var filter = filter_mod.Filter{ .include = &[_]filter_mod.Pattern{}, .exclude = &[_]filter_mod.Pattern{} };
-    if (subscribe_frame.length > 8) {
-        // Extended form: u16 include_count, patterns, u16 exclude_count, patterns.
-        var pos: usize = 8;
-        const include_count: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
-        pos += 2;
-        var inc: std.ArrayListUnmanaged(filter_mod.Pattern) = .empty;
-        defer inc.deinit(allocator);
-        for (0..include_count) |_| {
-            const plen: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
-            pos += 2;
-            const pbytes = subscribe_payload[pos .. pos + plen];
-            pos += plen;
-            try inc.append(allocator, filter_mod.compileOne(pbytes));
-        }
-        const exclude_count: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
-        pos += 2;
-        var exc: std.ArrayListUnmanaged(filter_mod.Pattern) = .empty;
-        defer exc.deinit(allocator);
-        for (0..exclude_count) |_| {
-            const plen: u16 = @as(u16, subscribe_payload[pos]) | (@as(u16, subscribe_payload[pos + 1]) << 8);
-            pos += 2;
-            const pbytes = subscribe_payload[pos .. pos + plen];
-            pos += plen;
-            try exc.append(allocator, filter_mod.compileOne(pbytes));
-        }
-        filter = .{
-            .include = try inc.toOwnedSlice(allocator),
-            .exclude = try exc.toOwnedSlice(allocator),
-        };
-    }
+    // The original form is 8 bytes (just `from_batch`); the extended form carries filter patterns. One
+    // decoder serves this path and the daemon's, so the two cannot disagree about the layout.
+    const decoded = filter_mod.decodeSubscribe(allocator, subscribe_payload) catch |err| switch (err) {
+        error.TooShort => {
+            refuse(io, stream, .protocol, "SUBSCRIBE payload too short", .{});
+            return null;
+        },
+        error.Malformed => {
+            refuse(io, stream, .protocol, "malformed SUBSCRIBE filter section", .{});
+            return null;
+        },
+        else => return err,
+    };
+    const from_batch = decoded.from_batch;
 
     if (from_batch > window.last) {
         // FORMAT.socket.md does not say what a client ahead of the server means; refusing it is the
@@ -504,7 +479,7 @@ fn negotiateWith(
             return null;
         }
     }
-    return .{ .from_batch = from_batch, .filter = filter };
+    return decoded;
 }
 
 /// Send `START_BATCH` … `END_BATCH` for every generation after `from_batch`, applying the consumer's

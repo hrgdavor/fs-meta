@@ -48,6 +48,7 @@ const std = @import("std");
 const nightwatch = @import("nightwatch");
 const engine = @import("../engine.zig");
 const batch_mod = @import("../batch.zig");
+const filter_mod = @import("../filter.zig");
 const server = @import("../server.zig");
 const wire = @import("../wire.zig");
 const format = @import("../format.zig");
@@ -269,8 +270,22 @@ fn takeKinds(stamps: *[8]std.atomic.Value(u64)) PendingKinds {
 const Subscriber = struct {
     stream: std.Io.net.Stream,
     from_batch: u64,
+    /// The compiled server-side name filter (`FORMAT.socket.md` § SUBSCRIBE filter patterns). An 8-byte
+    /// `SUBSCRIBE` leaves it pass-all. The pattern bytes live in `filter_storage`, **not** in the
+    /// connection arena: the scheduler broadcasts under the root lock, and the connection arena is
+    /// freed before `unregister` takes this subscriber out of the list, so an arena-owned filter would
+    /// be a use-after-free. The connection task frees both after `unregister` has returned.
+    filter: filter_mod.Filter = filter_mod.Filter.passAll(),
+    filter_storage: []const u8 = &.{},
     registered: bool = true,
     alive: bool = true,
+
+    /// Free the filter and the pattern bytes it matches against. Called by the connection task after
+    /// `unregister`, which is the point where no broadcast can be holding this subscriber any more.
+    fn deinitFilter(self: *Subscriber, allocator: std.mem.Allocator) void {
+        allocator.free(self.filter_storage);
+        self.filter.deinit(allocator);
+    }
 };
 
 /// The bridge from nightwatch's thread into the scheduler's atomics.
@@ -1790,13 +1805,24 @@ pub const RootRuntime = struct {
         self.dropDeadLocked();
     }
 
+    /// Send one batch as `START_BATCH` … `END_BATCH`, applying the subscriber's filter. The replay
+    /// (`replayLocked`) and the live broadcast (`broadcastBatchLocked`) are both this function, so a
+    /// name the client excluded is never sent and `END_BATCH` counts only the entries that were
+    /// (`FORMAT.socket.md` § SUBSCRIBE filter patterns: "the counts reflect what was actually sent").
     fn sendBatch(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber, generation: u64, plan: batch_mod.Plan) !void {
         const io = self.io;
         try server.sendStartBatch(io, subscriber.stream, generation, generation - 1);
+        var counted = server.Counts{};
         for (plan.entries, plan.names) |entry, name| {
+            if (!subscriber.filter.matches(name)) continue;
             try server.sendChangeEntry(io, arena, subscriber.stream, entry, name);
+            if (batch_mod.kindOf(entry)) |kind| switch (kind) {
+                .added => counted.added += 1,
+                .changed => counted.changed += 1,
+                .deleted => counted.deleted += 1,
+            };
         }
-        try server.sendEndBatch(io, subscriber.stream, generation, server.counts(plan));
+        try server.sendEndBatch(io, subscriber.stream, generation, counted);
         subscriber.from_batch = generation;
     }
 
@@ -1878,10 +1904,43 @@ pub const RootRuntime = struct {
         subscriber.* = .{ .stream = stream, .from_batch = 0 };
         defer {
             self.unregister(subscriber);
+            subscriber.deinitFilter(self.allocator);
             stream.close(io); // the connection's task owns the stream
             self.allocator.destroy(subscriber);
         }
         self.serveConnection(stream, subscriber) catch {};
+    }
+
+    /// Read the client's `SUBSCRIBE` frame after the greeting and decode it, including the extended
+    /// filter payload (`FORMAT.socket.md` § SUBSCRIBE filter patterns).
+    ///
+    /// A payload the protocol cannot read is answered with the protocol's normal `ERROR` (`protocol`,
+    /// code 1) and `null` is returned. The decoder is `filter.zig`'s, the same one `server.zig` calls,
+    /// so the two socket paths cannot disagree about the layout or about what is malformed. The
+    /// `from_batch`/window checks stay with the caller, which knows this root's archive.
+    fn readSubscribe(
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) !?filter_mod.Subscribe {
+        const prefix = (try readPrefix(io, stream, reader)) orelse return null;
+        if (prefix.kind != .subscribe) {
+            server.refuse(io, stream, .protocol, "expected SUBSCRIBE", .{});
+            return null;
+        }
+        const payload = try reader.take(prefix.length);
+        return filter_mod.decodeSubscribe(allocator, payload) catch |err| switch (err) {
+            error.TooShort => {
+                server.refuse(io, stream, .protocol, "SUBSCRIBE payload too short", .{});
+                return null;
+            },
+            error.Malformed => {
+                server.refuse(io, stream, .protocol, "malformed SUBSCRIBE filter section", .{});
+                return null;
+            },
+            else => return err,
+        };
     }
 
     /// Greet, subscribe, replay, and stay: the consumer-facing half of the daemon.
@@ -1938,12 +1997,14 @@ pub const RootRuntime = struct {
             return;
         }
 
-        const subscribe_prefix = (try readPrefix(io, stream, &reader.interface)) orelse return;
-        if (subscribe_prefix.kind != .subscribe or subscribe_prefix.length != 8) {
-            server.refuse(io, stream, .protocol, "expected SUBSCRIBE with a u64 from_batch", .{});
-            return;
-        }
-        const from_batch = std.mem.readInt(u64, (try reader.interface.take(subscribe_prefix.length))[0..8], .little);
+        const decoded = (try RootRuntime.readSubscribe(io, stream, &reader.interface, self.allocator)) orelse return;
+        // Adopt the filter before the archive checks: every early return below still runs the
+        // connection task's defer, which is what frees it (`Subscriber.deinitFilter`). The storage is
+        // allocated from the daemon allocator rather than this connection's arena on purpose — the
+        // arena dies before `unregister` takes the subscriber out of the broadcast list.
+        subscriber.filter = decoded.filter;
+        subscriber.filter_storage = decoded.storage;
+        const from_batch = decoded.from_batch;
 
         const window = try server.openBatchWindow(io, self.record.root);
         defer if (window.dir) |dir| dir.close(io);
@@ -2202,3 +2263,370 @@ test "a pass kind maps to the wire's reason table without inventing a value" {
     try testing.expectEqual(state.Reason.none, PassKind.scan.reason(.control));
 }
 
+// ---------------------------------------------------------------- SUBSCRIBE filter on the daemon socket
+//
+// `FORMAT.socket.md` § SUBSCRIBE filter patterns: the daemon now accepts the extended payload and applies
+// the filter server-side. These tests drive the daemon's own reader and the two send paths (`replayLocked`
+// for the archive, `broadcastBatchLocked` for live delivery) over a real socket pair, so a name that is
+// filtered here is a frame that is genuinely absent from the wire, not a filtered list.
+
+/// One socket pair as a consumer would see it: `client` is the consumer's end, `server_side` what the
+/// daemon reads from and writes to. The path is arena-owned and removed on `closeTestPair`.
+const TestSocketPair = struct {
+    listener: std.Io.net.Server,
+    client: std.Io.net.Stream,
+    server_side: std.Io.net.Stream,
+    path: []const u8,
+};
+
+fn connectTestPair(io: std.Io, arena: std.mem.Allocator, tmp_sub_path: []const u8) !TestSocketPair {
+    // An AF_UNIX address must be absolute, and the test's temporary directory is relative to the build
+    // root. Resolve it through the file system rather than joining by hand (`std.fs.path.resolve` does not
+    // prepend the current directory in Zig 0.17).
+    const relative = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", tmp_sub_path });
+    const absolute = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena);
+    const path = try std.fs.path.join(arena, &.{ absolute, "socket" });
+
+    const address = try std.Io.net.UnixAddress.init(path);
+    var listener = try address.listen(io, .{});
+    errdefer listener.deinit(io);
+    // Connect before accepting: the exchange fits in the kernel buffers, so one thread needs no peer yet.
+    const client = try address.connect(io);
+    errdefer client.close(io);
+    const server_side = try listener.accept(io);
+    return .{ .listener = listener, .client = client, .server_side = server_side, .path = path };
+}
+
+fn closeTestPair(pair: *TestSocketPair, io: std.Io) void {
+    pair.client.close(io);
+    pair.server_side.close(io);
+    pair.listener.deinit(io);
+    std.Io.Dir.deleteFileAbsolute(io, pair.path) catch {};
+}
+
+/// Build an extended `SUBSCRIBE` payload into `buffer` (`FORMAT.socket.md` § SUBSCRIBE filter patterns).
+fn subscribePayload(buffer: []u8, from_batch: u64, include: []const []const u8, exclude: []const []const u8) []u8 {
+    var pos: usize = 8;
+    std.mem.writeInt(u64, buffer[0..8], from_batch, .little);
+    for ([_][]const []const u8{ include, exclude }) |patterns| {
+        std.debug.assert(pos + 2 <= buffer.len);
+        std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(patterns.len), .little);
+        pos += 2;
+        for (patterns) |pattern| {
+            std.debug.assert(pos + 2 + pattern.len <= buffer.len);
+            std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(pattern.len), .little);
+            pos += 2;
+            @memcpy(buffer[pos..][0..pattern.len], pattern);
+            pos += pattern.len;
+        }
+    }
+    return buffer[0..pos];
+}
+
+/// A plan whose three entries vary by both extension and directory, so include/exclude decisions are
+/// distinguishable from the order the archive happens to store them in.
+fn testChangePlan(names: *[3][]const u8, entries: *[3]format.Entry) batch_mod.Plan {
+    names.* = .{ "docs/readme.md", "src/main.zig", "docs/draft.md" };
+    entries.* = .{
+        testChangeEntry(names[0], batch_mod.CHANGE_ADDED),
+        testChangeEntry(names[1], batch_mod.CHANGE_CHANGED),
+        testChangeEntry(names[2], batch_mod.CHANGE_ADDED),
+    };
+    return .{ .entries = entries, .names = names };
+}
+
+fn testChangeEntry(name: []const u8, change: u32) format.Entry {
+    var entry = std.mem.zeroes(format.Entry);
+    entry.flags_word = format.flags.regular_file | format.flags.content_known | change;
+    entry.size_bytes = name.len;
+    entry.name_hash = format.wyhash(name);
+    return entry;
+}
+
+/// A `RootRuntime` for the stream paths only: no scheduler, no watcher, no socket. `sendBatch` and
+/// `replayLocked` touch the io, the archive path in `record.root`, and nothing else.
+fn testStreamRuntime(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    root: []const u8,
+    git_registry: *gitwatch.Registry,
+) RootRuntime {
+    return .{
+        .io = io,
+        .allocator = allocator,
+        .arena = arena,
+        .layout = .{ .base = ".", .config = "." },
+        .record = .{
+            .id = "test",
+            .root = root,
+            .mode = .off,
+            .idle_timeout_ms = 0,
+            .retention = .{},
+            .on_remove = .keep,
+            .socket = "",
+            .served_by = "inproc",
+            .created_at = "2026-01-01T00:00:00Z",
+        },
+        .root_path = root,
+        .machine = state.Machine.init(.off, 0),
+        .git_registry = git_registry,
+    };
+}
+
+/// One frame read from the consumer's end. The payload is borrowed from the reader's buffer, so a test
+/// compares a name before reading the next frame.
+const FrameData = struct { kind: wire.Kind, payload: []u8 };
+
+fn readTestFrame(reader: *std.Io.Reader) !FrameData {
+    const prefix = try reader.takeArray(wire.prefix_size);
+    const frame = try wire.readPrefix(prefix);
+    return .{ .kind = frame.kind, .payload = try reader.take(frame.length) };
+}
+
+/// A received batch, with the names copied out of the reader's recycled buffer.
+const ReceivedBatch = struct {
+    number: u64 = 0,
+    names: [8][96]u8 = undefined,
+    name_lens: [8]usize = undefined,
+    count: usize = 0,
+    added: u64 = 0,
+    changed: u64 = 0,
+    deleted: u64 = 0,
+
+    fn name(self: *const ReceivedBatch, index: usize) []const u8 {
+        return self.names[index][0..self.name_lens[index]];
+    }
+
+    fn has(self: *const ReceivedBatch, wanted: []const u8) bool {
+        for (0..self.count) |index| {
+            if (std.mem.eql(u8, self.name(index), wanted)) return true;
+        }
+        return false;
+    }
+};
+
+/// Read `START_BATCH` … `END_BATCH`, copying every `CHANGE_ENTRY` name and the `END_BATCH` counts.
+fn readTestBatch(reader: *std.Io.Reader) !ReceivedBatch {
+    var batch = ReceivedBatch{};
+    const start = try readTestFrame(reader);
+    try testing.expectEqual(wire.Kind.start_batch, start.kind);
+    batch.number = std.mem.readInt(u64, start.payload[0..8], .little);
+    while (true) {
+        const frame = try readTestFrame(reader);
+        if (frame.kind == .end_batch) {
+            batch.added = std.mem.readInt(u64, frame.payload[8..16], .little);
+            batch.changed = std.mem.readInt(u64, frame.payload[16..24], .little);
+            batch.deleted = std.mem.readInt(u64, frame.payload[24..32], .little);
+            return batch;
+        }
+        try testing.expectEqual(wire.Kind.change_entry, frame.kind);
+        const name_length: usize = std.mem.readInt(u32, frame.payload[40..44], .little);
+        const name = frame.payload[format.entry_size..][0..name_length];
+        try testing.expect(batch.count < batch.names.len);
+        @memcpy(batch.names[batch.count][0..name.len], name);
+        batch.name_lens[batch.count] = name.len;
+        batch.count += 1;
+    }
+}
+
+/// Adopt a decoded `SUBSCRIBE` into a subscriber whose lifetime the test owns.
+fn testSubscriber(stream: std.Io.net.Stream, decoded: filter_mod.Subscribe) Subscriber {
+    return .{ .stream = stream, .from_batch = 0, .filter = decoded.filter, .filter_storage = decoded.storage };
+}
+
+test "the extended SUBSCRIBE filters the replay path and counts only sent entries" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    var meta_dir = try tmp.dir.openDir(io, ".fs-meta", .{});
+    defer meta_dir.close(io);
+
+    var names: [3][]const u8 = undefined;
+    var entries: [3]format.Entry = undefined;
+    const plan = testChangePlan(&names, &entries);
+    try batch_mod.write(allocator, io, meta_dir, plan, .{ .generation = 1, .parent = 0 });
+
+    const relative = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, arena);
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+
+    var pair = try connectTestPair(io, arena, &tmp.sub_path);
+    defer closeTestPair(&pair, io);
+
+    // The consumer asks for markdown only: `docs/readme.md` and `docs/draft.md`, not `src/main.zig`.
+    var payload_buffer: [128]u8 = undefined;
+    const payload = subscribePayload(&payload_buffer, 0, &.{"*.md"}, &.{});
+    try server.writeFrame(io, pair.client, .subscribe, payload);
+
+    var daemon_buffer: [512]u8 = undefined;
+    var daemon_reader = std.Io.net.Stream.Reader.init(pair.server_side, io, &daemon_buffer);
+    const decoded = (try RootRuntime.readSubscribe(io, pair.server_side, &daemon_reader.interface, allocator)) orelse return error.TestUnexpectedResult;
+    var subscriber = testSubscriber(pair.server_side, decoded);
+    defer subscriber.deinitFilter(allocator);
+
+    try runtime.replayLocked(arena, &subscriber, 0);
+    try testing.expectEqual(@as(u64, 1), subscriber.from_batch);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(pair.client, io, &consumer_buffer);
+    const received = try readTestBatch(&consumer.interface);
+    try testing.expectEqual(@as(u64, 1), received.number);
+    try testing.expectEqual(@as(usize, 2), received.count);
+    try testing.expect(received.has("docs/readme.md"));
+    try testing.expect(received.has("docs/draft.md"));
+    try testing.expect(!received.has("src/main.zig"));
+    // The counts are the filtered set's, not the plan's: 2 added (the `changed` entry was filtered out).
+    try testing.expectEqual(@as(u64, 2), received.added);
+    try testing.expectEqual(@as(u64, 0), received.changed);
+    try testing.expectEqual(@as(u64, 0), received.deleted);
+}
+
+test "exclude wins over include on the live broadcast path" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var names: [3][]const u8 = undefined;
+    var entries: [3]format.Entry = undefined;
+    const plan = testChangePlan(&names, &entries);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    // No archive is needed on this path; `broadcastBatchLocked` takes the plan the pass just published.
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair = try connectTestPair(io, arena, &tmp.sub_path);
+    defer closeTestPair(&pair, io);
+
+    // `docs/draft.md` matches the include but not the exclude; exclude wins, so it must not be sent.
+    var payload_buffer: [128]u8 = undefined;
+    const payload = subscribePayload(&payload_buffer, 0, &.{"*.md"}, &.{"draft*"});
+    try server.writeFrame(io, pair.client, .subscribe, payload);
+
+    var daemon_buffer: [512]u8 = undefined;
+    var daemon_reader = std.Io.net.Stream.Reader.init(pair.server_side, io, &daemon_buffer);
+    const decoded = (try RootRuntime.readSubscribe(io, pair.server_side, &daemon_reader.interface, allocator)) orelse return error.TestUnexpectedResult;
+    var subscriber = testSubscriber(pair.server_side, decoded);
+    defer subscriber.deinitFilter(allocator);
+
+    try runtime.subscribers.append(allocator, &subscriber);
+    defer runtime.subscribers.deinit(allocator);
+    runtime.broadcastBatchLocked(arena, 5, plan);
+    try testing.expectEqual(@as(u64, 5), subscriber.from_batch);
+    try testing.expect(subscriber.alive);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(pair.client, io, &consumer_buffer);
+    const received = try readTestBatch(&consumer.interface);
+    try testing.expectEqual(@as(u64, 5), received.number);
+    try testing.expectEqual(@as(usize, 1), received.count);
+    try testing.expect(received.has("docs/readme.md"));
+    try testing.expect(!received.has("docs/draft.md"));
+    try testing.expect(!received.has("src/main.zig"));
+    try testing.expectEqual(@as(u64, 1), received.added);
+    try testing.expectEqual(@as(u64, 0), received.changed);
+    try testing.expectEqual(@as(u64, 0), received.deleted);
+}
+
+test "the 8-byte SUBSCRIBE still means pass-all, unchanged" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var names: [3][]const u8 = undefined;
+    var entries: [3]format.Entry = undefined;
+    const plan = testChangePlan(&names, &entries);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair = try connectTestPair(io, arena, &tmp.sub_path);
+    defer closeTestPair(&pair, io);
+
+    // The original form: exactly eight bytes, the last batch applied.
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, &payload, 0, .little);
+    try server.writeFrame(io, pair.client, .subscribe, &payload);
+
+    var daemon_buffer: [512]u8 = undefined;
+    var daemon_reader = std.Io.net.Stream.Reader.init(pair.server_side, io, &daemon_buffer);
+    const decoded = (try RootRuntime.readSubscribe(io, pair.server_side, &daemon_reader.interface, allocator)) orelse return error.TestUnexpectedResult;
+    try testing.expect(decoded.filter.isPassAll());
+    try testing.expectEqual(@as(u64, 0), decoded.from_batch);
+    var subscriber = testSubscriber(pair.server_side, decoded);
+    defer subscriber.deinitFilter(allocator);
+
+    try runtime.sendBatch(arena, &subscriber, 3, plan);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(pair.client, io, &consumer_buffer);
+    const received = try readTestBatch(&consumer.interface);
+    try testing.expectEqual(@as(usize, 3), received.count);
+    try testing.expect(received.has("docs/readme.md"));
+    try testing.expect(received.has("src/main.zig"));
+    try testing.expect(received.has("docs/draft.md"));
+    try testing.expectEqual(@as(u64, 2), received.added);
+    try testing.expectEqual(@as(u64, 1), received.changed);
+    try testing.expectEqual(@as(u64, 0), received.deleted);
+}
+
+test "a malformed SUBSCRIBE payload is refused with the protocol error, code 1" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair = try connectTestPair(io, arena, &tmp.sub_path);
+    defer closeTestPair(&pair, io);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(pair.client, io, &consumer_buffer);
+
+    // Every case is a payload the protocol cannot read: shorter than the u64, a missing exclude count,
+    // a pattern length past the payload's end, and trailing bytes after a complete extended section.
+    const too_short = [_]u8{ 1, 2, 3, 4, 5, 6, 7 };
+    const truncated_count = std.mem.zeroes([9]u8);
+    var overrun = std.mem.zeroes([12]u8);
+    std.mem.writeInt(u16, overrun[8..10], 1, .little);
+    std.mem.writeInt(u16, overrun[10..12], 5, .little);
+    var trailing_buffer: [32]u8 = undefined;
+    const exact = subscribePayload(&trailing_buffer, 0, &.{}, &.{});
+    trailing_buffer[exact.len] = 0; // a byte after the complete exclude list is not part of the layout
+    const payloads = [_][]const u8{ &too_short, &truncated_count, &overrun, trailing_buffer[0 .. exact.len + 1] };
+
+    for (payloads) |payload| {
+        try server.writeFrame(io, pair.client, .subscribe, payload);
+        var daemon_buffer: [512]u8 = undefined;
+        var daemon_reader = std.Io.net.Stream.Reader.init(pair.server_side, io, &daemon_buffer);
+        const decoded = try RootRuntime.readSubscribe(io, pair.server_side, &daemon_reader.interface, allocator);
+        try testing.expect(decoded == null);
+
+        const refused = try readTestFrame(&consumer.interface);
+        try testing.expectEqual(wire.Kind.err, refused.kind);
+        try testing.expectEqual(
+            @as(u16, @intFromEnum(server.ErrorCode.protocol)),
+            std.mem.readInt(u16, refused.payload[0..2], .little),
+        );
+    }
+}
