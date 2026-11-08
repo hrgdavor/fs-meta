@@ -21,12 +21,15 @@ const format = @import("format.zig");
 
 /// The protocol version this implementation speaks, as `HELLO.protocol` (`major << 8 | minor`).
 ///
-/// `0x0101` adds the `STATE` frame (§ STATE), `0x0102` adds `GIT_EVENT` (§ GIT_EVENT). There are no deployed clients,
-/// so the minor bump is the whole compatibility story: every implementation is updated together, and no capability
-/// bit gate is carried for a population of zero. A `0x0100` peer is still accepted — `checkHello` compares majors —
-/// but it will not understand `0x09` or `0x0A`, which is why the daemon speaks `0x0102` and the document says so.
-/// `fsmeta serve` announces the same version and simply never emits either frame.
-pub const protocol: u16 = 0x0102;
+/// `0x0101` adds the `STATE` frame (§ STATE), `0x0102` adds `GIT_EVENT` (§ GIT_EVENT), `0x0103` adds the staged-build
+/// barrier (`SUBSCRIBE_V2`, `BUILD_STARTED`, `BUILD_DONE`, `STAGE_READY`), `0x0104` adds the streamed stage batch
+/// (`STAGE_BATCH_START`, `STAGE_CHANGE_ENTRY`, `STAGE_BATCH_END`), and `0x0105` adds `SUBSCRIBE_V3` with its
+/// `from_stage_batch` replay cursor (§ BUILD_STAGES). There are no deployed
+/// clients, so the minor bump is the whole compatibility story: every implementation is updated together, and no
+/// capability bit gate is carried for a population of zero. A `0x0100` peer is still accepted — `checkHello` compares
+/// majors — but it will not understand `0x09`, `0x0A` or `0x0B`–`0x12`, which is why the daemon speaks `0x0105` and
+/// the document says so. `fsmeta serve` announces the same version and simply never emits the daemon-only frames.
+pub const protocol: u16 = 0x0105;
 
 /// The prefix is 8 bytes: `u16 kind`, `u16 flags`, `u32 length`.
 pub const prefix_size = 8;
@@ -56,6 +59,22 @@ pub const Kind = enum(u16) {
     state = 0x09,
     /// A git operation's start or finish (protocol `0x0102`). Server to client, never inside a batch.
     git_event = 0x0A,
+    /// The staged-build subscription (protocol `0x0103`): `SUBSCRIBE` plus a stage and a builder flag.
+    subscribe_v2 = 0x0B,
+    /// A builder has begun work for a generation (protocol `0x0103`). Client to server.
+    build_started = 0x0C,
+    /// A builder has finished (or abandoned) a generation (protocol `0x0103`). Client to server.
+    build_done = 0x0D,
+    /// A stage's predecessor is done and its batches are released (protocol `0x0103`). Server to client.
+    stage_ready = 0x0E,
+    /// A stage scan started (protocol `0x0104`). Server to stage subscribers.
+    stage_batch_start = 0x0F,
+    /// One settled artifact in a streamed stage batch (protocol `0x0104`). Payload is `CHANGE_ENTRY`'s.
+    stage_change_entry = 0x10,
+    /// A streamed stage batch's commit (protocol `0x0104`). Server to stage subscribers.
+    stage_batch_end = 0x11,
+    /// `SUBSCRIBE_V2` plus the stage-batch replay cursor (protocol `0x0105`).
+    subscribe_v3 = 0x12,
 
     pub fn fromInt(value: u16) ?Kind {
         return switch (value) {
@@ -69,6 +88,14 @@ pub const Kind = enum(u16) {
             0x08 => .pong,
             0x09 => .state,
             0x0A => .git_event,
+            0x0B => .subscribe_v2,
+            0x0C => .build_started,
+            0x0D => .build_done,
+            0x0E => .stage_ready,
+            0x0F => .stage_batch_start,
+            0x10 => .stage_change_entry,
+            0x11 => .stage_batch_end,
+            0x12 => .subscribe_v3,
             else => null,
         };
     }
@@ -94,6 +121,7 @@ pub const ReadError = error{
     InvalidEntry,
     InvalidState,
     InvalidGitEvent,
+    InvalidBuild,
 };
 
 /// Write the 8-byte prefix for a payload of `length` bytes.
@@ -118,8 +146,14 @@ pub fn readPrefix(bytes: *const [prefix_size]u8) ReadError!Frame {
 /// The name is stored whole, exactly as `files.txt` stores it, so a consumer's path is the one the trio has — and
 /// `nameLength` in the entry makes the frame self-delimiting even if a prefix lied.
 pub fn writeChangeEntry(out: []u8, entry: format.Entry, name: []const u8) void {
+    writeChangeEntryAs(out, .change_entry, entry, name);
+}
+
+/// The same self-delimiting entry under a chosen kind: a stage batch uses `STAGE_CHANGE_ENTRY` but keeps the
+/// exact `CHANGE_ENTRY` payload, so a client has one parser.
+pub fn writeChangeEntryAs(out: []u8, kind: Kind, entry: format.Entry, name: []const u8) void {
     std.debug.assert(out.len == prefix_size + format.entry_size + name.len);
-    writePrefix(out[0..prefix_size], .change_entry, 0, @intCast(format.entry_size + name.len));
+    writePrefix(out[0..prefix_size], kind, 0, @intCast(format.entry_size + name.len));
     var encoded: [format.entry_size]u8 = undefined;
     var with_name = entry;
     with_name.name_length = @intCast(name.len);
@@ -294,6 +328,180 @@ pub const GitEvent = struct {
     }
 };
 
+// ---------------------------------------------------------------- the staged-build frames
+
+/// `SUBSCRIBE_V2`'s fixed header: `u64 from_batch`, `u16 stage`, `u16 flags`, then the filter section.
+pub const subscribe_v2_header_size = 12;
+
+/// `SUBSCRIBE_V3` adds the stage-batch replay cursor: `u64 from_batch`, `u64 from_stage_batch`,
+/// `u16 stage`, `u16 flags`, then the filter section.
+pub const subscribe_v3_header_size = 20;
+
+/// `SUBSCRIBE_V2.flags` bit 0: this subscriber builds and acknowledges batches. A listener leaves it clear.
+pub const SUBSCRIBE_FLAG_BUILDER: u16 = 0x01;
+
+/// The largest stage this implementation accepts. A stage is a small chain, not a namespace: the per-root pump
+/// walks stages in order, so an unbounded value from a client would turn one batch into tens of thousands of
+/// empty iterations. The document states the same limit.
+pub const max_stage: u16 = 64;
+
+/// The payload of `BUILD_STARTED`: the generation the builder is working from.
+pub const build_started_size = 8;
+
+/// The payload of `BUILD_DONE`: the generation acknowledged and the builder's status.
+pub const build_done_size = 9;
+
+/// The payload of `STAGE_READY`: `u16 stage`, `u64 head_batch`, `u64 released_through`.
+pub const stage_ready_size = 18;
+
+/// What a builder says about the work it was asked to do. A failed or cancelled build still releases the next
+/// stage: a permanently broken stage must not strand every later one.
+pub const BuildStatus = enum(u8) {
+    ok = 0,
+    failed = 1,
+    cancelled = 2,
+};
+
+/// `BUILD_STARTED` (kind `0x0C`, protocol `0x0103`), client to server.
+pub const BuildStarted = struct {
+    generation: u64,
+
+    pub fn write(self: BuildStarted, out: *[prefix_size + build_started_size]u8) void {
+        writePrefix(out[0..prefix_size], .build_started, 0, build_started_size);
+        std.mem.writeInt(u64, out[prefix_size..][0..8], self.generation, .little);
+    }
+
+    pub fn read(payload: []const u8) ReadError!BuildStarted {
+        if (payload.len != build_started_size) return error.LengthMismatch;
+        return .{ .generation = std.mem.readInt(u64, payload[0..8], .little) };
+    }
+};
+
+/// `BUILD_DONE` (kind `0x0D`, protocol `0x0103`), client to server.
+pub const BuildDone = struct {
+    generation: u64,
+    status: BuildStatus = .ok,
+
+    pub fn write(self: BuildDone, out: *[prefix_size + build_done_size]u8) void {
+        writePrefix(out[0..prefix_size], .build_done, 0, build_done_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u64, body[0..8], self.generation, .little);
+        body[8] = @intFromEnum(self.status);
+    }
+
+    pub fn read(payload: []const u8) ReadError!BuildDone {
+        if (payload.len != build_done_size) return error.LengthMismatch;
+        if (payload[8] > 2) return error.InvalidBuild;
+        return .{
+            .generation = std.mem.readInt(u64, payload[0..8], .little),
+            .status = @enumFromInt(payload[8]),
+        };
+    }
+};
+
+/// `STAGE_READY` (kind `0x0E`, protocol `0x0103`), server to client. It comes after the batches that became
+/// available, never inside `START_BATCH … END_BATCH`, and it is sent even when the previous stage published no
+/// tracked change — an artifact-only build is still a build round.
+pub const StageReady = struct {
+    /// The stage that may now work.
+    stage: u16,
+    /// The newest batch the root has published.
+    head_batch: u64,
+    /// The newest batch now released to this stage.
+    released_through: u64,
+
+    pub fn write(self: StageReady, out: *[prefix_size + stage_ready_size]u8) void {
+        writePrefix(out[0..prefix_size], .stage_ready, 0, stage_ready_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u16, body[0..2], self.stage, .little);
+        std.mem.writeInt(u64, body[2..10], self.head_batch, .little);
+        std.mem.writeInt(u64, body[10..18], self.released_through, .little);
+    }
+
+    pub fn read(payload: []const u8) ReadError!StageReady {
+        if (payload.len != stage_ready_size) return error.LengthMismatch;
+        return .{
+            .stage = std.mem.readInt(u16, payload[0..2], .little),
+            .head_batch = std.mem.readInt(u64, payload[2..10], .little),
+            .released_through = std.mem.readInt(u64, payload[10..18], .little),
+        };
+    }
+};
+
+// ---------------------------------------------------------------- stage batch frames
+
+/// `STAGE_BATCH_START`: `u16 stage`, `u64 generation`, `u64 parent`, `u64 started_ns`.
+pub const stage_batch_start_size = 26;
+
+/// `STAGE_BATCH_END`: `u16 stage`, `u64 generation`, `u64 added`, `u64 changed`, `u64 deleted`,
+/// `u64 changes_hash`, `u8 status`.
+pub const stage_batch_end_size = 43;
+
+/// A stage batch opens before its scan finishes and closes at `STAGE_BATCH_END`. Its entries are in observation
+/// order — the order the scan settles files — unlike a root batch's `(nameHash, name)` order. The stage state is
+/// the sorted form; a consumer that needs sorted state reads it after the commit.
+pub const StageBatchStart = struct {
+    stage: u16,
+    generation: u64,
+    parent: u64,
+    started_ns: u64,
+
+    pub fn write(self: StageBatchStart, out: *[prefix_size + stage_batch_start_size]u8) void {
+        writePrefix(out[0..prefix_size], .stage_batch_start, 0, stage_batch_start_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u16, body[0..2], self.stage, .little);
+        std.mem.writeInt(u64, body[2..10], self.generation, .little);
+        std.mem.writeInt(u64, body[10..18], self.parent, .little);
+        std.mem.writeInt(u64, body[18..26], self.started_ns, .little);
+    }
+
+    pub fn read(payload: []const u8) ReadError!StageBatchStart {
+        if (payload.len != stage_batch_start_size) return error.LengthMismatch;
+        return .{
+            .stage = std.mem.readInt(u16, payload[0..2], .little),
+            .generation = std.mem.readInt(u64, payload[2..10], .little),
+            .parent = std.mem.readInt(u64, payload[10..18], .little),
+            .started_ns = std.mem.readInt(u64, payload[18..26], .little),
+        };
+    }
+};
+
+pub const StageBatchEnd = struct {
+    stage: u16,
+    generation: u64,
+    added: u64,
+    changed: u64,
+    deleted: u64,
+    changes_hash: u64 = 0,
+    status: BuildStatus = .ok,
+
+    pub fn write(self: StageBatchEnd, out: *[prefix_size + stage_batch_end_size]u8) void {
+        writePrefix(out[0..prefix_size], .stage_batch_end, 0, stage_batch_end_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u16, body[0..2], self.stage, .little);
+        std.mem.writeInt(u64, body[2..10], self.generation, .little);
+        std.mem.writeInt(u64, body[10..18], self.added, .little);
+        std.mem.writeInt(u64, body[18..26], self.changed, .little);
+        std.mem.writeInt(u64, body[26..34], self.deleted, .little);
+        std.mem.writeInt(u64, body[34..42], self.changes_hash, .little);
+        body[42] = @intFromEnum(self.status);
+    }
+
+    pub fn read(payload: []const u8) ReadError!StageBatchEnd {
+        if (payload.len != stage_batch_end_size) return error.LengthMismatch;
+        if (payload[42] > 2) return error.InvalidBuild;
+        return .{
+            .stage = std.mem.readInt(u16, payload[0..2], .little),
+            .generation = std.mem.readInt(u64, payload[2..10], .little),
+            .added = std.mem.readInt(u64, payload[10..18], .little),
+            .changed = std.mem.readInt(u64, payload[18..26], .little),
+            .deleted = std.mem.readInt(u64, payload[26..34], .little),
+            .changes_hash = std.mem.readInt(u64, payload[34..42], .little),
+            .status = @enumFromInt(payload[42]),
+        };
+    }
+};
+
 // ---------------------------------------------------------------- the handshake
 
 pub const Role = enum(u8) { server = 0, client = 1 };
@@ -376,7 +584,7 @@ test "a prefix round-trips, and the kinds cannot look like JSON" {
     try testing.expectEqual(@as(u32, 100), frame.length);
 
     var kind: u16 = 0x01;
-    while (kind <= 0x0A) : (kind += 1) {
+    while (kind <= 0x12) : (kind += 1) {
         var prefix: [prefix_size]u8 = undefined;
         writePrefix(&prefix, Kind.fromInt(kind).?, 0, 0);
         try testing.expect(prefix[0] < 0x7B);
@@ -508,6 +716,64 @@ test "a state or reason outside the documented tables is refused, not guessed" {
 
     // A short payload is a length mismatch, not a partially-read state.
     try testing.expectError(error.LengthMismatch, State.read(payload[0 .. state_size - 1]));
+}
+
+test "the staged-build frames round-trip their documented payloads" {
+    var started_bytes: [prefix_size + build_started_size]u8 = undefined;
+    (BuildStarted{ .generation = 42 }).write(&started_bytes);
+    try testing.expectEqual(Kind.build_started, (try readPrefix(started_bytes[0..prefix_size])).kind);
+    try testing.expectEqual(@as(u64, 42), (try BuildStarted.read(started_bytes[prefix_size..])).generation);
+
+    var done_bytes: [prefix_size + build_done_size]u8 = undefined;
+    (BuildDone{ .generation = 42, .status = .failed }).write(&done_bytes);
+    try testing.expectEqual(Kind.build_done, (try readPrefix(done_bytes[0..prefix_size])).kind);
+    const done = try BuildDone.read(done_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u64, 42), done.generation);
+    try testing.expectEqual(BuildStatus.failed, done.status);
+
+    var ready_bytes: [prefix_size + stage_ready_size]u8 = undefined;
+    (StageReady{ .stage = 2, .head_batch = 17, .released_through = 16 }).write(&ready_bytes);
+    try testing.expectEqual(Kind.stage_ready, (try readPrefix(ready_bytes[0..prefix_size])).kind);
+    const ready = try StageReady.read(ready_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u16, 2), ready.stage);
+    try testing.expectEqual(@as(u64, 17), ready.head_batch);
+    try testing.expectEqual(@as(u64, 16), ready.released_through);
+
+    // A wrong length and a status outside the table are refused, not guessed.
+    try testing.expectError(error.LengthMismatch, BuildStarted.read(ready_bytes[prefix_size..][0..7]));
+    try testing.expectError(error.LengthMismatch, StageReady.read(done_bytes[prefix_size..]));
+    var bad_status = done_bytes[prefix_size..];
+    bad_status[8] = 3;
+    try testing.expectError(error.InvalidBuild, BuildDone.read(bad_status));
+}
+
+test "the stage batch frames round-trip, and the entry keeps CHANGE_ENTRY's payload" {
+    var start_bytes: [prefix_size + stage_batch_start_size]u8 = undefined;
+    (StageBatchStart{ .stage = 1, .generation = 7, .parent = 6, .started_ns = 99 }).write(&start_bytes);
+    try testing.expectEqual(Kind.stage_batch_start, (try readPrefix(start_bytes[0..prefix_size])).kind);
+    const start = try StageBatchStart.read(start_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u16, 1), start.stage);
+    try testing.expectEqual(@as(u64, 7), start.generation);
+
+    var entry = std.mem.zeroes(format.Entry);
+    entry.flags_word = format.flags.regular_file | format.flags.content_known | 0x20;
+    var entry_bytes: [prefix_size + format.entry_size + 5]u8 = undefined;
+    writeChangeEntryAs(&entry_bytes, .stage_change_entry, entry, "A.jar");
+    const entry_frame = try readPrefix(entry_bytes[0..prefix_size]);
+    try testing.expectEqual(Kind.stage_change_entry, entry_frame.kind);
+    const change = try readChangeEntry(entry_bytes[prefix_size..][0..entry_frame.length]);
+    try testing.expectEqualStrings("A.jar", change.name);
+
+    var end_bytes: [prefix_size + stage_batch_end_size]u8 = undefined;
+    (StageBatchEnd{ .stage = 1, .generation = 7, .added = 2, .changed = 1, .deleted = 0 }).write(&end_bytes);
+    try testing.expectEqual(Kind.stage_batch_end, (try readPrefix(end_bytes[0..prefix_size])).kind);
+    const end = try StageBatchEnd.read(end_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u64, 2), end.added);
+    try testing.expectEqual(BuildStatus.ok, end.status);
+
+    var bad_status = end_bytes[prefix_size..];
+    bad_status[42] = 3;
+    try testing.expectError(error.InvalidBuild, StageBatchEnd.read(bad_status));
 }
 
 test "a git event is exactly twenty bytes, and a worktree event is the only variable one" {

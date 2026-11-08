@@ -39,6 +39,8 @@ const security = @import("security.zig");
 const socutil = @import("socutil");
 const filter_mod = @import("filter.zig");
 const safe_dir = @import("safe_dir.zig");
+const build_config = @import("build_config.zig");
+const stage_mod = @import("stage.zig");
 
 const usage =
     \\fsmeta — the fs-meta engine
@@ -72,6 +74,10 @@ const usage =
     \\  fsmeta roots   list [--json] [--state watching,asleep]
     \\  fsmeta root    add|remove|set|status|sleep|wake …
     \\                               manage the daemon's roots
+    \\  fsmeta stage   status <root> [--stage N] [--json]
+    \\  fsmeta stage   scan|diff <root> --stage N [--json] [--updated <ISO-8601>]
+    \\                               the declared stage folders from <root>/.fs-meta/build.json; scan publishes
+    \\                               the stage state under .fs-meta/stages/<NN>/, diff compares without writing
     \\
     \\options:
     \\  --no-gitignore               list everything except the reserved directories
@@ -105,6 +111,15 @@ pub fn main(init: std.process.Init) !void {
         try write(io, usage);
         return;
     };
+
+    // The stage subcommands have their own option shape (an action before the root), so they are parsed before
+    // the engine's positional root/options loop.
+    if (std.mem.eql(u8, command, "stage")) {
+        var rest: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer rest.deinit(gpa);
+        while (args.next()) |arg| try rest.append(gpa, arg);
+        return runStageCommand(io, gpa, rest.items);
+    }
 
     // The daemon's subcommands are their own plane: they talk to a control socket and never touch a trio, so
     // they are dispatched before any of the engine's option parsing applies to them.
@@ -208,9 +223,11 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "exclude")) return runExclude(io, arena, target);
     if (std.mem.eql(u8, command, "verify")) return verify(io, arena, target);
     if (std.mem.eql(u8, command, "scan")) {
+        const build = build_config.load(arena, io, target) catch build_config.Config.empty();
         return listFacts(io, arena, target, .{
             .hash_mode = hash_mode,
             .respect_gitignore = respect_gitignore,
+            .exclude_prefixes = build.folders,
         }, json_output);
     }
     if (std.mem.eql(u8, command, "ignored")) {
@@ -609,9 +626,11 @@ fn listFacts(io: std.Io, arena: std.mem.Allocator, root: []const u8, options: sc
 /// the answer for one path, and "why is this subtree absent" is a question about the current tree. Nothing here
 /// writes, so it is safe on a root the daemon is serving.
 fn runIgnored(io: std.Io, arena: std.mem.Allocator, root: []const u8, respect_gitignore: bool, json: bool) !void {
+    const build = build_config.load(arena, io, root) catch build_config.Config.empty();
     const result = try scan.scanDetailed(arena, io, root, .{
         .hash_mode = .none,
         .respect_gitignore = respect_gitignore,
+        .exclude_prefixes = build.folders,
     });
     // The walk's order is the file system's. A diagnostic is easier to diff when it is ordered by path.
     const items = try arena.dupe(scan.Pruned, result.pruned);
@@ -960,3 +979,144 @@ const BaselineStore = struct {
         return self.by_name.get(name);
     }
 };
+
+/// `fsmeta stage status|scan|diff <root> [--stage N] [--json]`.
+///
+/// The CLI and the daemon use the same `stage.refresh`; the only difference is that the CLI has no subscriber to
+/// stream to, so it prints the plan instead.
+fn runStageCommand(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var action: ?[]const u8 = null;
+    var root: ?[]const u8 = null;
+    var stage_number: ?u16 = null;
+    var json_output = false;
+    var updated: []const u8 = "1970-01-01T00:00:00Z";
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
+        } else if (std.mem.eql(u8, arg, "--stage")) {
+            index += 1;
+            if (index >= args.len) return fail(io, gpa, "stage --stage needs a number");
+            stage_number = std.fmt.parseInt(u16, args[index], 10) catch return fail(io, gpa, "stage --stage needs a number from 0 to 64");
+        } else if (std.mem.eql(u8, arg, "--updated")) {
+            index += 1;
+            if (index >= args.len) return fail(io, gpa, "stage --updated needs a timestamp");
+            updated = args[index];
+        } else if (arg.len > 0 and arg[0] == '-') {
+            return fail(io, gpa, "unknown stage option");
+        } else if (action == null) {
+            action = arg;
+        } else if (root == null) {
+            root = arg;
+        } else {
+            return fail(io, gpa, "stage takes one action and one root");
+        }
+    }
+    const verb = action orelse return fail(io, gpa, "stage needs status, scan or diff");
+    const target = root orelse return fail(io, gpa, "stage needs a root directory");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const declaration = build_config.load(arena, io, target) catch |err| {
+        const message = try std.fmt.allocPrint(arena, "build.json is not usable: {s}", .{@errorName(err)});
+        return fail(io, gpa, message);
+    };
+
+    if (std.mem.eql(u8, verb, "status")) {
+        return printStageStatus(io, arena, target, declaration, stage_number, json_output);
+    }
+    if (!std.mem.eql(u8, verb, "scan") and !std.mem.eql(u8, verb, "diff")) {
+        return fail(io, gpa, "stage needs status, scan or diff");
+    }
+    const number = stage_number orelse return fail(io, gpa, "stage scan/diff needs --stage N");
+    const outcome = stage_mod.refresh(arena, io, target, declaration, number, .{
+        .write = std.mem.eql(u8, verb, "scan"),
+        .updated = updated,
+    }) catch |err| switch (err) {
+        error.StageNotDeclared => {
+            const message = try std.fmt.allocPrint(arena, "stage {d} is not declared in {s}/.fs-meta/build.json", .{ number, target });
+            return fail(io, gpa, message);
+        },
+        else => return err,
+    };
+
+    if (json_output) {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.writeAll("[");
+        var first = true;
+        if (outcome.plan) |plan| {
+            for (plan.entries, plan.names) |entry, name| {
+                const kind = batch.kindOf(entry) orelse continue;
+                if (!first) try out.writer.writeAll(",");
+                first = false;
+                var hash: [16]u8 = undefined;
+                try out.writer.print("{{\"change\":\"{s}\",\"name\":", .{@tagName(kind)});
+                try writeJsonString(&out.writer, name);
+                try out.writer.print(",\"contentHash\":\"{s}\"}}", .{format.hex(entry.content_hash, &hash)});
+            }
+        }
+        try out.writer.writeAll("]\n");
+        return write(io, out.written());
+    }
+
+    const generation = if (outcome.published) try std.fmt.allocPrint(arena, "stage {d}: generation {d} (added {d}, changed {d}, deleted {d})\n", .{
+        outcome.stage, outcome.generation, outcome.added, outcome.changed, outcome.deleted,
+    }) else try std.fmt.allocPrint(arena, "stage {d}: no changes (generation {d})\n", .{ outcome.stage, outcome.generation });
+    try write(io, generation);
+    if (outcome.plan) |plan| {
+        for (plan.entries, plan.names) |entry, name| {
+            const kind = batch.kindOf(entry) orelse continue;
+            const line = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ @tagName(kind), name });
+            try write(io, line);
+        }
+    }
+}
+
+fn printStageStatus(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    root: []const u8,
+    declaration: build_config.Config,
+    only: ?u16,
+    json_output: bool,
+) !void {
+    if (json_output) {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.writeAll("[");
+        var first = true;
+        for (declaration.stages) |stage| {
+            if (only) |number| {
+                if (stage.number != number) continue;
+            }
+            if (!first) try out.writer.writeAll(",");
+            first = false;
+            const state = stage_mod.stateInfo(arena, io, root, stage.number) catch null;
+            try out.writer.print("{{\"stage\":{d},\"folders\":[", .{stage.number});
+            for (stage.folders, 0..) |folder, folder_index| {
+                if (folder_index != 0) try out.writer.writeAll(",");
+                try writeJsonString(&out.writer, folder);
+            }
+            try out.writer.print("],\"hash\":\"{s}\",\"generation\":{d}", .{ @tagName(stage.hash_mode), if (state) |value| value.generation else 0 });
+            try out.writer.writeAll("}");
+        }
+        try out.writer.writeAll("]\n");
+        return write(io, out.written());
+    }
+    for (declaration.stages) |stage| {
+        if (only) |number| {
+            if (stage.number != number) continue;
+        }
+        const state = stage_mod.stateInfo(arena, io, root, stage.number) catch null;
+        var folders: std.Io.Writer.Allocating = .init(arena);
+        for (stage.folders, 0..) |folder, folder_index| {
+            if (folder_index != 0) try folders.writer.writeAll(", ");
+            try folders.writer.writeAll(folder);
+        }
+        const line = try std.fmt.allocPrint(arena, "stage {d}: folders [{s}], hash {s}, generation {d}\n", .{
+            stage.number, folders.written(), @tagName(stage.hash_mode), if (state) |value| value.generation else 0,
+        });
+        try write(io, line);
+    }
+}

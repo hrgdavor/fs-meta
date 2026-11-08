@@ -18,7 +18,10 @@ port is then announced on stdout as `socutil listening on http://127.0.0.1:<port
 any other command given it fails with `fsmeta: --http is only valid for the serve command`. `fsmeta daemon` is the
 other shape: **one long-lived process that tracks several roots**, each with its own socket at
 `<runtime>/roots/<id>.sock`, speaking the same binary protocol. A consumer connects, `SUBSCRIBE`s, and receives
-batches as the tree changes — the same batches the engine writes. `FORMAT.daemon.md` is the reference; this is the
+batches as the tree changes — the same batches the engine writes. A build pipeline can also stage its subscribers:
+`SUBSCRIBE_V2` declares a stage and a builder role, `BUILD_STARTED`/`BUILD_DONE` are the builder's
+acknowledgement, and `STAGE_READY` releases the next stage once every builder of the previous one is done
+([`FORMAT.socket.md`](../FORMAT.socket.md) § BUILD_STAGES). `FORMAT.daemon.md` is the reference; this is the
 working view.
 
 ```sh

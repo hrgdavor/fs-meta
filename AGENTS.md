@@ -86,6 +86,17 @@ starts a competing watcher.
   `<id>.sock` names and its claims describe a machine and a running process; the trio keeps containing no absolute
   path (`FORMAT.md` § 3.1). A change that would put a path into a stored byte needs a format change, not a daemon one.
 
+- **Build stages are a daemon barrier, not a trio field.** A `SUBSCRIBE_V2` stage, a builder's
+  `done_through`, and `STAGE_READY` describe one running pipeline; they are in memory, per root, and are rebuilt
+  from the client's `from_batch` on reconnect. Build artifacts stay ignored by the root walk and out of the root
+  trio (`FORMAT.socket.md` § BUILD_STAGES, `plans/build-artifacts.md`): the barrier says *when* a stage may run.
+  The stage-local state under `.fs-meta/stages/<NN>/` is a cache with the same trio shape, not the root trio: it is
+  regenerable, carries workspace-relative names and its own generations/batches, and its declared folders are a
+  `stage` ignore source excluded from the root walk. A late stage subscriber replays the producer's archive with
+  `SUBSCRIBE_V3`/`from_stage_batch`; the archived entries are hash-ordered, live stage entries observation-ordered.
+  A builder timeout, the `stage_blocked`/counter fields in `root status`, and the `build.json` change poll are
+  daemon state, never trio fields. A plain `SUBSCRIBE` must stay the stage-0, pass-all listener it is today.
+
 - **A boundary is ignored, not scanned twice.** A directory whose `.git` entry confirms is another repository — a
   clone, a submodule checkout or a linked worktree — and the walk neither lists nor enters it. A served nested root is
   hidden from its parent by the managed ignore block, so one tree is never described by two trios. This is a property

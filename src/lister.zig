@@ -49,6 +49,10 @@ pub const Tree = struct {
     /// The two root-level sources (`info/exclude` and `.fs-meta/ignore`). Read for every pass by the engine; a tree
     /// built without them lists exactly as it did before M1.
     sources: ?*ignores.Sources = null,
+    /// Workspace-relative folders that belong to a build stage. They are not listed and not entered; the stage
+    /// state describes them instead (`plans/build-artifacts.md` § 7.2). An ancestor of a declared folder is still
+    /// entered, because the walk has to reach the folder boundary before it can exclude it.
+    exclude_prefixes: []const []const u8 = &.{},
     /// Force the naive listing — a readdir plus a `stat` (and an identity handle) per entry — instead of the
     /// platform bulk call. It exists to be measured against, not to be used.
     per_file: bool = false,
@@ -62,6 +66,15 @@ pub const Tree = struct {
     /// The four-source decision of `plans/worktrees.md` § 5, asked about one child of `dir_path`. The `.gitignore`
     /// stack is the first source; `info/exclude` and `.fs-meta/ignore` follow through `Sources`, whose `decide`
     /// stops at the first exclusion and therefore cannot re-open an earlier one with a `!`.
+    fn excluded(self: *const Tree, rel_path: []const u8) bool {
+        for (self.exclude_prefixes) |prefix| {
+            if (std.mem.startsWith(u8, rel_path, prefix)) {
+                if (rel_path.len == prefix.len or rel_path[prefix.len] == '/') return true;
+            }
+        }
+        return false;
+    }
+
     fn isIgnored(self: *const Tree, allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, is_dir: bool) !bool {
         if (self.ignore) |stack| {
             if (try stack.ignored(dir_path, name, is_dir)) return true;
@@ -120,6 +133,10 @@ pub fn list(self: *Tree, allocator: std.mem.Allocator, dir_path: []const u8) ![]
             continue;
         }
         if (!self.visible(entry.name, entry.kind == .dir)) continue;
+        if (self.exclude_prefixes.len > 0) {
+            const rel_path = try relativePath(self, allocator, dir_path, entry.name);
+            if (self.excluded(rel_path)) continue;
+        }
         if (check_rules or check_sources) {
             if (try self.isIgnored(allocator, dir_path, entry.name, entry.kind == .dir)) continue;
         }

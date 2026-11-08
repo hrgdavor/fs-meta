@@ -62,6 +62,8 @@ const reaper = @import("reaper.zig");
 const state = @import("state.zig");
 const safe_dir = @import("../safe_dir.zig");
 const socket_security = @import("../socket_security.zig");
+const build_config = @import("../build_config.zig");
+const stage_mod = @import("../stage.zig");
 
 /// The watcher every root uses: nightwatch's recommended backend for this platform (ReadDirectoryChangesW on
 /// Windows, FSEvents/kqueue on macOS, inotify on Linux), all of which deliver from their own thread.
@@ -172,6 +174,18 @@ pub const Snapshot = struct {
     /// `GIT_EVENT` frames sent to this root's subscribers, and passes a finish waited for (§ 5d counters).
     git_events: u64 = 0,
     git_passes: u64 = 0,
+    /// Stage-batch counters and the current barrier. `stage_blocked` is the lowest stage with a builder that has
+    /// not acknowledged its release, or `null` when nothing is waiting.
+    stage_batches: u64 = 0,
+    stage_scan_failures: u64 = 0,
+    stage_timeouts: u64 = 0,
+    stage_blocked: ?u16 = null,
+    stage_blocked_generation: u64 = 0,
+    stage_builders: u32 = 0,
+    stage_timeout_ms: i64 = 60_000,
+    last_stage_scan_ms: i64 = 0,
+    last_stage_scan_duration_ms: i64 = 0,
+    last_stage_error: []const u8 = "",
     /// This root's own `gitwatch`, reported so a caller that is not the daemon can ask whether a hook spool for it
     /// would ever be read (`fsmeta daemon hooks install` refuses when it would not: `plans/worktrees.md` § 5c, M5).
     gitwatch: bool = true,
@@ -264,6 +278,30 @@ fn takeKinds(stamps: *[8]std.atomic.Value(u64)) PendingKinds {
 const Subscriber = struct {
     stream: std.Io.net.Stream,
     from_batch: u64,
+    /// The staged-build stage (`FORMAT.socket.md` § BUILD_STAGES). The original `SUBSCRIBE` is stage 0; a
+    /// subscriber at a later stage receives a batch only after every builder of the previous stage has
+    /// acknowledged it.
+    stage: u16 = 0,
+    /// Whether this subscriber is a builder that acknowledges batches. A listener never blocks the next stage;
+    /// a builder must send `BUILD_DONE` (or disconnect) for a generation to release it.
+    builder: bool = false,
+    /// The newest generation this builder has acknowledged. Monotonic; it never moves backwards. It starts at the
+    /// generation the subscriber joined from, so a builder that connects at `LATEST` does not hold the pipeline
+    /// at an older generation it will never receive.
+    done_through: u64 = 0,
+    /// The last generation for which this subscriber was sent `STAGE_READY`. Tracked per connection so a
+    /// reconnect receives the current ready signal once, and a repeated pump does not repeat it.
+    last_ready: u64 = 0,
+    /// The generation the last `BUILD_STARTED` named. Diagnostic; `done_through` is the barrier's only state.
+    started_generation: u64 = 0,
+    /// When `BUILD_STARTED` arrived, for the builder timeout. 0 means no build is in flight.
+    started_ms: i64 = 0,
+    /// When work was last delivered to this builder. It is the fallback deadline for a builder that never sent
+    /// `BUILD_STARTED`; 0 means no unacknowledged work is outstanding.
+    work_since_ms: i64 = 0,
+    /// The newest stage batch this subscriber has applied (`SUBSCRIBE_V3`). `null` means the client supplied no
+    /// cursor; it starts at the stage head rather than replaying the archive. Stage 0 does not use it.
+    from_stage_batch: ?u64 = null,
     /// The compiled server-side name filter (`FORMAT.socket.md` § SUBSCRIBE filter patterns). An 8-byte
     /// `SUBSCRIBE` leaves it pass-all. The pattern bytes live in `filter_storage`, **not** in the
     /// connection arena: the scheduler broadcasts under the root lock, and the connection arena is
@@ -474,6 +512,22 @@ pub const RootRuntime = struct {
     /// Counters (§ 5d): `GIT_EVENT` frames sent, and passes a finish waited for.
     git_events: u64 = 0,
     git_passes: u64 = 0,
+    /// Stage-batch counters, the last scan's cost, and builder timeouts.
+    stage_batches: u64 = 0,
+    stage_scan_failures: u64 = 0,
+    stage_timeouts: u64 = 0,
+    last_stage_scan_ms: i64 = 0,
+    last_stage_scan_duration_ms: i64 = 0,
+    last_stage_error: []const u8 = "",
+    /// A timeout of 0 disables the policy. A builder that started and has not acknowledged for this long is
+    /// treated as failed: its successor is released and `stage_timeouts` is incremented.
+    stage_timeout_ms: i64 = 60_000,
+    /// The root's last-seen `build.json` stamp. `.fs-meta` is not a watcher event, so the tick polls this.
+    build_config_stamp: ?u64 = null,
+    build_config_checked: bool = false,
+    /// The generation at which each undeclared-builder stage was last scanned, so a stage with no builders is
+    /// checked once per release rather than on every tick.
+    undeclared_stage_scanned: [wire.max_stage + 1]u64 = @splat(0),
     /// The last emitted `GIT_EVENT`, for `root status` (§ 8.12). Set before the subscriber check, so it reports what
     /// the root observed even while nobody is listening.
     last_git_kind: ?wire.GitKind = null,
@@ -682,6 +736,7 @@ pub const RootRuntime = struct {
         if (!self.lockWithin(budget_ms)) return error.Busy;
         defer self.unlock();
         const git_status = self.gitStatus();
+        const barrier = self.stageBarrierLocked();
         return .{
             .id = self.record.id,
             .root = self.root_path,
@@ -717,6 +772,16 @@ pub const RootRuntime = struct {
             .last_git_at_ms = self.last_git_at_ms,
             .git_events = self.git_events,
             .git_passes = self.git_passes,
+            .stage_batches = self.stage_batches,
+            .stage_scan_failures = self.stage_scan_failures,
+            .stage_timeouts = self.stage_timeouts,
+            .stage_blocked = barrier.blocked,
+            .stage_blocked_generation = barrier.generation,
+            .stage_builders = barrier.builders,
+            .stage_timeout_ms = self.stage_timeout_ms,
+            .last_stage_scan_ms = self.last_stage_scan_ms,
+            .last_stage_scan_duration_ms = self.last_stage_scan_duration_ms,
+            .last_stage_error = self.last_stage_error,
             .gitwatch = self.record.gitwatch,
             .worktrees = self.record.worktrees,
             .worktree = if (self.git) |location| location.is_gitfile else false,
@@ -961,6 +1026,9 @@ pub const RootRuntime = struct {
             .none => {},
         }
         self.syncWatcherLocked();
+
+        self.checkStageTimeoutsLocked(now_ms);
+        if (self.machine.phase == .watching and self.checkBuildConfigLocked(now_ms)) return;
 
         // The hook spool is the precision source (`plans/worktrees.md` § 5c). It is read before the latch and before
         // any pass, so a `prepared` start goes out while the operation is still in flight, and a `committed` finish is
@@ -1822,15 +1890,371 @@ pub const RootRuntime = struct {
         self.dropDeadLocked();
     }
 
-    /// Send one batch as `START_BATCH` … `END_BATCH`. A batch is a transaction: no `STATE` may appear inside.
+    /// Send one batch as `START_BATCH` … `END_BATCH` to stage 0, then release every stage the barrier allows.
+    /// A batch is a transaction: no `STATE` or `STAGE_READY` may appear inside it.
     fn broadcastBatchLocked(self: *RootRuntime, arena: std.mem.Allocator, generation: u64, plan: batch_mod.Plan) void {
         for (self.subscribers.items) |subscriber| {
-            if (!subscriber.alive) continue;
+            if (!subscriber.alive or subscriber.stage != 0) continue;
             self.sendBatch(arena, subscriber, generation, plan) catch {
                 subscriber.alive = false;
             };
         }
         self.dropDeadLocked();
+        self.pumpStagesLocked(arena);
+        self.scanStagesWithoutBuildersLocked(arena);
+    }
+
+    /// The newest generation every builder of `stage` has acknowledged. A stage with no builder is never a
+    /// barrier: its answer is the root's head, which is what makes a pipeline with no declared builders behave
+    /// exactly like the old single stream.
+    fn ackedThroughLocked(self: *RootRuntime, stage: u16) u64 {
+        var acked: ?u64 = null;
+        for (self.subscribers.items) |subscriber| {
+            if (!subscriber.alive or !subscriber.builder or subscriber.stage != stage) continue;
+            acked = if (acked) |value| @min(value, subscriber.done_through) else subscriber.done_through;
+        }
+        return acked orelse self.machine.head_batch;
+    }
+
+    const StageBarrier = struct {
+        blocked: ?u16 = null,
+        generation: u64 = 0,
+        builders: u32 = 0,
+    };
+
+    /// The lowest stage whose builders have not acknowledged the generation their stage was released to.
+    fn stageBarrierLocked(self: *RootRuntime) StageBarrier {
+        var result = StageBarrier{};
+        for (self.subscribers.items) |subscriber| {
+            if (!subscriber.alive or !subscriber.builder) continue;
+            result.builders += 1;
+            const released = self.releasedThroughLocked(subscriber.stage);
+            if (subscriber.done_through >= released) continue;
+            if (result.blocked == null or subscriber.stage < result.blocked.?) {
+                result.blocked = subscriber.stage;
+                result.generation = released;
+            }
+        }
+        return result;
+    }
+
+    /// Whether a builder is subscribed at this stage.
+    fn hasBuilderLocked(self: *RootRuntime, stage: u16) bool {
+        for (self.subscribers.items) |subscriber| {
+            if (subscriber.alive and subscriber.builder and subscriber.stage == stage) return true;
+        }
+        return false;
+    }
+
+    /// The newest generation a subscriber at `stage` may receive. Stage 0 is the source stream; every later
+    /// stage waits for the builders of the stage before it.
+    fn releasedThroughLocked(self: *RootRuntime, stage: u16) u64 {
+        if (stage == 0) return self.machine.head_batch;
+        return @min(self.machine.head_batch, self.ackedThroughLocked(stage - 1));
+    }
+
+    /// Scan a stage only when every builder of that stage has acknowledged its release. One of two builders
+    /// finishing early must not scan a folder the other is still writing.
+    fn maybeScanStageAfterAckLocked(self: *RootRuntime, arena: std.mem.Allocator, stage: u16) void {
+        if (self.ackedThroughLocked(stage) >= self.releasedThroughLocked(stage)) {
+            self.scanStageAfterBuildLocked(arena, stage);
+        }
+    }
+
+    /// A stage with no builders is not a barrier, but its folder is still an output. Scan it once per release so
+    /// a script that wrote the folder is noticed without a subscribed builder.
+    fn scanStagesWithoutBuildersLocked(self: *RootRuntime, arena: std.mem.Allocator) void {
+        const declaration = build_config.load(arena, self.io, self.record.root) catch return;
+        for (declaration.stages) |stage| {
+            if (self.hasBuilderLocked(stage.number)) continue;
+            // Stage N's output is scannable once its predecessor is released to it. Stage 0 is released at the head.
+            const trigger = self.releasedThroughLocked(stage.number);
+            if (trigger == 0 or trigger <= self.undeclared_stage_scanned[stage.number]) continue;
+            self.undeclared_stage_scanned[stage.number] = trigger;
+            self.scanStageAfterBuildLocked(arena, stage.number);
+        }
+    }
+
+    /// A content hash of `<root>/.fs-meta/build.json`. A missing file is `null`, which is also a distinct state
+    /// from "never checked" thanks to `build_config_checked`. Hashing the small document (rather than mtime+size)
+    /// catches a same-size edit on a filesystem with coarse timestamps.
+    fn buildConfigStampLocked(self: *RootRuntime) ?u64 {
+        var meta = openMetaDir(self.io, self.record.root, self.allocator) catch return null;
+        defer meta.close(self.io);
+        const bytes = meta.readFileAlloc(self.io, build_config.file_name, self.allocator, std.Io.Limit.limited(1 << 20)) catch return null;
+        defer self.allocator.free(bytes);
+        return format.wyhash(bytes);
+    }
+
+    /// `.fs-meta` is not a watcher event, so a changed `build.json` is polled on the tick. A change runs one pass
+    /// (so the root walk's stage exclusions follow it) and clears the undeclared-stage scan marks.
+    fn checkBuildConfigLocked(self: *RootRuntime, now_ms: i64) bool {
+        const stamp = self.buildConfigStampLocked();
+        if (!self.build_config_checked) {
+            self.build_config_checked = true;
+            self.build_config_stamp = stamp;
+            return false;
+        }
+        if (stamp == self.build_config_stamp) return false;
+        self.build_config_stamp = stamp;
+        @memset(self.undeclared_stage_scanned[0..], 0);
+        if (self.machine.phase != .watching) return false;
+        self.log("build.json changed; running a pass", .{});
+        _ = self.runPassLocked(now_ms, .event);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        self.scanStagesWithoutBuildersLocked(arena_state.allocator());
+        return true;
+    }
+
+    /// A builder that said "I started" and never acknowledged is treated as failed at the configured timeout.
+    /// This releases its successor; the state records the failure in `stage_timeouts` and the log.
+    fn checkStageTimeoutsLocked(self: *RootRuntime, now_ms: i64) void {
+        if (self.stage_timeout_ms <= 0) return;
+        var timed_stages: [wire.max_stage + 1]bool = @splat(false);
+        var changed = false;
+        for (self.subscribers.items) |subscriber| {
+            if (!subscriber.alive or !subscriber.builder) continue;
+            const released = self.releasedThroughLocked(subscriber.stage);
+            if (released == 0 or subscriber.done_through >= released) {
+                subscriber.started_ms = 0;
+                subscriber.work_since_ms = 0;
+                continue;
+            }
+            // A builder that never sent `BUILD_STARTED` still has work once a batch was delivered. The delivery
+            // time is the deadline's origin; a started build uses its start, which may be earlier.
+            const since = if (subscriber.started_ms != 0) subscriber.started_ms else subscriber.work_since_ms;
+            if (since == 0 or now_ms < since or now_ms - since < self.stage_timeout_ms) continue;
+            subscriber.done_through = released;
+            subscriber.started_ms = 0;
+            subscriber.work_since_ms = 0;
+            self.stage_timeouts += 1;
+            timed_stages[subscriber.stage] = true;
+            changed = true;
+            self.log("build: stage {d} timed out waiting for generation {d}", .{ subscriber.stage, released });
+        }
+        if (!changed) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        self.pumpStagesLocked(arena);
+        for (timed_stages, 0..) |timed, stage| {
+            if (timed) self.maybeScanStageAfterAckLocked(arena, @intCast(stage));
+        }
+        self.scanStagesWithoutBuildersLocked(arena);
+    }
+
+    /// Deliver every batch a stage is now allowed to see, then announce `STAGE_READY`. Called after a batch is
+    /// published and after a builder acknowledges one; the loop is what lets a stage with no builder pass the
+    /// release straight through to the next stage in the same turn.
+    fn pumpStagesLocked(self: *RootRuntime, arena: std.mem.Allocator) void {
+        while (true) {
+            var progressed = false;
+            var max_stage: u16 = 0;
+            for (self.subscribers.items) |subscriber| {
+                if (subscriber.alive and subscriber.stage > max_stage) max_stage = subscriber.stage;
+            }
+            var stage: u16 = 1;
+            while (stage <= max_stage) : (stage += 1) {
+                const target = self.releasedThroughLocked(stage);
+                for (self.subscribers.items) |subscriber| {
+                    if (!subscriber.alive or subscriber.stage != stage) continue;
+                    if (subscriber.from_batch < target) {
+                        self.sendPendingLocked(arena, subscriber, target) catch {
+                            subscriber.alive = false;
+                            continue;
+                        };
+                        progressed = true;
+                    }
+                    // The ready frame follows the batches it announces. It is per generation, not per batch:
+                    // a stage that only needs "your input may have changed" sees one signal.
+                    if (target > subscriber.last_ready) {
+                        self.sendStageReadyLocked(subscriber, stage, target) catch {
+                            subscriber.alive = false;
+                            continue;
+                        };
+                        subscriber.last_ready = target;
+                        progressed = true;
+                    }
+                }
+            }
+            self.dropDeadLocked();
+            if (!progressed) return;
+        }
+    }
+
+    /// Send the archive batches `from_batch + 1 ..= target` to one subscriber. The archive is re-opened per pump
+    /// so a batch that was rotated away is a `BatchGap` on the ordinary path, never a half-sent stream.
+    fn sendPendingLocked(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber, target: u64) !void {
+        const io = self.io;
+        const window = try server.openBatchWindow(io, self.record.root);
+        defer if (window.dir) |dir| dir.close(io);
+        const dir = window.dir orelse return error.BatchGap;
+        var generation = subscriber.from_batch + 1;
+        while (generation <= target) : (generation += 1) {
+            const plan = server.loadBatch(arena, io, dir, generation) catch |err| switch (err) {
+                error.BatchGap => return error.BatchGap,
+                else => return err,
+            };
+            try self.sendBatch(arena, subscriber, generation, plan);
+        }
+    }
+
+    fn sendStageReadyLocked(self: *RootRuntime, subscriber: *Subscriber, stage: u16, released_through: u64) !void {
+        var bytes: [wire.prefix_size + wire.stage_ready_size]u8 = undefined;
+        (wire.StageReady{
+            .stage = stage,
+            .head_batch = self.machine.head_batch,
+            .released_through = released_through,
+        }).write(&bytes);
+        try writeAll(self.io, subscriber.stream, &bytes);
+    }
+
+    /// A stage's builders finished: scan that stage's declared folders and send its artifact batch to the next
+    /// stage. The state is published even when no subscriber wants the stream, so `fsmeta stage diff` sees it.
+    fn scanStageAfterBuildLocked(self: *RootRuntime, arena: std.mem.Allocator, producer_stage: u16) void {
+        if (producer_stage >= wire.max_stage) return;
+        const scan_started = nowMs(self.io);
+        const declaration = build_config.load(arena, self.io, self.record.root) catch |err| {
+            self.stage_scan_failures += 1;
+            self.last_stage_error = @errorName(err);
+            self.last_stage_scan_ms = scan_started;
+            self.last_stage_scan_duration_ms = nowMs(self.io) - scan_started;
+            self.log("stage {d}: build.json is not usable ({s})", .{ producer_stage, @errorName(err) });
+            return;
+        };
+        _ = declaration.find(producer_stage) orelse return;
+        const consumer_stage = producer_stage + 1;
+
+        const Target = struct {
+            subscriber: *Subscriber,
+            added: u64 = 0,
+            changed: u64 = 0,
+            deleted: u64 = 0,
+        };
+        const StageStream = struct {
+            root: *RootRuntime,
+            producer_stage: u16,
+            targets: []Target,
+            generation: u64 = 0,
+            started: bool = false,
+            finished: bool = false,
+
+            fn start(raw: *anyopaque, stage: u16, generation: u64, parent: u64) void {
+                const stream: *@This() = @ptrCast(@alignCast(raw));
+                _ = parent;
+                stream.generation = generation;
+                stream.started = true;
+                for (stream.targets) |*target| {
+                    if (!target.subscriber.alive) continue;
+                    var bytes: [wire.prefix_size + wire.stage_batch_start_size]u8 = undefined;
+                    (wire.StageBatchStart{
+                        .stage = stage,
+                        .generation = generation,
+                        .parent = if (generation > 0) generation - 1 else 0,
+                        .started_ns = @intCast(@max(std.Io.Clock.real.now(stream.root.io).nanoseconds, 0)),
+                    }).write(&bytes);
+                    writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
+                        target.subscriber.alive = false;
+                    };
+                }
+            }
+
+            fn change(raw: *anyopaque, item: stage_mod.Change) void {
+                const stream: *@This() = @ptrCast(@alignCast(raw));
+                for (stream.targets) |*target| {
+                    if (!target.subscriber.alive or !target.subscriber.filter.matches(item.name)) continue;
+                    const frame = stream.root.allocator.alloc(u8, wire.prefix_size + format.entry_size + item.name.len) catch return;
+                    defer stream.root.allocator.free(frame);
+                    wire.writeChangeEntryAs(frame, .stage_change_entry, item.entry, item.name);
+                    writeAll(stream.root.io, target.subscriber.stream, frame) catch {
+                        target.subscriber.alive = false;
+                        continue;
+                    };
+                    switch (item.kind) {
+                        .added => target.added += 1,
+                        .changed => target.changed += 1,
+                        .deleted => target.deleted += 1,
+                    }
+                }
+            }
+
+            fn finish(raw: *anyopaque, stage: u16, generation: u64, added: u64, changed: u64, deleted: u64, ok: bool) void {
+                _ = added;
+                _ = changed;
+                _ = deleted;
+                const stream: *@This() = @ptrCast(@alignCast(raw));
+                stream.finishWith(stage, generation, ok);
+            }
+
+            fn finishWith(stream: *@This(), stage: u16, generation: u64, ok: bool) void {
+                if (!stream.started or stream.finished) return;
+                stream.finished = true;
+                for (stream.targets) |*target| {
+                    if (!target.subscriber.alive) continue;
+                    if (ok) target.subscriber.from_stage_batch = generation;
+                    var bytes: [wire.prefix_size + wire.stage_batch_end_size]u8 = undefined;
+                    (wire.StageBatchEnd{
+                        .stage = stage,
+                        .generation = generation,
+                        .added = target.added,
+                        .changed = target.changed,
+                        .deleted = target.deleted,
+                        .status = if (ok) .ok else .failed,
+                    }).write(&bytes);
+                    writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
+                        target.subscriber.alive = false;
+                    };
+                }
+                stream.root.dropDeadLocked();
+            }
+        };
+
+        var targets: std.ArrayListUnmanaged(Target) = .empty;
+        defer targets.deinit(arena);
+        for (self.subscribers.items) |subscriber| {
+            if (subscriber.alive and subscriber.stage == consumer_stage) {
+                targets.append(arena, .{ .subscriber = subscriber }) catch return;
+            }
+        }
+
+        var stream_ctx = StageStream{
+            .root = self,
+            .producer_stage = producer_stage,
+            .targets = targets.items,
+        };
+        const stream: ?stage_mod.Stream = if (targets.items.len > 0) .{
+            .ctx = &stream_ctx,
+            .on_start = StageStream.start,
+            .on_change = StageStream.change,
+            .on_finish = StageStream.finish,
+        } else null;
+
+        var stamp_buffer: [32]u8 = undefined;
+        const outcome = stage_mod.refresh(arena, self.io, self.record.root, declaration, producer_stage, .{
+            .write = true,
+            .updated = rfc3339Utc(nowMs(self.io), &stamp_buffer),
+            .stream = stream,
+        }) catch |err| {
+            stream_ctx.finishWith(producer_stage, stream_ctx.generation, false);
+            self.stage_scan_failures += 1;
+            self.last_stage_error = @errorName(err);
+            self.last_stage_scan_ms = scan_started;
+            self.last_stage_scan_duration_ms = nowMs(self.io) - scan_started;
+            self.log("stage {d}: scan failed ({s})", .{ producer_stage, @errorName(err) });
+            return;
+        };
+        self.last_stage_scan_ms = scan_started;
+        self.last_stage_scan_duration_ms = nowMs(self.io) - scan_started;
+        self.last_stage_error = "";
+        if (outcome.published) self.stage_batches += 1;
+        if (outcome.plan) |plan| {
+            if (plan.entries.len > 0) {
+                self.log("stage {d}: generation {d}, {d} artifact change(s)", .{ producer_stage, outcome.generation, plan.entries.len });
+            }
+        }
+        // The stage batch is now visible; a later stage with no builders may be due a scan against it.
+        self.scanStagesWithoutBuildersLocked(arena);
     }
 
     /// Send one batch as `START_BATCH` … `END_BATCH`, applying the subscriber's filter. The replay
@@ -1852,25 +2276,114 @@ pub const RootRuntime = struct {
         }
         try server.sendEndBatch(io, subscriber.stream, generation, counted);
         subscriber.from_batch = generation;
+        if (subscriber.builder) subscriber.work_since_ms = nowMs(io);
     }
 
-    /// Replay the archive from `from_batch` up to the head, to one subscriber.
+    /// Replay the archive from `from_batch` up to what this subscriber's stage may see, to one subscriber.
+    ///
+    /// For a stage above 0 the ceiling is `released(stage)`, not the root head: a subscriber that reconnects
+    /// must not jump over a build stage that has not finished, even though the archive already has its batches.
+    /// The ready frame follows the replay so a stage that only needs the barrier's signal is not left waiting.
     fn replayLocked(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber, from_batch: u64) !void {
         const io = self.io;
         const window = try server.openBatchWindow(io, self.record.root);
         defer if (window.dir) |dir| dir.close(io);
-        const dir = window.dir orelse return;
-        var generation = from_batch + 1;
+        const target = @min(window.last, self.releasedThroughLocked(subscriber.stage));
+        if (window.dir) |dir| {
+            var generation = from_batch + 1;
+            while (generation <= target) : (generation += 1) {
+                const plan = server.loadBatch(arena, io, dir, generation) catch |err| switch (err) {
+                    error.BatchGap => {
+                        server.refuse(io, subscriber.stream, .batch_gap, "no batch {d}; the archive ends at {d}", .{ generation, window.last });
+                        return error.BatchGap;
+                    },
+                    else => return err,
+                };
+                try self.sendBatch(arena, subscriber, generation, plan);
+            }
+        }
+        if (subscriber.stage > 0 and target > subscriber.last_ready) {
+            try self.sendStageReadyLocked(subscriber, subscriber.stage, target);
+            subscriber.last_ready = target;
+        }
+    }
+
+    /// Replay the producer stage's artifact batches to a consumer-stage subscriber. `SUBSCRIBE_V2` has no cursor,
+    /// so it starts at the stage head; `SUBSCRIBE_V3` supplies `from_stage_batch` and gets the archive from there.
+    fn replayStageBatchesLocked(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber) !void {
+        if (subscriber.stage == 0) return;
+        const producer_stage = subscriber.stage - 1;
+        const window = try stage_mod.openBatchWindow(self.io, self.record.root, producer_stage);
+        defer if (window.dir) |dir| dir.close(self.io);
+        const dir = window.dir orelse {
+            subscriber.from_stage_batch = 0;
+            return;
+        };
+        const from = subscriber.from_stage_batch orelse {
+            subscriber.from_stage_batch = window.last;
+            return;
+        };
+        if (from > window.last) {
+            server.refuse(self.io, subscriber.stream, .protocol, "from_stage_batch {d} is newer than the newest stage batch {d}", .{ from, window.last });
+            return error.BatchGap;
+        }
+        if (window.first) |first| {
+            if (from + 1 < first) {
+                server.refuse(self.io, subscriber.stream, .batch_too_old, "stage batches start at {d}, so from_stage_batch {d} cannot be replayed", .{ first, from });
+                return error.BatchGap;
+            }
+        }
+        var generation = from + 1;
         while (generation <= window.last) : (generation += 1) {
-            const plan = server.loadBatch(arena, io, dir, generation) catch |err| switch (err) {
+            const plan = server.loadBatch(arena, self.io, dir, generation) catch |err| switch (err) {
                 error.BatchGap => {
-                    server.refuse(io, subscriber.stream, .batch_gap, "no batch {d}; the archive ends at {d}", .{ generation, window.last });
+                    server.refuse(self.io, subscriber.stream, .batch_gap, "no stage batch {d}; the archive ends at {d}", .{ generation, window.last });
                     return error.BatchGap;
                 },
                 else => return err,
             };
-            try self.sendBatch(arena, subscriber, generation, plan);
+            try self.sendStageBatchToSubscriber(arena, subscriber, producer_stage, generation, plan);
+            subscriber.from_stage_batch = generation;
         }
+    }
+
+    /// Send one archived stage batch as `STAGE_BATCH_START … STAGE_BATCH_END`. The archive is hash-ordered; a
+    /// live stage batch is observation-ordered. Both carry the same 64-byte entry, and neither promises a write
+    /// order to the consumer.
+    fn sendStageBatchToSubscriber(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber, producer_stage: u16, generation: u64, plan: batch_mod.Plan) !void {
+        var start_bytes: [wire.prefix_size + wire.stage_batch_start_size]u8 = undefined;
+        (wire.StageBatchStart{
+            .stage = producer_stage,
+            .generation = generation,
+            .parent = if (generation > 0) generation - 1 else 0,
+            .started_ns = 0,
+        }).write(&start_bytes);
+        try writeAll(self.io, subscriber.stream, &start_bytes);
+
+        var added: u64 = 0;
+        var changed: u64 = 0;
+        var deleted: u64 = 0;
+        for (plan.entries, plan.names) |entry, name| {
+            if (!subscriber.filter.matches(name)) continue;
+            const frame = try arena.alloc(u8, wire.prefix_size + format.entry_size + name.len);
+            wire.writeChangeEntryAs(frame, .stage_change_entry, entry, name);
+            try writeAll(self.io, subscriber.stream, frame);
+            switch (batch_mod.kindOf(entry) orelse continue) {
+                .added => added += 1,
+                .changed => changed += 1,
+                .deleted => deleted += 1,
+            }
+        }
+
+        var end_bytes: [wire.prefix_size + wire.stage_batch_end_size]u8 = undefined;
+        (wire.StageBatchEnd{
+            .stage = producer_stage,
+            .generation = generation,
+            .added = added,
+            .changed = changed,
+            .deleted = deleted,
+        }).write(&end_bytes);
+        try writeAll(self.io, subscriber.stream, &end_bytes);
     }
 
     /// Forget subscribers whose socket failed. **The connection's own task owns the memory and closes the
@@ -1961,18 +2474,27 @@ pub const RootRuntime = struct {
         allocator: std.mem.Allocator,
     ) !?filter_mod.Subscribe {
         const prefix = (try readPrefix(io, stream, reader)) orelse return null;
-        if (prefix.kind != .subscribe) {
-            server.refuse(io, stream, .protocol, "expected SUBSCRIBE", .{});
+        if (prefix.kind != .subscribe and prefix.kind != .subscribe_v2 and prefix.kind != .subscribe_v3) {
+            server.refuse(io, stream, .protocol, "expected SUBSCRIBE, SUBSCRIBE_V2 or SUBSCRIBE_V3", .{});
             return null;
         }
         const payload = try reader.take(prefix.length);
-        return filter_mod.decodeSubscribe(allocator, payload) catch |err| switch (err) {
+        return (if (prefix.kind == .subscribe_v3)
+            filter_mod.decodeSubscribeV3(allocator, payload)
+        else if (prefix.kind == .subscribe_v2)
+            filter_mod.decodeSubscribeV2(allocator, payload)
+        else
+            filter_mod.decodeSubscribe(allocator, payload)) catch |err| switch (err) {
             error.TooShort => {
                 server.refuse(io, stream, .protocol, "SUBSCRIBE payload too short", .{});
                 return null;
             },
             error.Malformed => {
                 server.refuse(io, stream, .protocol, "malformed SUBSCRIBE filter section", .{});
+                return null;
+            },
+            error.ReservedFlags => {
+                server.refuse(io, stream, .protocol, "unknown SUBSCRIBE_V2 flag", .{});
                 return null;
             },
             else => return err,
@@ -2040,12 +2562,22 @@ pub const RootRuntime = struct {
         // arena dies before `unregister` takes the subscriber out of the broadcast list.
         subscriber.filter = decoded.filter;
         subscriber.filter_storage = decoded.storage;
+        subscriber.stage = decoded.stage;
+        subscriber.builder = decoded.builder;
+        subscriber.from_stage_batch = decoded.from_stage_batch;
         const from_batch = decoded.from_batch;
 
         const window = try server.openBatchWindow(io, self.record.root);
         defer if (window.dir) |dir| dir.close(io);
         if (from_batch > window.last) {
             server.refuse(io, stream, .protocol, "from_batch {d} is newer than the newest batch {d}", .{ from_batch, window.last });
+            return;
+        }
+        // A staged subscriber cannot claim a generation its stage has not been released: reconnecting at LATEST
+        // must not jump over a build stage that has not run (`FORMAT.socket.md` § BUILD_STAGES).
+        const released = self.releasedThroughLocked(decoded.stage);
+        if (from_batch > released) {
+            server.refuse(io, stream, .protocol, "from_batch {d} is newer than the release {d} for stage {d}", .{ from_batch, released, decoded.stage });
             return;
         }
         if (window.first) |first| {
@@ -2060,6 +2592,9 @@ pub const RootRuntime = struct {
         if (self.machine.mode == .off) _ = self.runPassLocked(nowMs(io), .scan);
 
         subscriber.from_batch = from_batch;
+        // A builder joining at `from_batch` does not claim work it has never seen; the replay below gives it the
+        // batches its stage is already allowed to see, and `done_through` starts exactly at that join point.
+        subscriber.done_through = from_batch;
         try self.subscribers.append(self.allocator, subscriber);
         subscriber.registered = true;
 
@@ -2070,6 +2605,7 @@ pub const RootRuntime = struct {
         self.syncWatcherLocked();
         self.broadcastState(); // "immediately after HELLO, so a fresh client knows what it joined"
         try self.replayLocked(arena, subscriber, from_batch);
+        try self.replayStageBatchesLocked(arena, subscriber);
         if (self.machine.phase == .waking) {
             // The wake scan runs on the scheduler, not here: the client has already been told it is coming.
             self.log("subscribed: waking", .{});
@@ -2106,6 +2642,56 @@ pub const RootRuntime = struct {
                     self.unlock();
                 },
                 .pong => {},
+                .build_started => {
+                    const started = wire.BuildStarted.read(payload) catch {
+                        server.refuse(io, stream, .protocol, "malformed BUILD_STARTED", .{});
+                        break;
+                    };
+                    self.lock();
+                    if (!subscriber.alive) {
+                        self.unlock();
+                        break;
+                    }
+                    const released = self.releasedThroughLocked(subscriber.stage);
+                    if (started.generation > released) {
+                        server.refuse(io, stream, .protocol, "BUILD_STARTED generation {d} is newer than the release {d} for stage {d}", .{ started.generation, released, subscriber.stage });
+                        self.unlock();
+                        break;
+                    }
+                    subscriber.started_generation = started.generation;
+                    subscriber.started_ms = nowMs(self.io);
+                    self.log("build: stage {d} started at generation {d}", .{ subscriber.stage, started.generation });
+                    self.unlock();
+                },
+                .build_done => {
+                    const done = wire.BuildDone.read(payload) catch {
+                        server.refuse(io, stream, .protocol, "malformed BUILD_DONE", .{});
+                        break;
+                    };
+                    self.lock();
+                    if (!subscriber.alive) {
+                        self.unlock();
+                        break;
+                    }
+                    const released = self.releasedThroughLocked(subscriber.stage);
+                    if (done.generation > released) {
+                        server.refuse(io, stream, .protocol, "BUILD_DONE generation {d} is newer than the release {d} for stage {d}", .{ done.generation, released, subscriber.stage });
+                        self.unlock();
+                        break;
+                    }
+                    if (done.generation > subscriber.done_through) subscriber.done_through = done.generation;
+                    subscriber.started_ms = 0;
+                    subscriber.work_since_ms = if (subscriber.done_through < self.releasedThroughLocked(subscriber.stage)) nowMs(self.io) else 0;
+                    self.log("build: stage {d} done through generation {d} ({s})", .{ subscriber.stage, subscriber.done_through, @tagName(done.status) });
+                    // A builder that is not this root's client may still be the last one holding a stage; pumping
+                    // here is what turns one acknowledgement into the next stage's batches. The pump's frames are
+                    // temporary, so they get their own arena rather than the daemon's long-lived one.
+                    var pump_arena_state = std.heap.ArenaAllocator.init(self.allocator);
+                    defer pump_arena_state.deinit();
+                    self.pumpStagesLocked(pump_arena_state.allocator());
+                    self.maybeScanStageAfterAckLocked(pump_arena_state.allocator(), subscriber.stage);
+                    self.unlock();
+                },
                 else => break,
             }
         }
@@ -2124,6 +2710,12 @@ pub const RootRuntime = struct {
             }
         }
         self.machine.unsubscribe(nowMs(self.io));
+        // A builder that leaves is no longer a barrier: the stage after it may run. Pump before the early return
+        // for an `off` root, because the socket and its subscribers still exist there.
+        var pump_arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer pump_arena_state.deinit();
+        self.pumpStagesLocked(pump_arena_state.allocator());
+        self.scanStagesWithoutBuildersLocked(pump_arena_state.allocator());
         if (self.machine.mode == .off) return;
         self.broadcastState();
         self.log("unsubscribed: {d} client(s) left", .{self.machine.clients});
@@ -2372,6 +2964,27 @@ fn closeTestPair(pair: *TestSocketPair, io: std.Io) void {
     std.Io.Dir.deleteFileAbsolute(io, pair.path) catch {};
 }
 
+/// Build a `SUBSCRIBE_V2` payload into `buffer` (`FORMAT.socket.md` § BUILD_STAGES).
+fn subscribeV2Payload(buffer: []u8, from_batch: u64, stage: u16, flags: u16, include: []const []const u8, exclude: []const []const u8) []u8 {
+    var pos: usize = 12;
+    std.mem.writeInt(u64, buffer[0..8], from_batch, .little);
+    std.mem.writeInt(u16, buffer[8..10], stage, .little);
+    std.mem.writeInt(u16, buffer[10..12], flags, .little);
+    for ([_][]const []const u8{ include, exclude }) |patterns| {
+        std.debug.assert(pos + 2 <= buffer.len);
+        std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(patterns.len), .little);
+        pos += 2;
+        for (patterns) |pattern| {
+            std.debug.assert(pos + 2 + pattern.len <= buffer.len);
+            std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(pattern.len), .little);
+            pos += 2;
+            @memcpy(buffer[pos..][0..pattern.len], pattern);
+            pos += pattern.len;
+        }
+    }
+    return buffer[0..pos];
+}
+
 /// Build an extended `SUBSCRIBE` payload into `buffer` (`FORMAT.socket.md` § SUBSCRIBE filter patterns).
 fn subscribePayload(buffer: []u8, from_batch: u64, include: []const []const u8, exclude: []const []const u8) []u8 {
     var pos: usize = 8;
@@ -2526,6 +3139,8 @@ test "the extended SUBSCRIBE filters the replay path and counts only sent entrie
     var git_registry = gitwatch.Registry.initCounting(io, allocator);
     defer git_registry.deinit();
     var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    // The replay ceiling is the root's head; the test writes generation 1 directly, so the machine must agree.
+    runtime.machine.head_batch = 1;
 
     var pair = try connectTestPair(io, arena, &tmp.sub_path);
     defer closeTestPair(&pair, io);
@@ -2654,6 +3269,423 @@ test "the 8-byte SUBSCRIBE still means pass-all, unchanged" {
     try testing.expectEqual(@as(u64, 2), received.added);
     try testing.expectEqual(@as(u64, 1), received.changed);
     try testing.expectEqual(@as(u64, 0), received.deleted);
+}
+
+test "the barrier is the minimum of the stage's builders, and a stage with none does not block" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+    runtime.machine.head_batch = 3;
+
+    // No builder at stage 0: stage 1 is released to the head at once.
+    try testing.expectEqual(@as(u64, 3), runtime.ackedThroughLocked(0));
+    try testing.expectEqual(@as(u64, 3), runtime.releasedThroughLocked(1));
+
+    // Two stage-0 builders: the slower one is the barrier.
+    var first = Subscriber{ .stream = undefined, .from_batch = 3, .stage = 0, .builder = true, .done_through = 1 };
+    var second = Subscriber{ .stream = undefined, .from_batch = 3, .stage = 0, .builder = true, .done_through = 2 };
+    try runtime.subscribers.append(allocator, &first);
+    try runtime.subscribers.append(allocator, &second);
+    defer runtime.subscribers.deinit(allocator);
+    try testing.expectEqual(@as(u64, 1), runtime.ackedThroughLocked(0));
+    try testing.expectEqual(@as(u64, 1), runtime.releasedThroughLocked(1));
+
+    second.done_through = 3;
+    try testing.expectEqual(@as(u64, 1), runtime.releasedThroughLocked(1));
+    first.done_through = 3;
+    try testing.expectEqual(@as(u64, 3), runtime.releasedThroughLocked(1));
+
+    // A builder that leaves is no longer a barrier; the stage after it must not be stranded.
+    _ = runtime.subscribers.orderedRemove(0);
+    try testing.expectEqual(@as(u64, 3), runtime.releasedThroughLocked(1));
+
+    // A listener at the same stage never narrows the barrier, even with `done_through = 0`.
+    var listener = Subscriber{ .stream = undefined, .from_batch = 3, .stage = 0, .builder = false, .done_through = 0 };
+    try runtime.subscribers.append(allocator, &listener);
+    try testing.expectEqual(@as(u64, 3), runtime.releasedThroughLocked(1));
+}
+
+test "a stage-1 listener waits for the stage-0 builder, then receives the held batch and STAGE_READY" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The archive the stage-1 pump reads from.
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    var meta_dir = try tmp_root.dir.openDir(io, ".fs-meta", .{});
+    defer meta_dir.close(io);
+    var names: [3][]const u8 = undefined;
+    var entries: [3]format.Entry = undefined;
+    const plan = testChangePlan(&names, &entries);
+    try batch_mod.write(allocator, io, meta_dir, plan, .{ .generation = 1, .parent = 0 });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    runtime.machine.head_batch = 1;
+
+    var tmp_builder = testing.tmpDir(.{});
+    defer tmp_builder.cleanup();
+    var tmp_listener = testing.tmpDir(.{});
+    defer tmp_listener.cleanup();
+    var builder_pair = try connectTestPair(io, arena, &tmp_builder.sub_path);
+    var listener_pair = try connectTestPair(io, arena, &tmp_listener.sub_path);
+    defer closeTestPair(&listener_pair, io);
+
+    var payload_buffer: [128]u8 = undefined;
+    const builder_payload = subscribeV2Payload(&payload_buffer, 0, 0, wire.SUBSCRIBE_FLAG_BUILDER, &.{}, &.{});
+    try server.writeFrame(io, builder_pair.client, .subscribe_v2, builder_payload);
+
+    var server_buffer: [512]u8 = undefined;
+    var server_reader = std.Io.net.Stream.Reader.init(builder_pair.server_side, io, &server_buffer);
+    const builder_decoded = (try RootRuntime.readSubscribe(io, builder_pair.server_side, &server_reader.interface, allocator)) orelse return error.TestUnexpectedResult;
+    var builder = testSubscriber(builder_pair.server_side, builder_decoded);
+    defer builder.deinitFilter(allocator);
+    builder.stage = builder_decoded.stage;
+    builder.builder = builder_decoded.builder;
+    builder.done_through = builder_decoded.from_batch;
+
+    var listener_payload_buffer: [128]u8 = undefined;
+    const listener_payload = subscribeV2Payload(&listener_payload_buffer, 0, 1, 0, &.{}, &.{});
+    try server.writeFrame(io, listener_pair.client, .subscribe_v2, listener_payload);
+    var listener_server_buffer: [512]u8 = undefined;
+    var listener_server_reader = std.Io.net.Stream.Reader.init(listener_pair.server_side, io, &listener_server_buffer);
+    const listener_decoded = (try RootRuntime.readSubscribe(io, listener_pair.server_side, &listener_server_reader.interface, allocator)) orelse return error.TestUnexpectedResult;
+    var listener = testSubscriber(listener_pair.server_side, listener_decoded);
+    defer listener.deinitFilter(allocator);
+    listener.stage = listener_decoded.stage;
+    listener.builder = listener_decoded.builder;
+
+    try runtime.subscribers.append(allocator, &builder);
+    try runtime.subscribers.append(allocator, &listener);
+    defer runtime.subscribers.deinit(allocator);
+
+    // Stage 0 sees the batch; stage 1 is held at the barrier.
+    runtime.broadcastBatchLocked(arena, 1, plan);
+    try testing.expectEqual(@as(u64, 1), builder.from_batch);
+    try testing.expectEqual(@as(u64, 0), listener.from_batch);
+
+    // The builder acknowledges through the real command path on its own thread; the client stays open until
+    // the stage-1 frames have been read, so the acknowledgement is not racing a close.
+    const BuilderLoop = struct {
+        runtime: *RootRuntime,
+        stream: std.Io.net.Stream,
+        reader: *std.Io.net.Stream.Reader,
+        subscriber: *Subscriber,
+
+        fn run(self: *@This()) void {
+            self.runtime.readLoop(self.stream, self.reader, self.subscriber);
+        }
+    };
+    var loop = BuilderLoop{
+        .runtime = &runtime,
+        .stream = builder_pair.server_side,
+        .reader = &server_reader,
+        .subscriber = &builder,
+    };
+    const loop_thread = try std.Thread.spawn(.{}, BuilderLoop.run, .{&loop});
+
+    var done_frame: [wire.prefix_size + wire.build_done_size]u8 = undefined;
+    (wire.BuildDone{ .generation = 1 }).write(&done_frame);
+    try server.writeFrame(io, builder_pair.client, .build_done, done_frame[wire.prefix_size..]);
+
+    // Stage 1 now has the held batch, followed by the ready frame that announces the barrier.
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(listener_pair.client, io, &consumer_buffer);
+    const received = try readTestBatch(&consumer.interface);
+    try testing.expectEqual(@as(u64, 1), received.number);
+    try testing.expectEqual(@as(usize, 3), received.count);
+    const ready = try readTestFrame(&consumer.interface);
+    try testing.expectEqual(wire.Kind.stage_ready, ready.kind);
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, ready.payload[0..2], .little));
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, ready.payload[10..18], .little));
+    try testing.expectEqual(@as(u64, 1), builder.done_through);
+    try testing.expectEqual(@as(u64, 1), listener.from_batch);
+
+    builder_pair.client.close(io);
+    loop_thread.join();
+
+    // The client end of the builder pair was closed above; clean up the rest without closing it twice.
+    builder_pair.server_side.close(io);
+    builder_pair.listener.deinit(io);
+    std.Io.Dir.deleteFileAbsolute(io, builder_pair.path) catch {};
+}
+
+test "the daemon scans a stage after BUILD_DONE and streams its artifact batch to the next stage" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    try tmp_root.dir.createDirPath(io, "build/classes");
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/A.class", .data = "AAA" });
+    try tmp_root.dir.writeFile(io, .{
+        .sub_path = ".fs-meta/build.json",
+        .data = "{\"version\":1,\"stages\":[{\"stage\":0,\"folders\":[\"build/classes\"]}]}",
+    });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+
+    var tmp_consumer = testing.tmpDir(.{});
+    defer tmp_consumer.cleanup();
+    var consumer_pair = try connectTestPair(io, arena, &tmp_consumer.sub_path);
+    defer closeTestPair(&consumer_pair, io);
+    var consumer = Subscriber{ .stream = consumer_pair.server_side, .from_batch = 0, .stage = 1 };
+    try runtime.subscribers.append(allocator, &consumer);
+    defer runtime.subscribers.deinit(allocator);
+
+    runtime.scanStageAfterBuildLocked(arena, 0);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var reader = std.Io.net.Stream.Reader.init(consumer_pair.client, io, &consumer_buffer);
+    const start = try readTestFrame(&reader.interface);
+    try testing.expectEqual(wire.Kind.stage_batch_start, start.kind);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, start.payload[0..2], .little));
+
+    var count: usize = 0;
+    var found = false;
+    var end: FrameData = undefined;
+    while (true) {
+        const frame = try readTestFrame(&reader.interface);
+        if (frame.kind == .stage_batch_end) {
+            end = frame;
+            break;
+        }
+        try testing.expectEqual(wire.Kind.stage_change_entry, frame.kind);
+        const name_length: usize = std.mem.readInt(u32, frame.payload[40..44], .little);
+        const name = frame.payload[format.entry_size..][0..name_length];
+        if (std.mem.eql(u8, name, "build/classes/A.class")) found = true;
+        count += 1;
+    }
+    try testing.expect(count >= 1);
+    try testing.expect(found);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, end.payload[0..2], .little));
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, end.payload[2..10], .little));
+
+    // A late stage-1 subscriber with a cursor replays the archive through the stage-batch frames.
+    var replay_tmp = testing.tmpDir(.{});
+    defer replay_tmp.cleanup();
+    var replay_pair = try connectTestPair(io, arena, &replay_tmp.sub_path);
+    defer closeTestPair(&replay_pair, io);
+    var replay_sub = Subscriber{ .stream = replay_pair.server_side, .from_batch = 0, .stage = 1, .from_stage_batch = 0 };
+    try runtime.subscribers.append(allocator, &replay_sub);
+    try runtime.replayStageBatchesLocked(arena, &replay_sub);
+    try testing.expectEqual(@as(?u64, 1), replay_sub.from_stage_batch);
+
+    var replay_buffer: [1024]u8 = undefined;
+    var replay_reader = std.Io.net.Stream.Reader.init(replay_pair.client, io, &replay_buffer);
+    const replay_start = try readTestFrame(&replay_reader.interface);
+    try testing.expectEqual(wire.Kind.stage_batch_start, replay_start.kind);
+    var replay_count: usize = 0;
+    var replay_end: FrameData = undefined;
+    while (true) {
+        const frame = try readTestFrame(&replay_reader.interface);
+        if (frame.kind == .stage_batch_end) {
+            replay_end = frame;
+            break;
+        }
+        try testing.expectEqual(wire.Kind.stage_change_entry, frame.kind);
+        replay_count += 1;
+    }
+    try testing.expect(replay_count >= 1);
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, replay_end.payload[2..10], .little));
+}
+
+test "a stage is scanned only after every builder acknowledges, and a no-builder stage is scanned once" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    try tmp_root.dir.createDirPath(io, "build/classes");
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/A.class", .data = "AAA" });
+    try tmp_root.dir.writeFile(io, .{
+        .sub_path = ".fs-meta/build.json",
+        .data = "{\"version\":1,\"stages\":[{\"stage\":0,\"folders\":[\"build/classes\"]}]}",
+    });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+    const state_file = try std.fs.path.join(arena, &.{ root, ".fs-meta", "stages", "00", "files.json" });
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    runtime.machine.head_batch = 1;
+
+    var first = Subscriber{ .stream = undefined, .from_batch = 1, .stage = 0, .builder = true, .done_through = 0 };
+    var second = Subscriber{ .stream = undefined, .from_batch = 1, .stage = 0, .builder = true, .done_through = 0 };
+    try runtime.subscribers.append(allocator, &first);
+    try runtime.subscribers.append(allocator, &second);
+    defer runtime.subscribers.deinit(allocator);
+
+    first.done_through = 1;
+    runtime.maybeScanStageAfterAckLocked(arena, 0);
+    if (std.Io.Dir.accessAbsolute(io, state_file, .{})) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.FileNotFound, err);
+
+    second.done_through = 1;
+    runtime.maybeScanStageAfterAckLocked(arena, 0);
+    try std.Io.Dir.accessAbsolute(io, state_file, .{});
+
+    // With no builder at stage 0, one release advances the undeclared-stage scan exactly once.
+    runtime.subscribers.clearRetainingCapacity();
+    runtime.machine.head_batch = 2;
+    runtime.scanStagesWithoutBuildersLocked(arena);
+    try testing.expectEqual(@as(u64, 2), runtime.undeclared_stage_scanned[0]);
+    runtime.scanStagesWithoutBuildersLocked(arena);
+    try testing.expectEqual(@as(u64, 2), runtime.undeclared_stage_scanned[0]);
+}
+
+test "a builder that starts and never acknowledges times out and releases its successor" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+    runtime.machine.head_batch = 4;
+    runtime.stage_timeout_ms = 100;
+    var builder = Subscriber{ .stream = undefined, .from_batch = 4, .stage = 0, .builder = true, .done_through = 0, .started_ms = 1_000 };
+    try runtime.subscribers.append(allocator, &builder);
+    defer runtime.subscribers.deinit(allocator);
+
+    runtime.checkStageTimeoutsLocked(1_050);
+    try testing.expectEqual(@as(u64, 0), builder.done_through);
+    try testing.expectEqual(@as(u64, 0), runtime.stage_timeouts);
+
+    runtime.checkStageTimeoutsLocked(1_100);
+    try testing.expectEqual(@as(u64, 4), builder.done_through);
+    try testing.expectEqual(@as(u64, 1), runtime.stage_timeouts);
+    try testing.expectEqual(@as(i64, 0), builder.started_ms);
+}
+
+test "a builder that never sends BUILD_STARTED still times out from delivery" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, "unused", &git_registry);
+    runtime.machine.head_batch = 3;
+    runtime.stage_timeout_ms = 100;
+    var builder = Subscriber{ .stream = undefined, .from_batch = 3, .stage = 0, .builder = true, .done_through = 0, .work_since_ms = 1_000 };
+    try runtime.subscribers.append(allocator, &builder);
+    defer runtime.subscribers.deinit(allocator);
+
+    runtime.checkStageTimeoutsLocked(1_050);
+    try testing.expectEqual(@as(u64, 0), builder.done_through);
+    runtime.checkStageTimeoutsLocked(1_100);
+    try testing.expectEqual(@as(u64, 3), builder.done_through);
+    try testing.expectEqual(@as(u64, 1), runtime.stage_timeouts);
+}
+
+test "a changed build.json is detected even though .fs-meta is not watched" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    try tmp_root.dir.writeFile(io, .{ .sub_path = ".fs-meta/build.json", .data = "{\"version\":1,\"stages\":[]}" });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    runtime.machine.phase = .off;
+    try testing.expect(!runtime.checkBuildConfigLocked(1_000));
+    const stamp = runtime.build_config_stamp;
+    // Same size, different content: mtime+size alone would miss this; the content hash does not.
+    try tmp_root.dir.writeFile(io, .{ .sub_path = ".fs-meta/build.json", .data = "{\"version\":2,\"stages\":[]}" });
+    try testing.expect(!runtime.checkBuildConfigLocked(1_001));
+    try testing.expect(runtime.build_config_stamp != stamp);
+}
+
+test "a stage with no builder passes the release through to the next stage" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    var meta_dir = try tmp_root.dir.openDir(io, ".fs-meta", .{});
+    defer meta_dir.close(io);
+    var names: [3][]const u8 = undefined;
+    var entries: [3]format.Entry = undefined;
+    const plan = testChangePlan(&names, &entries);
+    try batch_mod.write(allocator, io, meta_dir, plan, .{ .generation = 1, .parent = 0 });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    runtime.machine.head_batch = 1;
+
+    var tmp_stage0 = testing.tmpDir(.{});
+    defer tmp_stage0.cleanup();
+    var tmp_stage2 = testing.tmpDir(.{});
+    defer tmp_stage2.cleanup();
+    var stage0_pair = try connectTestPair(io, arena, &tmp_stage0.sub_path);
+    defer closeTestPair(&stage0_pair, io);
+    var stage2_pair = try connectTestPair(io, arena, &tmp_stage2.sub_path);
+    defer closeTestPair(&stage2_pair, io);
+
+    var stage0 = Subscriber{ .stream = stage0_pair.server_side, .from_batch = 0 };
+    var stage2 = Subscriber{ .stream = stage2_pair.server_side, .from_batch = 0, .stage = 2 };
+    try runtime.subscribers.append(allocator, &stage0);
+    try runtime.subscribers.append(allocator, &stage2);
+    defer runtime.subscribers.deinit(allocator);
+
+    runtime.broadcastBatchLocked(arena, 1, plan);
+    try testing.expectEqual(@as(u64, 1), stage0.from_batch);
+    try testing.expectEqual(@as(u64, 1), stage2.from_batch);
+
+    var consumer_buffer: [1024]u8 = undefined;
+    var consumer = std.Io.net.Stream.Reader.init(stage2_pair.client, io, &consumer_buffer);
+    const received = try readTestBatch(&consumer.interface);
+    try testing.expectEqual(@as(u64, 1), received.number);
+    const ready = try readTestFrame(&consumer.interface);
+    try testing.expectEqual(wire.Kind.stage_ready, ready.kind);
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, ready.payload[0..2], .little));
 }
 
 test "a malformed SUBSCRIBE payload is refused with the protocol error, code 1" {

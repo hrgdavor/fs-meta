@@ -30,6 +30,7 @@ const ignore_mod = @import("ignore.zig");
 const ignores = @import("ignores.zig");
 const boundary_mod = @import("boundary.zig");
 const safe_dir = @import("safe_dir.zig");
+const build_config = @import("build_config.zig");
 
 pub const Cache = cache_mod.Cache;
 
@@ -219,6 +220,16 @@ try previous.append(arena, batch_mod.dirItem(try arena.dupe(u8, name), cache.dir
     defer rules.deinit();
     var sources = try ignores.Sources.load(arena, io, root, options.respect_gitignore);
     defer sources.deinit();
+    // Declared stage folders are outputs, not sources. A malformed build.json must not stop a root pass; it is
+    // reported by `fsmeta stage status` and the folders stay visible until it is fixed.
+    const build = build_config.load(arena, io, root) catch build_config.Config.empty();
+    var ignore_sources = sources.active;
+    if (build.folders.len > 0) {
+        const with_stage = try arena.alloc([]const u8, ignore_sources.len + 1);
+        @memcpy(with_stage[0..ignore_sources.len], ignore_sources);
+        with_stage[ignore_sources.len] = "stage";
+        ignore_sources = with_stage;
+    }
     var tree: lister.Tree = .{
         .io = io,
         .root = root,
@@ -226,6 +237,7 @@ try previous.append(arena, batch_mod.dirItem(try arena.dupe(u8, name), cache.dir
         .ignored_dir_names = options.ignored_dir_names,
         .ignore = &rules,
         .sources = &sources,
+        .exclude_prefixes = build.folders,
         .per_file = options.per_file,
     };
     outcome.report = try coldstart.coldStart(arena, &cache, tree.lister(), root);
@@ -279,7 +291,7 @@ try previous.append(arena, batch_mod.dirItem(try arena.dupe(u8, name), cache.dir
             .nested_repos = true,
             // What this pass actually consulted, in precedence order. A missing file is absent from the list
             // rather than present as a stale entry; `.gitignore` is listed whenever the flag allowed the chain.
-            .ignore_sources = sources.active,
+            .ignore_sources = ignore_sources,
         },
     });
     outcome.published = true;
@@ -716,4 +728,38 @@ test "a pass and a full walk agree about the tree, .gitignore included" {
     try testing.expect(hasName(relaxed, "x.log"));
     try testing.expect(hasName(relaxed, "build"));
     try testing.expect(hasName(relaxed, "build/y.txt"));
+}
+
+test "a declared stage folder is hidden from the root pass and its contents are not described" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, io, "src/main.zig", "const x = 1;\n");
+    try writeFile(tmp.dir, io, "build/classes/A.class", "AAA");
+    try writeFile(tmp.dir, io, ".fs-meta/build.json",
+        \\{"version":1,"stages":[{"stage":0,"folders":["build/classes"]}]}
+    );
+
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const count = try tmp.dir.realPath(io, &path_buffer);
+    const root = path_buffer[0..count];
+
+    var arena_alloc = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    const outcome = try refresh(arena, io, root, .{ .updated = "2026-11-08T00:00:00Z" });
+    try testing.expect(outcome.published);
+    const names = try trioNames(arena, root, io);
+    try testing.expect(hasName(names, "src/main.zig"));
+    try testing.expect(!hasName(names, "build/classes/A.class"));
+    try testing.expect(!hasName(names, "build/classes"));
+    try testing.expect(hasName(names, "build")); // the ancestor stays, so the exclusion is visible as a prune
+
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta_dir = try root_dir.openDir(io, format.directory_name, .{ .iterate = true });
+    defer meta_dir.close(io);
+    const document = try meta_dir.readFileAlloc(io, format.json_file, arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, document, "\"stage\"") != null);
 }

@@ -109,6 +109,9 @@ pub const Host = struct {
     /// `FSMETA_GITWATCH`: the finer knob. `false` disables git signals alone; it cannot re-enable anything
     /// `FSMETA_WORKTREES=0` turned off.
     gitwatch_override: ?bool = null,
+    /// `FSMETA_STAGE_TIMEOUT_MS`: a started builder that has not acknowledged for this long is failed. `0`
+    /// disables the policy; an unparsable value leaves the per-root default.
+    stage_timeout_ms: ?i64 = null,
     /// Test-only (`FORMAT.daemon.md` § 8): `FSMETA_GIT_ARM=off` does not arm the metadata watcher, so the hook spool
     /// path (M5) can be exercised on its own. Not a user switch: the git dirs are still resolved, the latch still
     /// polls, and the spool is still read; only the metadata *watch* — and so the timeline only it can see — is off.
@@ -140,6 +143,12 @@ pub const Host = struct {
         // misbehaves must be standable-down by a restart.
         self.worktrees_override = parseFlagEnv(options.env.get("FSMETA_WORKTREES"));
         self.gitwatch_override = parseFlagEnv(options.env.get("FSMETA_GITWATCH"));
+        if (options.env.get("FSMETA_STAGE_TIMEOUT_MS")) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (std.fmt.parseInt(i64, trimmed, 10)) |ms| {
+                if (ms >= 0) self.stage_timeout_ms = ms;
+            } else |_| {}
+        }
         // A test guard, not a feature (`FORMAT.daemon.md` § 8): the hook path is proved on its own by taking the
         // metadata timeline out of the picture, and an environment guard is the only way to do that without a second
         // build. It is logged, so a daemon that is quiet about git events says why.
@@ -278,6 +287,7 @@ pub const Host = struct {
         // The daemon's start bounds the hook spool (§ 5c): a line from an earlier second is not this daemon's event.
         runtime.daemon_started_at_ms = self.started_at_ms;
         runtime.git_arm_enabled = !self.git_arm_disabled;
+        if (self.stage_timeout_ms) |ms| runtime.stage_timeout_ms = ms;
 
         // The socket path is rewritten on every start: the runtime directory may have moved since the record
         // was written, and a stale path in the list would point at nothing.
@@ -729,6 +739,7 @@ pub const Host = struct {
         runtime.worktree_observer = .{ .ctx = self, .onWorktree = observeWorktree };
         runtime.daemon_started_at_ms = self.started_at_ms;
         runtime.git_arm_enabled = !self.git_arm_disabled;
+        if (self.stage_timeout_ms) |ms| runtime.stage_timeout_ms = ms;
         std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = try self.layout.rootLog(self.arena, record.id),
             .data = "",
@@ -1307,6 +1318,22 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: root_mod.Snapshot) !void 
     // `GIT_EVENT` counters (§ 5d): frames sent to this root's subscribers, and passes a finish waited for.
     try control.intField(writer, "git_events", snapshot.git_events);
     try control.intField(writer, "git_passes", snapshot.git_passes);
+    // Stage barrier and batch counters (`FORMAT.daemon.md` § 8b). A blocked stage is `null` only in the text
+    // rendering; the JSON keeps a stable integer `-1` for "nothing waiting".
+    try control.intField(writer, "stage_batches", snapshot.stage_batches);
+    try control.intField(writer, "stage_scan_failures", snapshot.stage_scan_failures);
+    try control.intField(writer, "stage_timeouts", snapshot.stage_timeouts);
+    if (snapshot.stage_blocked) |stage| {
+        try control.intField(writer, "stage_blocked", stage);
+    } else {
+        try control.intField(writer, "stage_blocked", -1);
+    }
+    try control.intField(writer, "stage_blocked_generation", snapshot.stage_blocked_generation);
+    try control.intField(writer, "stage_builders", snapshot.stage_builders);
+    try control.intField(writer, "stage_timeout_ms", snapshot.stage_timeout_ms);
+    try control.intField(writer, "last_stage_scan_ms", snapshot.last_stage_scan_ms);
+    try control.intField(writer, "last_stage_scan_duration_ms", snapshot.last_stage_scan_duration_ms);
+    try control.stringField(writer, "last_stage_error", snapshot.last_stage_error);
     // The root's own switches, so a caller that is not this daemon (`fsmeta daemon hooks install`) can ask whether a
     // hook spool for it would ever be read (`plans/worktrees.md` § 5c).
     try control.boolField(writer, "gitwatch", snapshot.gitwatch);
@@ -1404,6 +1431,15 @@ fn sampleSnapshot() root_mod.Snapshot {
         .last_pass_files = 4000,
         .last_pass_hashed = 7,
         .last_pass_batch_bytes = 512 * 1024,
+        .stage_batches = 3,
+        .stage_scan_failures = 1,
+        .stage_timeouts = 2,
+        .stage_blocked = 1,
+        .stage_blocked_generation = 4,
+        .stage_builders = 2,
+        .last_stage_scan_ms = 1_700_000_000_100,
+        .last_stage_scan_duration_ms = 9,
+        .last_stage_error = "",
         .last_error = "",
         .created_at = "2026-10-26T06:50:00Z",
     };
@@ -1440,6 +1476,14 @@ test "a snapshot reply is valid JSON with the documented field names" {
     try testing.expectEqual(@as(i64, 50), root.get("tick_ms").?.integer);
     try testing.expectEqual(@as(i64, 32), root.get("retention").?.object.get("max_batches").?.integer);
     try testing.expectEqualStrings("keep", root.get("on_remove").?.string);
+    // Stage barrier/counters are part of the same status object (`FORMAT.daemon.md` § 8b).
+    try testing.expectEqual(@as(i64, 3), root.get("stage_batches").?.integer);
+    try testing.expectEqual(@as(i64, 1), root.get("stage_scan_failures").?.integer);
+    try testing.expectEqual(@as(i64, 2), root.get("stage_timeouts").?.integer);
+    try testing.expectEqual(@as(i64, 1), root.get("stage_blocked").?.integer);
+    try testing.expectEqual(@as(i64, 4), root.get("stage_blocked_generation").?.integer);
+    try testing.expectEqual(@as(i64, 2), root.get("stage_builders").?.integer);
+    try testing.expectEqual(@as(i64, 9), root.get("last_stage_scan_duration_ms").?.integer);
     try testing.expect(std.mem.endsWith(u8, out.written(), "\n"));
 }
 

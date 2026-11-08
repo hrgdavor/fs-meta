@@ -194,7 +194,7 @@ UTF-8 JSON object, no comment. The commit record.
 | `created`        | string | RFC3339 instant of the trio's first publish, informational; a rewriter keeps it               |
 | `writer`         | string | tool/version, informational (`fs-meta/1` is the engine)                                       |
 | `root`           | object | `{ "dev": number, "ino": number }` - identity of the root directory; a copied tree has a different one, a renamed tree keeps it (§ 3.1) |
-| `scan`           | object | optional, the settings the engine used: `{ "hashMode": "text" \| "lf" \| "none", "ignoredDirectoryNames": [string], "respectGitignore": boolean, "nestedRepos": boolean?, "ignoreSources": [string]? }`. `nestedRepos: true` records that the nested-repository boundary rule (§ 16) was applied; **absent means it was not**, never "there was no nested repository". `ignoreSources` records the root-level ignore sources **actually in effect**, in precedence order: `gitignore` (the `.gitignore` chain, listed whenever the flag allowed it), `info/exclude` and `fs-meta/ignore` (each listed only when its file exists). It is a record of what the pass read, not an mtime: both files are re-read on every pass. Additive and optional: a reader that does not know either key ignores it. |
+| `scan`           | object | optional, the settings the engine used: `{ "hashMode": "text" \| "lf" \| "none", "ignoredDirectoryNames": [string], "respectGitignore": boolean, "nestedRepos": boolean?, "ignoreSources": [string]? }`. `nestedRepos: true` records that the nested-repository boundary rule (§ 16) was applied; **absent means it was not**, never "there was no nested repository". `ignoreSources` records the root-level ignore sources **actually in effect**, in precedence order: `gitignore` (the `.gitignore` chain, listed whenever the flag allowed it), `info/exclude` and `fs-meta/ignore` (each listed only when its file exists), and `stage` (the build-stage folders declared in `.fs-meta/build.json`, listed when at least one is declared). It is a record of what the pass read, not an mtime: both files are re-read on every pass. Additive and optional: a reader that does not know either key ignores it. |
 | `roots`          | object | optional, § 18: `{ "<direct child>": { "offset": number, "length": number } }` — byte ranges in `files.txt`, each covering the folder's own `dir/` line and its subtree |
 
 Required keys: `format`, `version`, `entrySize`, `count`, `meta.bytes`, `meta.wyhash`, `txt.bytes`, `txt.wyhash`, `hash.content`, `hash.name`, `hash.seed`. Unknown keys ignored and preserved by rewriter.
@@ -352,6 +352,11 @@ That ends at the first release. From then on a new version is required for a lay
   resolution (a linked worktree's is `<common>/info/exclude`, not its own git dir); when the root is not a repository
   the source does not exist. `--no-gitignore` disables the chain and `info/exclude` (git's own) but not
   `.fs-meta/ignore`, which is the nested-root guard.
+- **Declared build-stage folders are a source named `stage`.** `<root>/.fs-meta/build.json` lists the output folders
+  of each build stage (`plans/build-artifacts.md` § 7.2). They are excluded from the root walk before the ignore chain,
+  so no `!` can re-open one; `fsmeta ignored` reports `stage` as the deciding source, and `scan.ignoreSources` carries
+  `stage` when at least one folder is declared. The folders are not written into `.fs-meta/ignore`: that file belongs
+  to the user.
 - **Precedence is per source, and a `!` never crosses a source.** The first source that excludes a path decides it; a
   later `!` cannot re-include what an earlier source excluded. A `!` still overrides an earlier pattern **inside its own
   source**, which is git's last-match-wins rule. `.fs-meta/ignore`'s `# fsmeta-managed` block is evaluated after the

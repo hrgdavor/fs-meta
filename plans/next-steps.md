@@ -18,10 +18,18 @@ writer-scope tests, one POSIX-only socket assertion, one Linux-only watch-bound 
 port and CLI suites.
 
 **Implemented, in one line each:** the trio format and the Zig engine; the daemon (`roots.json`, per-root sockets,
-`STATE`, sleep/wake, retention, `on_remove`); and the worktrees plan ([`worktrees.md`](worktrees.md)) — boundary rule,
+`STATE`, sleep/wake, retention, `on_remove`); the worktrees plan ([`worktrees.md`](worktrees.md)) — boundary rule,
 guarded nesting, ignore sources, git lock latch, metadata watch, `GIT_EVENT` (`0x0102`), hooks, seeding, live
-discovery/removal, and the two per-root switches. `FORMAT.md`, `FORMAT.daemon.md`, `FORMAT.socket.md`, `README.md`
-and `AGENTS.md` are the references.
+discovery/removal, and the two per-root switches; and staged builds ([`build-artifacts.md`](build-artifacts.md)) —
+`SUBSCRIBE_V2` stage/builder, `BUILD_STARTED`/`BUILD_DONE`, `STAGE_READY`, and the per-root barrier that releases a
+stage only when the previous stage's builders acknowledge. The stage-folder phase is implemented too: each stage
+declares its output folders in `.fs-meta/build.json`, the folders are a `stage` ignore source, a stage-local
+trio/cache and batch archive lives under `.fs-meta/stages/<NN>/`, the daemon emits a stage batch after a stage's
+build, and `fsmeta stage status|scan|diff` reuses the same pass for one-shot builds. Stage entries are emitted from
+the scan hook while the walk is running, and `SUBSCRIBE_V3`/`from_stage_batch` replays the producer's archived
+stage batches, the scp-like publisher is runnable at [`examples/stage-publisher/`](../examples/stage-publisher/), and
+`root status` reports the stage barrier/counters with a started-builder timeout. `FORMAT.md`, `FORMAT.daemon.md`,
+`FORMAT.socket.md`, `README.md` and `AGENTS.md` are the references.
 
 ## 1. Retention and the WAL (deliberately open)
 

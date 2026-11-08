@@ -50,9 +50,26 @@ pub const HashMode = enum { none, lf, text };
 pub const Options = struct {
     hash_mode: HashMode = .text,
     respect_gitignore: bool = true,
+    /// Take a content hash while walking. A caller that already has a previous state (the stage scan) asks for
+    /// metadata only and hashes the dirty residue itself; false leaves every `content_hash` at 0.
+    hash_files: bool = true,
     /// Directory names that are never listed and never entered. `.git` and `.fs-meta` are also skipped
     /// unconditionally, because § 16 makes that a rule of the format rather than a caller's choice.
     ignored_dir_names: []const []const u8 = &.{ ".git", ".fs-meta" },
+    /// Declared build-stage folders: outputs, not sources. They are pruned like an ignore source named `stage`.
+    exclude_prefixes: []const []const u8 = &.{},
+    /// Called for each entry as the walk produces it, before the fact is stored. A mutable `Fact` lets a stage
+    /// scan hash the file and emit it while the walk is still running; the walker stores the mutated value.
+    on_fact: ?FactHook = null,
+};
+
+pub const FactHook = struct {
+    ctx: *anyopaque,
+    on_fact: *const fn (ctx: *anyopaque, fact: *Fact) void,
+
+    fn call(self: FactHook, fact: *Fact) void {
+        self.on_fact(self.ctx, fact);
+    }
 };
 
 /// One entry of a snapshot, before it becomes a 64-byte `format.Entry`.
@@ -116,11 +133,18 @@ pub fn scanDetailed(arena: std.mem.Allocator, io: std.Io, root_path: []const u8,
     try walker.walkDir(root, "");
     const facts = try walker.facts.toOwnedSlice(arena);
     std.mem.sort(Fact, facts, {}, lessThanFact);
+    var active = sources.active;
+    if (options.exclude_prefixes.len > 0) {
+        const with_stage = try arena.alloc([]const u8, active.len + 1);
+        @memcpy(with_stage[0..active.len], active);
+        with_stage[active.len] = "stage";
+        active = with_stage;
+    }
     return .{
         .facts = facts,
         .boundaries = try walker.boundaries.toOwnedSlice(arena),
         .pruned = try walker.pruned.toOwnedSlice(arena),
-        .ignore_sources = sources.active,
+        .ignore_sources = active,
         .skipped_names = walker.skipped_names,
     };
 }
@@ -188,6 +212,13 @@ const Walker = struct {
 
             const rel_name = try self.relName(rel_dir, name);
 
+            // A declared stage folder is a build output. It is pruned before the ignore chain, so no `!` can
+            // re-open it; `stage` is a source like `gitignore`, not a hint.
+            if (self.isStageFolder(rel_name)) {
+                if (kind == .dir) try self.pruned.append(self.arena, .{ .path = rel_name, .source = "stage" });
+                continue;
+            }
+
             // Extra configured names apply to directories only: the option is a *directory* name list.
             if (kind == .dir and self.isIgnoredDirName(name)) {
                 try self.pruned.append(self.arena, .{ .path = rel_name, .source = "reserved" });
@@ -237,15 +268,18 @@ const Walker = struct {
             switch (kind) {
                 .regular_file => {
                     fact.size_bytes = stat.size;
-                    const hashed = try hashFile(self.io, dir, name, self.options.hash_mode);
-                    fact.content_hash = hashed.hash;
-                    fact.hash_lf = hashed.hash_lf;
+                    if (self.options.hash_files) {
+                        const hashed = try hashFile(self.io, dir, name, self.options.hash_mode);
+                        fact.content_hash = hashed.hash;
+                        fact.hash_lf = hashed.hash_lf;
+                    }
                 },
                 // § 5/§ 6: a directory's and a symlink's size and content hash are 0. The symlink's mtime
                 // and identity above are the link's own because every stat was an lstat.
                 .dir, .symlink => {},
             }
 
+            if (self.options.on_fact) |hook| hook.call(&fact);
             try self.facts.append(self.arena, fact);
 
             if (kind == .dir) {
@@ -259,6 +293,15 @@ const Walker = struct {
     fn relName(self: *Walker, rel_dir: []const u8, name: []const u8) ![]const u8 {
         if (rel_dir.len == 0) return self.arena.dupe(u8, name);
         return std.fmt.allocPrint(self.arena, "{s}/{s}", .{ rel_dir, name });
+    }
+
+    fn isStageFolder(self: *Walker, rel_name: []const u8) bool {
+        for (self.options.exclude_prefixes) |prefix| {
+            if (std.mem.startsWith(u8, rel_name, prefix)) {
+                if (rel_name.len == prefix.len or rel_name[prefix.len] == '/') return true;
+            }
+        }
+        return false;
     }
 
     fn isIgnoredDirName(self: *Walker, name: []const u8) bool {

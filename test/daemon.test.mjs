@@ -196,7 +196,7 @@ function helloFrame() {
   const bytes = Buffer.alloc(8 + 24);
   bytes.writeUInt16LE(KIND.HELLO, 0);
   bytes.writeUInt32LE(24, 4);
-  bytes.writeUInt16LE(0x0102, 8); // protocol: major 1, minor 2 (STATE and GIT_EVENT)
+  bytes.writeUInt16LE(0x0105, 8); // protocol: major 1, minor 5 (STATE, GIT_EVENT, barrier, stage batch, replay cursor)
   bytes.writeUInt16LE(ENTRY_SIZE, 10);
   bytes.writeUInt8(0, 12); // hash_algorithm 0 = wyhash64
   bytes.writeUInt8(1, 13); // role 1 = client
@@ -357,7 +357,7 @@ function expectHello(frame) {
   expect(frame.kind).toBe(KIND.HELLO);
   expect(frame.flags).toBe(0);
   expect(frame.length).toBe(24);
-  expect(frame.payload.readUInt16LE(0)).toBe(0x0102);
+  expect(frame.payload.readUInt16LE(0)).toBe(0x0105);
   expect(frame.payload.readUInt16LE(2)).toBe(ENTRY_SIZE);
   expect(frame.payload.readUInt8(5)).toBe(0); // role = server
 }
@@ -377,7 +377,7 @@ function parseState(frame) {
   };
 }
 
-/** `GIT_EVENT` (0x0A, protocol 0x0102): 20 bytes, and `24 + path_len` for the one variable kind, `worktree`. */
+/** `GIT_EVENT` (0x0A, added at protocol 0x0102): 20 bytes, and `24 + path_len` for the one variable kind, `worktree`. */
 const GIT_PHASE = ['start', 'finish', 'aborted'];
 const GIT_KIND = ['branch', 'checkout', 'commit', 'merge', 'rebase', 'index', 'worktree', 'other'];
 const GIT_SOURCE = ['metadata', 'hook'];

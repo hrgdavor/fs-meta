@@ -34,17 +34,21 @@
 //! The `SUBSCRIBE` payload is length-prefixed by the frame, so the server distinguishes the forms by
 //! `length`:
 //!
-//! - `length == 8`: the original form — `u64 from_batch`, no filter.
-//! - `length > 8`: the extended form — `u64 from_batch`, `u16 include_count`,
+//! - `SUBSCRIBE`, `length == 8`: the original form — `u64 from_batch`, no filter.
+//! - `SUBSCRIBE`, `length > 8`: the extended form — `u64 from_batch`, `u16 include_count`,
 //!   `include_count × (u16 pattern_len + pattern_bytes)`, `u16 exclude_count`,
 //!   `exclude_count × (u16 pattern_len + pattern_bytes)`.
+//! - `SUBSCRIBE_V2` (`FORMAT.socket.md` § BUILD_STAGES): the same filter section after a 12-byte header —
+//!   `u64 from_batch`, `u16 stage`, `u16 flags` (bit 0 = builder).
 //!
 //! All integers are little-endian. A pattern is its UTF-8 bytes, no terminator. The extended section
 //! must end exactly at the payload's end; a truncated length/count or trailing bytes are `Malformed`
-//! (the protocol's `protocol` error). `decodeSubscribe` is the one decoder both socket paths use.
+//! (the protocol's `protocol` error). `decodeSubscribe` and `decodeSubscribeV2` are the one decoder both
+//! socket paths use; the only difference is the header width.
 
 const std = @import("std");
 const gitignore = @import("gitignore.zig");
+const wire = @import("wire.zig");
 
 /// One compiled pattern: the pattern bytes plus the anchoring decision.
 pub const Pattern = struct {
@@ -136,6 +140,13 @@ pub fn compileOne(pattern: []const u8) Pattern {
 pub const Subscribe = struct {
     from_batch: u64,
     filter: Filter,
+    /// The staged-build stage. The original `SUBSCRIBE` is stage 0 (`FORMAT.socket.md` § BUILD_STAGES).
+    stage: u16 = 0,
+    /// Whether this subscriber is a builder that acknowledges batches; a listener is `false`.
+    builder: bool = false,
+    /// The last stage batch the client has applied (`SUBSCRIBE_V3` only). `null` means "no cursor supplied";
+    /// the daemon starts such a subscriber at the current stage head.
+    from_stage_batch: ?u64 = null,
     /// The copied payload tail holding the pattern bytes; empty for the 8-byte pass-all form.
     storage: []const u8,
 
@@ -146,10 +157,10 @@ pub const Subscribe = struct {
     }
 };
 
-/// Why a `SUBSCRIBE` payload could not be decoded. Both are the protocol's `protocol` error (code 1) at
-/// the socket: `FORMAT.socket.md` § Errors names a `SUBSCRIBE` shorter than 8 bytes and a malformed
-/// extended filter section together.
-pub const DecodeError = error{ TooShort, Malformed };
+/// Why a `SUBSCRIBE` payload could not be decoded. All are the protocol's `protocol` error (code 1) at
+/// the socket: `FORMAT.socket.md` § Errors names a `SUBSCRIBE` shorter than 8 bytes, a malformed
+/// extended filter section, and a reserved `SUBSCRIBE_V2` flag together.
+pub const DecodeError = error{ TooShort, Malformed, ReservedFlags };
 
 /// Decode a `SUBSCRIBE` payload (`FORMAT.socket.md` § SUBSCRIBE filter patterns).
 ///
@@ -166,10 +177,55 @@ pub fn decodeSubscribe(allocator: std.mem.Allocator, payload: []const u8) (Decod
     if (payload.len < 8) return error.TooShort;
     const from_batch = std.mem.readInt(u64, payload[0..8], .little);
     if (payload.len == 8) return .{ .from_batch = from_batch, .filter = Filter.passAll(), .storage = &.{} };
+    return decodeFilterSection(allocator, payload, 8, from_batch, 0, false, null);
+}
 
-    // One copy of the pattern section; every pattern below is a slice into it, so no per-pattern
-    // allocation and one free.
-    const storage = try allocator.dupe(u8, payload[8..]);
+/// Decode `SUBSCRIBE_V2` (`FORMAT.socket.md` § BUILD_STAGES): `u64 from_batch`, `u16 stage`,
+/// `u16 flags`, then the same include/exclude section the extended `SUBSCRIBE` carries.
+///
+/// `flags` bit 0 is the builder role; every other bit is reserved and refused rather than ignored, because
+/// a role this server does not understand must not silently become a listener.
+pub fn decodeSubscribeV2(allocator: std.mem.Allocator, payload: []const u8) (DecodeError || std.mem.Allocator.Error)!Subscribe {
+    if (payload.len < 12) return error.TooShort;
+    const flags = std.mem.readInt(u16, payload[10..12], .little);
+    if ((flags & ~@as(u16, 0x01)) != 0) return error.ReservedFlags;
+    const from_batch = std.mem.readInt(u64, payload[0..8], .little);
+    const stage = std.mem.readInt(u16, payload[8..10], .little);
+    // A stage is a small chain, not a namespace; the same limit the daemon's stage walk assumes.
+    if (stage > wire.max_stage) return error.Malformed;
+    // The filter section is mandatory in the v2 form (even when both counts are zero), so the payload must at
+    // least carry the two `u16` counts.
+    if (payload.len < 14) return error.Malformed;
+    return decodeFilterSection(allocator, payload, 12, from_batch, stage, (flags & 0x01) != 0, null);
+}
+
+/// Decode `SUBSCRIBE_V3`: `u64 from_batch`, `u64 from_stage_batch`, `u16 stage`, `u16 flags`, then the filter
+/// section. The only addition over v2 is the stage-batch replay cursor.
+pub fn decodeSubscribeV3(allocator: std.mem.Allocator, payload: []const u8) (DecodeError || std.mem.Allocator.Error)!Subscribe {
+    if (payload.len < 20) return error.TooShort;
+    const flags = std.mem.readInt(u16, payload[18..20], .little);
+    if ((flags & ~@as(u16, 0x01)) != 0) return error.ReservedFlags;
+    const from_batch = std.mem.readInt(u64, payload[0..8], .little);
+    const from_stage_batch = std.mem.readInt(u64, payload[8..16], .little);
+    const stage = std.mem.readInt(u16, payload[16..18], .little);
+    if (stage > wire.max_stage) return error.Malformed;
+    if (payload.len < 22) return error.Malformed;
+    return decodeFilterSection(allocator, payload, 20, from_batch, stage, (flags & 0x01) != 0, from_stage_batch);
+}
+
+/// The common tail of both subscription forms: the include/exclude pattern section after `header_size`.
+/// The section must end exactly at the payload's end.
+fn decodeFilterSection(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    header_size: usize,
+    from_batch: u64,
+    stage: u16,
+    builder: bool,
+    from_stage_batch: ?u64,
+) (DecodeError || std.mem.Allocator.Error)!Subscribe {
+    // The `len == 8` fast path is the caller's; every path here has a filter section.
+    const storage = try allocator.dupe(u8, payload[header_size..]);
     errdefer allocator.free(storage);
 
     var include: std.ArrayListUnmanaged(Pattern) = .empty;
@@ -188,6 +244,9 @@ pub fn decodeSubscribe(allocator: std.mem.Allocator, payload: []const u8) (Decod
     return .{
         .from_batch = from_batch,
         .filter = .{ .include = include_slice, .exclude = exclude_slice },
+        .stage = stage,
+        .builder = builder,
+        .from_stage_batch = from_stage_batch,
         .storage = storage,
     };
 }
@@ -276,6 +335,49 @@ fn encodeSubscribe(buffer: []u8, from_batch: u64, include: []const []const u8, e
     return buffer[0..pos];
 }
 
+/// Build a `SUBSCRIBE_V2` payload (`FORMAT.socket.md` § BUILD_STAGES) into `buffer` and return the filled slice.
+fn encodeSubscribeV2(buffer: []u8, from_batch: u64, stage: u16, flags: u16, include: []const []const u8, exclude: []const []const u8) []u8 {
+    var pos: usize = 12;
+    std.mem.writeInt(u64, buffer[0..8], from_batch, .little);
+    std.mem.writeInt(u16, buffer[8..10], stage, .little);
+    std.mem.writeInt(u16, buffer[10..12], flags, .little);
+    for ([_][]const []const u8{ include, exclude }) |patterns| {
+        std.debug.assert(pos + 2 <= buffer.len);
+        std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(patterns.len), .little);
+        pos += 2;
+        for (patterns) |pattern| {
+            std.debug.assert(pos + 2 + pattern.len <= buffer.len);
+            std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(pattern.len), .little);
+            pos += 2;
+            @memcpy(buffer[pos..][0..pattern.len], pattern);
+            pos += pattern.len;
+        }
+    }
+    return buffer[0..pos];
+}
+
+/// Build a `SUBSCRIBE_V3` payload into `buffer` and return the filled slice.
+fn encodeSubscribeV3(buffer: []u8, from_batch: u64, from_stage_batch: u64, stage: u16, flags: u16, include: []const []const u8, exclude: []const []const u8) []u8 {
+    var pos: usize = 20;
+    std.mem.writeInt(u64, buffer[0..8], from_batch, .little);
+    std.mem.writeInt(u64, buffer[8..16], from_stage_batch, .little);
+    std.mem.writeInt(u16, buffer[16..18], stage, .little);
+    std.mem.writeInt(u16, buffer[18..20], flags, .little);
+    for ([_][]const []const u8{ include, exclude }) |patterns| {
+        std.debug.assert(pos + 2 <= buffer.len);
+        std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(patterns.len), .little);
+        pos += 2;
+        for (patterns) |pattern| {
+            std.debug.assert(pos + 2 + pattern.len <= buffer.len);
+            std.mem.writeInt(u16, buffer[pos..][0..2], @intCast(pattern.len), .little);
+            pos += 2;
+            @memcpy(buffer[pos..][0..pattern.len], pattern);
+            pos += pattern.len;
+        }
+    }
+    return buffer[0..pos];
+}
+
 test "the 8-byte SUBSCRIBE form decodes to the pass-all filter" {
     var payload: [8]u8 = undefined;
     std.mem.writeInt(u64, &payload, 42, .little);
@@ -307,6 +409,73 @@ test "extended SUBSCRIBE: two empty counts is still pass-all" {
     defer sub.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 3), sub.from_batch);
     try std.testing.expect(sub.filter.isPassAll());
+}
+
+test "SUBSCRIBE_V2 decodes stage and builder, and a plain SUBSCRIBE stays stage 0" {
+    var buffer: [128]u8 = undefined;
+    const payload = encodeSubscribeV2(&buffer, 9, 2, 0x01, &.{"*.class"}, &.{"generated/*"});
+    var sub = try decodeSubscribeV2(std.testing.allocator, payload);
+    defer sub.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 9), sub.from_batch);
+    try std.testing.expectEqual(@as(u16, 2), sub.stage);
+    try std.testing.expect(sub.builder);
+    try std.testing.expect(sub.filter.matches("build/Main.class"));
+    try std.testing.expect(!sub.filter.matches("generated/Main.class"));
+
+    // No filter still carries both zero counts; a listener needs no builder flag.
+    const empty = encodeSubscribeV2(&buffer, 4, 1, 0, &.{}, &.{});
+    var listener = try decodeSubscribeV2(std.testing.allocator, empty);
+    defer listener.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1), listener.stage);
+    try std.testing.expect(!listener.builder);
+    try std.testing.expect(listener.filter.isPassAll());
+
+    // The original form's defaults are the documented ones.
+    var legacy_payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, &legacy_payload, 3, .little);
+    var legacy = try decodeSubscribe(std.testing.allocator, &legacy_payload);
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 0), legacy.stage);
+    try std.testing.expect(!legacy.builder);
+}
+
+test "SUBSCRIBE_V3 carries the stage replay cursor and keeps the other fields" {
+    var buffer: [128]u8 = undefined;
+    const payload = encodeSubscribeV3(&buffer, 9, 3, 2, 0x01, &.{"*.jar"}, &.{});
+    var sub = try decodeSubscribeV3(std.testing.allocator, payload);
+    defer sub.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 9), sub.from_batch);
+    try std.testing.expectEqual(@as(u64, 3), sub.from_stage_batch.?);
+    try std.testing.expectEqual(@as(u16, 2), sub.stage);
+    try std.testing.expect(sub.builder);
+    try std.testing.expect(sub.filter.matches("build/libs/app.jar"));
+
+    // v2 has no cursor; the daemon reads `null` as "start at the stage head".
+    var old_buffer: [128]u8 = undefined;
+    const old = encodeSubscribeV2(&old_buffer, 4, 1, 0, &.{}, &.{});
+    var old_sub = try decodeSubscribeV2(std.testing.allocator, old);
+    defer old_sub.deinit(std.testing.allocator);
+    try std.testing.expect(old_sub.from_stage_batch == null);
+}
+
+test "SUBSCRIBE_V2 refuses a reserved flag and a missing filter section" {
+    var buffer: [64]u8 = undefined;
+    // Bit 1 is reserved: a role this server does not understand must not become a listener silently.
+    const reserved = encodeSubscribeV2(&buffer, 0, 0, 0x02, &.{}, &.{});
+    try std.testing.expectError(error.ReservedFlags, decodeSubscribeV2(std.testing.allocator, reserved));
+
+    // The 12-byte header without the two filter counts is malformed, not pass-all: the v2 layout is exact.
+    var header_only: [12]u8 = undefined;
+    @memset(&header_only, 0);
+    try std.testing.expectError(error.Malformed, decodeSubscribeV2(std.testing.allocator, &header_only));
+
+    // A truncated pattern section is still malformed.
+    const full = encodeSubscribeV2(&buffer, 0, 0, 0, &.{"*.md"}, &.{});
+    try std.testing.expectError(error.Malformed, decodeSubscribeV2(std.testing.allocator, full[0 .. full.len - 1]));
+
+    // A stage beyond the documented chain is refused rather than turned into a 65 000-step pump.
+    const too_deep = encodeSubscribeV2(&buffer, 0, wire.max_stage + 1, 0, &.{}, &.{});
+    try std.testing.expectError(error.Malformed, decodeSubscribeV2(std.testing.allocator, too_deep));
 }
 
 test "decoded patterns outlive the payload buffer they came from" {

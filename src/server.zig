@@ -796,6 +796,7 @@ fn frameErrorWord(err: wire.ReadError) []const u8 {
         error.InvalidEntry => "invalid-entry",
         error.InvalidState => "invalid-state",
         error.InvalidGitEvent => "invalid-git-event",
+        error.InvalidBuild => "invalid-build",
     };
 }
 
@@ -906,7 +907,7 @@ test "the greeting is the document's fixed 24-byte payload, not the kind table's
     try std.testing.expectEqual(@as(usize, 32), bytes.len);
     try std.testing.expectEqual(@as(u8, 0x01), bytes[0]);
     try std.testing.expectEqual(@as(u32, wire.hello_size), std.mem.readInt(u32, bytes[4..8], .little));
-    try std.testing.expectEqual(@as(u16, 0x0102), std.mem.readInt(u16, bytes[8..10], .little));
+    try std.testing.expectEqual(protocol, std.mem.readInt(u16, bytes[8..10], .little));
     try std.testing.expectEqual(@as(u16, 64), std.mem.readInt(u16, bytes[10..12], .little));
     try std.testing.expectEqual(@as(u8, 0), bytes[14]); // role = server
     try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, bytes[16..24], .little));

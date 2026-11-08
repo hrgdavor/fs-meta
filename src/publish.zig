@@ -43,6 +43,8 @@ pub const Request = struct {
     updated: []const u8,
     writer: []const u8,
     scan: ?json.ScanFields = null,
+    /// Present only for a stage state; the root trio never carries it.
+    stage: ?json.StageFields = null,
 };
 
 pub const Outcome = struct {
@@ -108,6 +110,7 @@ pub fn publish(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cache:
         .updated = request.updated,
         .writer = request.writer,
         .scan = request.scan,
+        .stage = request.stage,
         .roots = roots,
     });
 

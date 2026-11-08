@@ -49,6 +49,15 @@ pub const RootFields = struct {
     length: u64,
 };
 
+/// The additive header a stage state carries (`plans/build-artifacts.md` § 7.3). A root trio never has it; a
+/// reader that does not know it ignores it.
+pub const StageFields = struct {
+    stage: u16,
+    folders: []const []const u8,
+    hash: []const u8,
+    config_hash: []const u8,
+};
+
 pub const Fields = struct {
     generation: u64,
     count: u64,
@@ -69,6 +78,8 @@ pub const Fields = struct {
     roots: ?[]const RootFields = null,
     /// Present only in a batch trio (§ 17.2).
     batch: ?BatchFields = null,
+    /// Present only in a stage state (§ 7.3).
+    stage: ?StageFields = null,
 };
 
 /// The document a publish writes: `FORMAT.md` § 7's keys, in the order a reader sees them.
@@ -108,6 +119,18 @@ pub fn encode(gpa: std.mem.Allocator, fields: Fields) ![]u8 {
     try writer.writeAll(" },\n");
 
     try writer.print("  \"root\": {{ \"dev\": {d}, \"ino\": {d} }},\n", .{ fields.root_dev, fields.root_ino });
+    if (fields.stage) |stage| {
+        try writer.print("  \"stage\": {{ \"stage\": {d}, \"folders\": [", .{stage.stage});
+        for (stage.folders, 0..) |folder, index| {
+            if (index != 0) try writer.writeAll(", ");
+            try writeString(writer, folder);
+        }
+        try writer.writeAll("], \"hash\": ");
+        try writeString(writer, stage.hash);
+        try writer.writeAll(", \"configHash\": ");
+        try writeString(writer, stage.config_hash);
+        try writer.writeAll(" },\n");
+    }
     if (fields.batch) |batch| {
         try writer.print("  \"batch\": {{ \"number\": {d}, \"parent\": {d}, \"added\": {d}, \"changed\": {d}, \"deleted\": {d} }},\n",
             .{ batch.number, batch.parent, batch.added, batch.changed, batch.deleted });

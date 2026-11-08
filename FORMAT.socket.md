@@ -132,18 +132,26 @@ simultaneous-greeting rule anyway.
 
 ### Messages
 
-| `kind` | Name           | Payload                                                                                |
-| ------ | -------------- | -------------------------------------------------------------------------------------- |
-| `0x01` | `HELLO`        | the fixed 24-byte greeting of § Handshake — its one definition, not a second size here |
-| `0x02` | `START_BATCH`  | `u64 number`, `u64 parent`, `u64 started_ns`                                           |
-| `0x03` | `CHANGE_ENTRY` | 64-byte entry (§ 5) + name bytes, no LF                                                |
-| `0x04` | `END_BATCH`    | `u64 number`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`            |
-| `0x05` | `ERROR`        | `u16 code`, then a UTF-8 message                                                       |
-| `0x06` | `SUBSCRIBE`    | `u64 from_batch` — the last batch the client has applied (`0` = nothing); optionally followed by filter patterns (see below) |
-| `0x07` | `PING`         | empty                                                                                  |
-| `0x08` | `PONG`         | empty                                                                                  |
-| `0x09` | `STATE`        | `u8 state`, `u8 reason`, `u32 idle_timeout_ms`, `u64 head_batch` — see § STATE         |
-| `0x0a` | `GIT_EVENT`    | `u8 phase`, `u8 kind`, `u8 source`, `u8 status`, `u64 head_batch`, `u64 at_ms`, then for `kind = worktree` only `u32 path_len` + path — see § GIT_EVENT |
+| `kind` | Name                 | Payload                                                                                |
+| ------ | -------------------- | -------------------------------------------------------------------------------------- |
+| `0x01` | `HELLO`              | the fixed 24-byte greeting of § Handshake — its one definition, not a second size here |
+| `0x02` | `START_BATCH`        | `u64 number`, `u64 parent`, `u64 started_ns`                                           |
+| `0x03` | `CHANGE_ENTRY`       | 64-byte entry (§ 5) + name bytes, no LF                                                |
+| `0x04` | `END_BATCH`          | `u64 number`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`            |
+| `0x05` | `ERROR`              | `u16 code`, then a UTF-8 message                                                       |
+| `0x06` | `SUBSCRIBE`          | `u64 from_batch` — the last batch the client has applied (`0` = nothing); optionally followed by filter patterns (see below) |
+| `0x07` | `PING`               | empty                                                                                  |
+| `0x08` | `PONG`               | empty                                                                                  |
+| `0x09` | `STATE`              | `u8 state`, `u8 reason`, `u32 idle_timeout_ms`, `u64 head_batch` — see § STATE         |
+| `0x0a` | `GIT_EVENT`          | `u8 phase`, `u8 kind`, `u8 source`, `u8 status`, `u64 head_batch`, `u64 at_ms`, then for `kind = worktree` only `u32 path_len` + path — see § GIT_EVENT |
+| `0x0b` | `SUBSCRIBE_V2`       | `u64 from_batch`, `u16 stage`, `u16 flags`, then the `SUBSCRIBE` filter section — see § BUILD_STAGES |
+| `0x0c` | `BUILD_STARTED`      | `u64 generation` — see § BUILD_STAGES                                                  |
+| `0x0d` | `BUILD_DONE`         | `u64 generation`, `u8 status` — see § BUILD_STAGES                                     |
+| `0x0e` | `STAGE_READY`        | `u16 stage`, `u64 head_batch`, `u64 released_through` — see § BUILD_STAGES             |
+| `0x0f` | `STAGE_BATCH_START`  | `u16 stage`, `u64 generation`, `u64 parent`, `u64 started_ns` — see § BUILD_STAGES     |
+| `0x10` | `STAGE_CHANGE_ENTRY` | the same 64-byte entry + name as `CHANGE_ENTRY` — see § BUILD_STAGES                   |
+| `0x11` | `STAGE_BATCH_END`    | `u16 stage`, `u64 generation`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`, `u8 status` — see § BUILD_STAGES |
+| `0x12` | `SUBSCRIBE_V3`       | `u64 from_batch`, `u64 from_stage_batch`, `u16 stage`, `u16 flags`, then the `SUBSCRIBE` filter section — see § BUILD_STAGES |
 
 **`HELLO` is defined once**, in § Handshake; the row above is a pointer that keeps the kind numbering in one place,
 not a second payload layout.
@@ -310,8 +318,129 @@ apart; coalescing is per `(kind, phase)` per pass, not per operation.
 8. **A late subscriber is not replayed a finish.** Git events are a live signal, not a log: a client that subscribes
    after one was flushed learns the state from the batch. The history of git operations is `root status`'s job.
 
-**Git events are a daemon feature.** `fsmeta serve` announces `0x0102` and never emits `0x0a` (or `0x09`): it has no
-scheduler and no git handling, so a consumer of `serve` gets batches only — the same asymmetry `STATE` already has.
+**Git events are a daemon feature.** `fsmeta serve` announces `0x0105` and never emits `0x0a` (or `0x09`, or the
+staged-build frames): it has no scheduler and no git handling, so a consumer of `serve` gets batches only — the same
+asymmetry `STATE` already has.
+
+### BUILD_STAGES
+
+A development project often has staged builds: stage 0 compiles sources into generated sources or classes; stage 1
+packages those; stage 2 bundles them; and so on. Build **artifacts** are usually in `.gitignore`, so the walk does
+not list them and their writes never publish a batch — which is exactly what keeps the main thread from waking on
+its own output. The missing signal is the **barrier**: stage 1 must not start until every stage-0 build is done,
+and stage 0's output produces no tracked change to tell it so.
+
+`fs-meta` adds that barrier to the stream the daemon already owns. It does **not** add artifact paths to the root
+trio (§ What the wire deliberately does not carry, below): the root batch carries what the root tracks, while the
+declared stage folders get their own state and their own `STAGE_CHANGE_ENTRY` batch. A consumer that only needs
+"your predecessor finished" uses `STAGE_READY`; one that needs the changed artifact names uses the stage batch or
+`.fs-meta/stages/<NN>/`.
+
+**Who is what.**
+
+- **Stage** — a non-negative integer. `0` is the ordinary source stream. A subscriber that does not declare a
+  stage is stage 0 and behaves exactly as before.
+- **Listener** — a subscriber that only receives changes. It never blocks another stage.
+- **Builder** — a subscriber that declared `flags` bit 0. A builder is expected to acknowledge every batch released
+  to its stage with `BUILD_DONE` (and may send `BUILD_STARTED` while it works). A failed or cancelled build still
+  acknowledges: a permanently broken stage must not strand every later one.
+- **Round** — one traversal of the chain. Stage 0 receives a batch; its builders work; when all of them are done,
+  stage 1 receives the batches it had not seen and a `STAGE_READY`; and so on.
+
+**`SUBSCRIBE_V2` (kind `0x0B`)** is the original `SUBSCRIBE` plus a 12-byte header. **`SUBSCRIBE_V3` (kind
+`0x12`)** adds the stage-batch replay cursor after `from_batch`; the filter section and every other field are the
+same:
+
+```text
+u64  from_batch
+u16  stage             0 = the ordinary source stream
+u16  flags             bit 0 = builder; bits 1..15 reserved and refused when set
+u16  include_count     then include_count × (u16 length + pattern bytes)
+u16  exclude_count     then exclude_count × (u16 length + pattern bytes)
+```
+
+`SUBSCRIBE_V3` inserts `u64 from_stage_batch` between `from_batch` and `stage`:
+
+```text
+u64  from_batch
+u64  from_stage_batch  the last producer-stage batch the client applied
+u16  stage
+u16  flags
+u16  include_count     then include_count × (u16 length + pattern bytes)
+u16  exclude_count     then exclude_count × (u16 length + pattern bytes)
+```
+
+The filter section is the one § SUBSCRIBE filter patterns defines, including exclude-wins and the filtered
+`END_BATCH` counts. A payload shorter than the header, a reserved flag, a stage above **64**, or a filter section
+that does not end exactly at the payload's end is `ERROR{protocol}`. The stage limit is explicit because the
+per-root pump walks stages in order; an unbounded client value would turn one batch into an unbounded loop.
+
+**`BUILD_STARTED` (kind `0x0C`, client → server)** carries `u64 generation`, the newest batch the builder is
+working from. It is diagnostic: it does not advance the barrier. A builder that starts and never finishes still
+blocks its successor, which is why a disconnect and a `BUILD_DONE` with `status = failed` both release it.
+
+**`BUILD_DONE` (kind `0x0D`, client → server)** carries `u64 generation` and `u8 status` (`0 = ok`, `1 = failed`,
+`2 = cancelled`). This is the acknowledgement that advances the barrier. A builder may batch several generations
+into one done; the highest generation wins, and `done_through` never moves backwards. A generation above the
+root's head **or above the builder's stage release** is `ERROR{protocol}`: a builder cannot acknowledge work its
+stage has not been given.
+
+**`STAGE_READY` (kind `0x0E`, server → client)** carries `u16 stage`, `u64 head_batch` and `u64 released_through`.
+It follows the batches that became available (never inside `START_BATCH … END_BATCH`) and is sent even when the
+previous stage published no tracked change: an artifact-only build is still a build round. A subscriber at stage
+`S > 0` receives one ready frame each time its release advances, carrying the new ceiling.
+
+**The barrier rule.** For one root:
+
+```text
+acked(stage)    = head_batch                    if no builder subscriber declares that stage
+                = min(done_through of every builder subscriber at that stage)
+released(stage) = head_batch                    if stage == 0
+                = min(head_batch, acked(stage - 1))
+```
+
+A subscriber at stage `S` may receive batches up to `released(S)`. A stage with no builder is not a barrier, so a
+pipeline that declares no builders behaves like the old single stream plus an explicit ready signal. A listener
+never narrows `acked`, even if it is at the same stage as a builder.
+
+**Replay is bounded by the barrier.** A stage-1 subscriber that reconnects with `from_batch` replays only up to
+`released(1)`, not the root head: reconnecting is not a way to jump over a build stage that has not run. The daemon
+then sends `STAGE_READY` for the release it replayed.
+
+**Stage batches replay separately.** A subscriber at stage `S > 0` also has the producer stage's artifact archive
+(`stage S-1`). `SUBSCRIBE_V3` carries `from_stage_batch`: the daemon replays each archived stage batch after that
+cursor as `STAGE_BATCH_START … STAGE_BATCH_END`, then continues live. A payload too old for the stage archive is
+`ERROR{batch-too-old}`; a missing generation is `ERROR{batch-gap}`. `SUBSCRIBE_V2` has no cursor and starts at the
+current stage head, which is why V3 exists for a late subscriber that wants the history. Archived stage entries are
+in the state's hash order; live stage entries are in observation order — a consumer treats both as a set, not a
+write-order stream.
+
+**Failure and disconnect.** A builder that leaves is no longer a barrier; the daemon releases the next stage and
+logs that it advanced without an acknowledgement. A `BUILD_DONE{status = failed}` does the same and records the
+status. A builder that never acknowledges holds its successor until it disconnects; there is deliberately no
+timeout in this version, because a timeout a slow compiler trips over is worse than the visible log line.
+
+**`fsmeta serve` does not implement this section.** It is a replay-only server with no scheduler and no rounds:
+it accepts the original `SUBSCRIBE`, and a `SUBSCRIBE_V2` to it is refused with `ERROR{protocol}`. The daemon is
+the staged server; `serve` announces the same protocol number and never emits `0x09`, `0x0A` or `0x0E`–`0x11`.
+
+**Stage batches (`0x0F`–`0x11`).** Each stage declares its output folders in `.fs-meta/build.json`; after the
+stage's builders finish, the daemon scans those folders against `.fs-meta/stages/<NN>/` and streams the artifact
+changes to the next stage:
+
+| frame                | meaning                                                                                  |
+| -------------------- | ---------------------------------------------------------------------------------------- |
+| `STAGE_BATCH_START`  | the stage scan's generation/parent; opens the stream                                     |
+| `STAGE_CHANGE_ENTRY` | one added/changed/deleted artifact; the payload is `CHANGE_ENTRY`'s 64-byte entry + name |
+| `STAGE_BATCH_END`    | the commit: exact counts, `changes_hash = 0` (not specified yet), status                 |
+
+Stage entries are in **observation order, not `(nameHash, name)` order**, because the scan emits a settled file
+before it has walked the whole folder; the root batch ordering above is unchanged. The sorted, durable form is the
+stage state's `files.meta`/`files.txt`; a consumer that needs sorted state reads that after the commit.
+`STAGE_BATCH_START` is sent before the first change, not for an empty scan; `STAGE_BATCH_END` follows the stage
+state commit, and deletes are emitted after the walk because the surviving set is only knowable then. The one-shot
+`fsmeta stage scan` and `diff` use the same state without a daemon. The first implementation scanned before it
+streamed; [`plans/build-artifacts.md`](plans/build-artifacts.md) § 7.6 records that gap and the callback fix.
 
 ### What the wire deliberately does not carry
 
@@ -321,6 +450,11 @@ scheduler and no git handling, so a consumer of `serve` gets batches only — th
   reads `files.meta` / `files.txt` / `files.json` directly, or asks for a snapshot message that is not specified yet.
 - **Ordering by clock.** `START_BATCH.started_ns` exists for diagnostics; ordering is the batch number, never a
   timestamp, because a clock can go backwards and a sequence cannot.
+- **Build artifact paths in a root batch.** Artifacts are usually ignored by the root walk, so they have no root
+  `CHANGE_ENTRY`; the stage batch (`STAGE_CHANGE_ENTRY`) is where a declared stage's changed artifacts are named.
+  Putting artifact paths into the root trio would make it describe files the project excluded and change every root
+  batch and vector for one tool's workflow. The stage state under `.fs-meta/stages/<NN>/` is the separate, sorted
+  form.
 
 ### Why two boundaries: the consumer can work during the batch
 
@@ -403,12 +537,14 @@ greet at once, and no state machine whose order can deadlock.
 The layout above is the format. Three of its values are this implementation's choice, and they are pinned here so a
 client author reads them instead of inferring them from the server's bytes.
 
-**`protocol` is `0x0102`** — major 1, minor 2. A client must use major 1; a different major is `unsupported-version`.
-The minor is negotiated by allowance, as above. Minor 1 is the `STATE` frame (§ STATE) and minor 2 is `GIT_EVENT`
-(§ GIT_EVENT); there are no deployed clients, so each bump was made once and every implementation was updated
-together — no capability bit gates either, and a `0x0100` or `0x0101` caller is still accepted because the major
-matches. A minor-2 client that does not know `0x0a` must refuse it rather than skip it (an unknown kind closes the
-connection), which is why the bump is a bump: a reader must be able to say "I do not know this frame".
+**`protocol` is `0x0105`** — major 1, minor 5. A client must use major 1; a different major is
+`unsupported-version`. The minor is negotiated by allowance, as above. Minor 1 is the `STATE` frame (§ STATE), minor
+2 is `GIT_EVENT` (§ GIT_EVENT), minor 3 is the staged-build barrier, minor 4 adds the streamed stage batch, and
+minor 5 adds `SUBSCRIBE_V3` with the stage-batch replay cursor (§ BUILD_STAGES); there are no deployed clients, so
+each bump was made once and every implementation was updated together — no capability bit gates either, and a
+`0x0100`–`0x0104` caller is still accepted because the major matches. A minor-2 client that does not know `0x0a` must
+refuse it rather than skip it (an unknown kind closes the connection), which is why the bump is a bump: a reader
+must be able to say "I do not know this frame".
 
 **`ERROR` codes** are the `u16 code` at offset 0 of the payload (kind `0x05`). The number is the contract: the UTF-8
 message that follows begins with the code's word and `: `, then detail for a human, so a client branches on the number
@@ -416,7 +552,7 @@ and never on the text.
 
 | code | word            | sent when                                                                                          |
 | ---- | --------------- | -------------------------------------------------------------------------------------------------- |
-| 1    | `protocol`      | the peer's greeting is not a `HELLO` frame with `length = 24`, its payload does not decode (`role` outside 0/1), or it fails a greeting check (`unsupported-entry-size`, `unsupported-hash`, `unsupported-version`, `unsupported-capability`); `SUBSCRIBE` is shorter than 8 bytes, its `from_batch` is newer than the newest batch, or its extended filter section is malformed; or a frame prefix is refused (`unknown-kind`, `unsupported-flags`, `frame-too-large`) |
+| 1    | `protocol`      | the peer's greeting is not a `HELLO` frame with `length = 24`, its payload does not decode (`role` outside 0/1), or it fails a greeting check (`unsupported-entry-size`, `unsupported-hash`, `unsupported-version`, `unsupported-capability`); `SUBSCRIBE` is shorter than 8 bytes, its `from_batch` is newer than the newest batch, or its extended filter section is malformed; `SUBSCRIBE_V2` has a reserved flag or a malformed section, `BUILD_STARTED`/`BUILD_DONE` names a generation above the head, or a stage-batch frame has a wrong length or status; or a frame prefix is refused (`unknown-kind`, `unsupported-flags`, `frame-too-large`) |
 | 2    | `batch-too-old` | `from_batch + 1` is below the oldest retained batch, so replay cannot start where the client asked |
 | 3    | `batch-gap`     | a generation in `from_batch + 1 ..= newest` has no batch directory                                 |
 

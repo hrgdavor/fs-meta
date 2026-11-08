@@ -50,10 +50,19 @@ export const KIND = {
   PONG: 0x08,
   STATE: 0x09,
   GIT_EVENT: 0x0a,
+  SUBSCRIBE_V2: 0x0b,
+  BUILD_STARTED: 0x0c,
+  BUILD_DONE: 0x0d,
+  STAGE_READY: 0x0e,
+  STAGE_BATCH_START: 0x0f,
+  STAGE_CHANGE_ENTRY: 0x10,
+  STAGE_BATCH_END: 0x11,
+  SUBSCRIBE_V3: 0x12,
 };
 
-/** The protocol this client speaks: major 1, minor 2 (`0x0102`). */
-export const PROTOCOL = 0x0102;
+/** The protocol this client speaks: major 1, minor 5 (`0x0105`). It subscribes with the original form; the
+ *  staged-build frames are for clients that opt into `SUBSCRIBE_V2`/`SUBSCRIBE_V3` (`FORMAT.socket.md` § BUILD_STAGES). */
+export const PROTOCOL = 0x0105;
 
 /** Every frame's payload is at most 1 MiB (`FORMAT.socket.md` § Framing). */
 export const MAX_FRAME = 1024 * 1024;

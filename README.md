@@ -17,13 +17,14 @@ reads — so a tool that kept an index can ask *"is this file still what I index
 **The format is specified in [`FORMAT.md`](FORMAT.md).** That document is the authority; this one is about the
 subproject: what is here, how to run it, and where it plugs in.
 
-| In this subproject                | What it is                                                                                          |
-| --------------------------------- | --------------------------------------------------------------------------------------------------- |
-| [`FORMAT.md`](FORMAT.md)          | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
-| `src/main.zig` + `build.zig*`     | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
-| `src/main/java/hr/hrg/fsmeta/`    | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.7`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
-| `js/`                             | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
-| `conformance/`                    | the shared vector file every reader asserts, and the generator that produces it                     |
+| In this subproject                                       | What it is                                                                                          |
+| -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| [`FORMAT.md`](FORMAT.md)                                 | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
+| `src/main.zig` + `build.zig*`                            | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
+| `src/main/java/hr/hrg/fsmeta/`                           | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.7`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
+| `js/`                                                    | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
+| `conformance/`                                           | the shared vector file every reader asserts, and the generator that produces it                     |
+| [`examples/stage-publisher/`](examples/stage-publisher/) | a runnable scp-like stage client: copy while the stage batch arrives, hook after the commit         |
 
 **Not a `jcodebuddy` artifact.** The module has its own group id, artifact id and version and **no parent** — it
 does not inherit `jcodebuddy-parent`, and it names no `jcodebuddy`/`hipster` type. It is listed in the root POM's
@@ -51,6 +52,17 @@ This is the intended deployment, not an implementation detail:
   stream across all of them. That is why the Zig variant is the intended one: it is the most lightweight and
   fastest option when several Java, Bun, editor and codegen processes are open, and it avoids each of them
   carrying its own event loop, debounce and hashing.
+- **Staged builds are a barrier on the same stream.** A dev pipeline often has stage 0 compiling sources into
+  artifacts that `.gitignore` hides, stage 1 packaging them, and so on. A subscriber can declare a stage and a
+  builder role (`SUBSCRIBE_V2`), send `BUILD_STARTED`/`BUILD_DONE`, and receive `STAGE_READY` when the previous
+  stage is finished. Declared stage folders (`<root>/.fs-meta/build.json`) are excluded from the root walk and get
+  a stage-local trio/cache and batch history under `.fs-meta/stages/<NN>/`; after a stage's build the daemon emits
+  its artifact batch (`STAGE_BATCH_START`/`STAGE_CHANGE_ENTRY`/`STAGE_BATCH_END`), and the same incremental pass
+  is available without a watcher through `fsmeta stage status|scan|diff`. Stage entries are emitted from the scan
+  hook while the walk is still running, with a lazy start; artifacts stay out of the root trio.
+  `FORMAT.socket.md` § BUILD_STAGES is the wire contract; `plans/build-artifacts.md` is the design. A late stage
+  subscriber can replay the producer's archived stage batches with `SUBSCRIBE_V3`/`from_stage_batch`;
+  `root status` reports the blocked stage and stage counters, and a started builder has a timeout.
 - **The Java, Bun and Node ports are clients/readers, never daemons.** They validate and decode the trio and can
   speak the socket protocol. They do not run a second watch loop in-process and do not start a daemon; that would
   duplicate the engine and defeat the point. The Java port's writer exists for repair/tests, not as a production

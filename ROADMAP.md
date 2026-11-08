@@ -14,6 +14,16 @@
 - **The engine's socket.** A tool with the engine running should ask it for the live state over a local socket
   (Unix domain socket; `AF_UNIX` is supported by Windows 10 1803+, and by Java 16+/Bun/Zig) instead of
   re-reading the tree. The protocol is its own document; `FORMAT.md` stays the durable path.
+- **Staged builds over the socket.** `SUBSCRIBE_V2` declares a stage and a builder role; `BUILD_STARTED` /
+  `BUILD_DONE` are the builder's acknowledgement, and `STAGE_READY` releases the next stage after every builder of
+  the previous one is done. The daemon holds the barrier per root; build artifacts stay out of the trio. The
+  contract is `FORMAT.socket.md` § BUILD_STAGES, the design is
+  [`plans/build-artifacts.md`](plans/build-artifacts.md). **Implemented:** stage-declared output folders in
+  `.fs-meta/build.json`, the `stage` ignore source, a stage-local trio/cache and batch archive under
+  `.fs-meta/stages/<NN>/`, stage-batch wire frames streamed from the scan hook while the walk runs, and the
+  one-shot `fsmeta stage status|scan|diff` CLI, and `SUBSCRIBE_V3`/`from_stage_batch` stage-batch replay. **Open
+  implemented:** `root status` reports the blocked stage, stage counters and the last scan, with a started-builder
+  timeout; the scp-like demo is [`examples/stage-publisher/`](examples/stage-publisher/).
 - **The watcher wiring.** The Java half is ready for it (`FsMetaScanner.scanFile` for one event's path,
   `FsMetaWriter.publish` for a generation), and `java-watch-core` may now depend on this module directly.
 - **The hash dependency is in its own project** (DEC-050): both ports hash with the same code — the Java half

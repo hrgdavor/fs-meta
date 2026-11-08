@@ -847,6 +847,66 @@ typo or an empty value is no guard; a daemon started with it prints one line say
 ~150 ms of process time; § 6a records the measured effect on a checkout. Nothing in the design can remove the spawn —
 it is what running a hook means — which is why the hooks are opt-in and the body does as little as possible.
 
+## 8b. Build stages on the consumer socket
+
+`FORMAT.socket.md` § BUILD_STAGES is the contract; this section is what the daemon does about it, and where its
+state lives.
+
+**The barrier is per root and in memory.** Each subscriber records its `stage`, whether it is a builder, and the
+newest generation it acknowledged (`done_through`). For a stage, `acked(stage)` is the minimum `done_through` of
+its builders, or the root's head when it has none; `released(stage)` is `head` for stage 0 and
+`min(head, acked(stage - 1))` for every later stage. There is no round file, no second archive and no persisted
+counter: reconnect replays from the client's `from_batch`, bounded by `released(stage)`, and a daemon restart is
+the ordinary cold path (the client reconnects and acknowledges what it sees).
+
+**A batch is delivered to stage 0, then the pump runs.** The daemon writes the batch to stage-0 subscribers as it
+always did, then sends every later stage the batches its barrier now releases, in generation order, followed by one
+`STAGE_READY`. A stage with no builder is passed through in the same turn, so a pipeline that declares no builders
+sees the old stream plus the ready frame. A subscriber's filter still applies to both the batch and its counts.
+
+**The root lock covers the pump.** The scheduler and a builder's `BUILD_DONE` both run on the root's task under
+`RootRuntime.lock`; a batch and the ready frame that follows it cannot interleave with another stage's release.
+`BUILD_DONE` arrives on the connection's own task and takes the lock only to update the acknowledgement and pump,
+so a slow stage-0 build never blocks the watcher thread.
+
+**A builder leaving releases the barrier.** `unregister` removes the subscriber and pumps before returning, so the
+next stage is not stranded by a crash. A `BUILD_DONE{status = failed}` does the same; the daemon logs the stage,
+the generation and the status. A builder that stays connected and never acknowledges holds its successor; this
+version deliberately has no timeout, because one a slow compiler trips over is worse than the log line.
+
+**`fsmeta serve` does not implement the barrier.** It has no scheduler and no rounds, so it accepts only the
+original `SUBSCRIBE` ([`FORMAT.socket.md`](FORMAT.socket.md) § BUILD_STAGES). The daemon is the staged server.
+
+**Stage folders and their state are implemented.** Each stage declares its output folders in
+`.fs-meta/build.json`; the folders are a `stage` ignore source for the root walk, and a stage-local trio/cache and
+batch archive lives under `.fs-meta/stages/<NN>/`. After a stage builder's `BUILD_DONE`, the daemon scans that
+stage and streams `STAGE_BATCH_START`/`STAGE_CHANGE_ENTRY`/`STAGE_BATCH_END` to the next stage. Entries are settled,
+hashed and emitted from `scan.Options.on_fact` while the walk is still running; the start frame is lazy (no frame
+for an empty scan), deletes follow the walk, and the end frame follows the stage-state commit. The first version
+scanned first and then streamed; [`plans/build-artifacts.md`](plans/build-artifacts.md) § 7.6 records that gap.
+The same state is available without a daemon through `fsmeta stage status|scan|diff`. A late stage subscriber can
+replay the producer stage's archived batches with `SUBSCRIBE_V3`'s `from_stage_batch`; a `SUBSCRIBE_V2` client has no
+cursor and starts at the current stage head. Archived stage entries are hash-ordered, live ones observation-ordered,
+and both are a set to the consumer.
+
+**The scan waits for the whole stage.** A stage is scanned only when `ackedThrough(stage) >= releasedThrough(stage)`;
+one of two builders finishing early must not scan a folder the other is still writing. A stage with **no** builders
+is scanned once per release (tracked in `undeclared_stage_scanned`), not once per tick.
+
+**Timeouts.** A builder that has unacknowledged work for `stage_timeout_ms` (default 60 s;
+`FSMETA_STAGE_TIMEOUT_MS` overrides it for the daemon, and 0 disables) is treated as failed whether or not it sent
+`BUILD_STARTED`; delivery starts the clock. Its `done_through` moves to the release, the successor is pumped, and
+`stage_timeouts` is incremented. The client is not sent a synthetic event; the log and status are the record.
+
+**Configuration is polled.** `.fs-meta` is not a watcher event, so each watching tick hashes `build.json` (a small
+document) and compares it with the previous digest. A change clears the undeclared-stage scan marks and runs one
+pass (while `watching`), so the root walk's stage exclusions follow the new declaration. A same-size, same-mtime edit
+is therefore still noticed.
+
+**`root status --json`** reports the stage state under the same snapshot object: `stage_batches`,
+`stage_scan_failures`, `stage_timeouts`, `stage_blocked` (`-1` when nothing waits), `stage_blocked_generation`,
+`stage_builders`, `stage_timeout_ms`, `last_stage_scan_ms`, `last_stage_scan_duration_ms` and `last_stage_error`.
+
 ## 9. What is not implemented
 
 - **A per-root child daemon** (§ 7). The interface and the `served_by` field are there; no child process is.

@@ -46,8 +46,8 @@ const ENTRY_SIZE = 64;
 /** `STATE`'s state table, in the order the byte encodes it (`FORMAT.socket.md` § STATE). */
 const STATE_NAMES = ['off', 'asleep', 'waking', 'watching'];
 
-/** The daemon's protocol: major 1, minor 2 adds `STATE` and `GIT_EVENT` (`wire.zig`). */
-const DAEMON_PROTOCOL = 0x0102;
+/** The daemon's protocol: major 1, minor 5 adds the stage-batch replay cursor (`wire.zig`). */
+const DAEMON_PROTOCOL = 0x0105;
 
 const scratchDirs = [];
 const children = [];
@@ -211,7 +211,7 @@ async function waitForDaemon(m, child, timeoutMs = 15000) {
 
 /**
  * `HELLO`: the 8-byte prefix plus the fixed 24-byte payload. The minor version is the caller's: `serve`
- * predates `STATE` and is greeted as 0x0100, the daemon as 0x0101; both compare majors.
+ * predates the daemon-only frames and is greeted as 0x0100, the daemon as 0x0105; both compare majors.
  */
 function helloFrame(protocol) {
   const bytes = Buffer.alloc(8 + 24);
@@ -739,7 +739,7 @@ describe('daemon parity with fsmeta serve on the same tree', () => {
 
       expectParity(m.root, served, daemon);
 
-      // The facts that must hold even if the two replays agree: the daemon speaks 0x0101 and binds the
+      // The facts that must hold even if the two replays agree: the daemon speaks 0x0105 and binds the
       // documented socket path. (Both are also checked inside readFromDaemon; these keep the contract in
       // the test body, where the reader looks for it.)
       expect(daemon.protocol).toBe(DAEMON_PROTOCOL);
