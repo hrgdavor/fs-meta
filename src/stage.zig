@@ -807,6 +807,65 @@ test "deleting a stage folder yields deletes, and deleting the stage state force
     try testing.expect(recreated.added >= 2); // the recreated folder/files
 }
 
+test "live stage entries follow the walk order, not the hash order" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, io, "build/classes/z.class", "Z");
+    try writeTestFile(tmp.dir, io, "build/classes/a.class", "A");
+    try writeTestFile(tmp.dir, io, "build/classes/m.class", "M");
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    try writeTestFile(tmp.dir, io, ".fs-meta/build.json",
+        \\{"version":1,"stages":[{"stage":0,"folders":["build/classes"]}]}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try testRoot(arena, &tmp);
+    const declaration = try build_config.load(arena, io, root);
+
+    const Walk = struct {
+        arena: std.mem.Allocator,
+        names: std.ArrayListUnmanaged([]const u8) = .empty,
+        fn onFact(raw: *anyopaque, fact: *scan.Fact) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (fact.kind == .regular_file) self.names.append(self.arena, fact.name) catch {};
+        }
+    };
+    var walk = Walk{ .arena = arena };
+    defer walk.names.deinit(arena);
+    const folder = try joinPath(arena, root, "build/classes");
+    _ = try scan.scanDetailed(arena, io, folder, .{
+        .hash_mode = .none,
+        .hash_files = false,
+        .on_fact = .{ .ctx = &walk, .on_fact = Walk.onFact },
+    });
+
+    const StreamProbe = struct {
+        names: std.ArrayListUnmanaged([]const u8) = .empty,
+        arena: std.mem.Allocator,
+        fn change(raw: *anyopaque, item: Change) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (item.entry.flags_word & format.flags.regular_file != 0) {
+                self.names.append(self.arena, item.name) catch {};
+            }
+        }
+    };
+    var probe = StreamProbe{ .arena = arena };
+    defer probe.names.deinit(arena);
+    _ = try refresh(arena, io, root, declaration, 0, .{
+        .updated = "2026-11-08T00:00:00Z",
+        .stream = .{ .ctx = &probe, .on_change = StreamProbe.change },
+    });
+
+    try testing.expectEqual(walk.names.items.len, probe.names.items.len);
+    for (walk.names.items, probe.names.items) |expected, actual| {
+        const prefixed = try std.fmt.allocPrint(arena, "build/classes/{s}", .{expected});
+        try testing.expectEqualStrings(prefixed, actual);
+    }
+}
+
 test "a stage stream emits entries before the state is committed" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});

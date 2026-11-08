@@ -2204,11 +2204,13 @@ describe('git events on the wire, behind the gitwatch flag', () => {
       const daemon = startDaemon(m);
       try {
         await waitForDaemon(m);
-        const id = addRoot(m, repo, '--mode', 'always');
+        // A slow tick makes the test about coalescing the burst, not about how many scheduler ticks the writes
+        // happened to straddle: the repo-wide flush is per tick, so five refs in one tick must be one frame.
+        const id = addRoot(m, repo, '--mode', 'always', '--tick', '1000');
         const peer = await connect(join(m.runtime, 'roots', `${id}.sock`));
         expectHello(await peer.frame());
         await readUntilState(peer, (state) => state.state === 'watching');
-        await drainFrames(peer);
+        await drainFrames(peer, 1000);
 
         // One process, five refs: the shape of a fetch or a scripted loop. The names are branches, so the kind is
         // `commit`; coalescing per kind means one frame, not five.
