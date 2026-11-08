@@ -31,6 +31,11 @@ import {
   replayNames,
   rootsConfigPath,
   subscribePayload,
+  subscribeV3Payload,
+  buildStartedPayload,
+  buildDonePayload,
+  parseStageBatchStart,
+  parseStageBatchEnd,
 } from './daemon.mjs';
 import { publish, scanTree } from './fsmeta.mjs';
 
@@ -213,6 +218,46 @@ describe('frames', () => {
     assert.equal(payload.readUInt16LE(22), 1);
     assert.equal(payload.readUInt16LE(24), 8);
     assert.equal(payload.subarray(26, 34).toString('utf8'), 'draft.md');
+  });
+
+  test('SUBSCRIBE_V3 carries the stage cursor and BUILD_* payloads round-trip', () => {
+    const payload = subscribeV3Payload({
+      fromBatch: 9n,
+      fromStageBatch: 4n,
+      stage: 2,
+      builder: true,
+      include: ['*.jar'],
+      exclude: [],
+    });
+    assert.equal(payload.readBigUInt64LE(0), 9n);
+    assert.equal(payload.readBigUInt64LE(8), 4n);
+    assert.equal(payload.readUInt16LE(16), 2);
+    assert.equal(payload.readUInt16LE(18), 1);
+    assert.equal(payload.readUInt16LE(20), 1);
+    assert.equal(payload.readUInt16LE(22), 5);
+    assert.equal(payload.subarray(24, 29).toString('utf8'), '*.jar');
+
+    assert.equal(buildStartedPayload(9n).readBigUInt64LE(0), 9n);
+    const done = buildDonePayload(9n, 1);
+    assert.equal(done.readBigUInt64LE(0), 9n);
+    assert.equal(done.readUInt8(8), 1);
+
+    const start = Buffer.alloc(26);
+    start.writeUInt16LE(1, 0);
+    start.writeBigUInt64LE(4n, 2);
+    start.writeBigUInt64LE(3n, 10);
+    start.writeBigUInt64LE(99n, 18);
+    assert.deepEqual(parseStageBatchStart(start), { stage: 1, generation: 4n, parent: 3n, startedNs: 99n });
+
+    const end = Buffer.alloc(43);
+    end.writeUInt16LE(1, 0);
+    end.writeBigUInt64LE(4n, 2);
+    end.writeBigUInt64LE(2n, 10);
+    end.writeBigUInt64LE(1n, 18);
+    end.writeBigUInt64LE(0n, 26);
+    end.writeUInt8(0, 42);
+    assert.equal(parseStageBatchEnd(end).added, 2n);
+    assert.equal(parseStageBatchEnd(end).status, 0);
   });
 
   test('parseEntry reads flags and name, and rejects a short payload', () => {

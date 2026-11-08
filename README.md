@@ -62,7 +62,9 @@ This is the intended deployment, not an implementation detail:
   hook while the walk is still running, with a lazy start; artifacts stay out of the root trio.
   `FORMAT.socket.md` § BUILD_STAGES is the wire contract; `plans/build-artifacts.md` is the design. A late stage
   subscriber can replay the producer's archived stage batches with `SUBSCRIBE_V3`/`from_stage_batch`;
-  `root status` reports the blocked stage and stage counters, and a started builder has a timeout.
+  `root status` reports the blocked stage and stage counters, and a builder with unacknowledged work has a timeout.
+  The JS client exports the stage frame helpers (`subscribeV3Payload`, `buildStartedPayload`, `buildDonePayload`,
+  `parseStageBatchStart`, `parseStageBatchEnd`).
 - **The Java, Bun and Node ports are clients/readers, never daemons.** They validate and decode the trio and can
   speak the socket protocol. They do not run a second watch loop in-process and do not start a daemon; that would
   duplicate the engine and defeat the point. The Java port's writer exists for repair/tests, not as a production

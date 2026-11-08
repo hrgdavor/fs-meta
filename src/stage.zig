@@ -415,6 +415,17 @@ const ScanContext = struct {
             if (hashed) |value| {
                 fact.content_hash = value.hash;
                 fact.hash_lf = value.hash_lf;
+                // A file that moved while it was being hashed is not a settled artifact. Abort the pass rather
+                // than publish a hash for one state and metadata for another; the next pass sees the settled file.
+                if (std.Io.Dir.cwd().statFile(self.io, full, .{ .follow_symlinks = false })) |after| {
+                    if (after.size != fact.size_bytes or mtimeNs(after.mtime) != fact.mtime_ns) {
+                        self.failure = error.UnstableFile;
+                        return;
+                    }
+                } else |_| {
+                    self.failure = error.UnstableFile;
+                    return;
+                }
             }
         }
 

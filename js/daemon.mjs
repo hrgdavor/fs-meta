@@ -212,6 +212,75 @@ export function subscribePayload({ fromBatch = 0n, include = [], exclude = [] } 
   return Buffer.concat(parts);
 }
 
+/**
+ * `SUBSCRIBE_V3`: `from_batch`, `from_stage_batch`, `stage`, `flags`, then the same include/exclude
+ * section as `subscribePayload` (`FORMAT.socket.md` § BUILD_STAGES). `flags` bit 0 is the builder role.
+ */
+export function subscribeV3Payload({
+  fromBatch = 0n,
+  fromStageBatch = 0n,
+  stage = 0,
+  builder = false,
+  include = [],
+  exclude = [],
+} = {}) {
+  const head = Buffer.alloc(20);
+  head.writeBigUInt64LE(u64(fromBatch), 0);
+  head.writeBigUInt64LE(u64(fromStageBatch), 8);
+  head.writeUInt16LE(stage, 16);
+  head.writeUInt16LE(builder ? 1 : 0, 18);
+
+  const includeCount = Buffer.alloc(2);
+  includeCount.writeUInt16LE(include.length, 0);
+  const parts = [head, includeCount];
+  for (const pattern of include) parts.push(lengthPrefixed(pattern));
+  const excludeCount = Buffer.alloc(2);
+  excludeCount.writeUInt16LE(exclude.length, 0);
+  parts.push(excludeCount);
+  for (const pattern of exclude) parts.push(lengthPrefixed(pattern));
+  return Buffer.concat(parts);
+}
+
+/** `BUILD_STARTED`: the generation a builder is working from. */
+export function buildStartedPayload(generation) {
+  const payload = Buffer.alloc(8);
+  payload.writeBigUInt64LE(u64(generation), 0);
+  return payload;
+}
+
+/** `BUILD_DONE`: the generation acknowledged and `0 = ok`, `1 = failed`, `2 = cancelled`. */
+export function buildDonePayload(generation, status = 0) {
+  const payload = Buffer.alloc(9);
+  payload.writeBigUInt64LE(u64(generation), 0);
+  payload.writeUInt8(status, 8);
+  return payload;
+}
+
+/** A `STAGE_BATCH_START` server payload (`u16 stage`, `u64 generation`, `u64 parent`, `u64 started_ns`). */
+export function parseStageBatchStart(payload) {
+  if (payload.length !== 26) throw new Error('daemon sent a short STAGE_BATCH_START');
+  return {
+    stage: payload.readUInt16LE(0),
+    generation: payload.readBigUInt64LE(2),
+    parent: payload.readBigUInt64LE(10),
+    startedNs: payload.readBigUInt64LE(18),
+  };
+}
+
+/** A `STAGE_BATCH_END` server payload. */
+export function parseStageBatchEnd(payload) {
+  if (payload.length !== 43) throw new Error('daemon sent a short STAGE_BATCH_END');
+  return {
+    stage: payload.readUInt16LE(0),
+    generation: payload.readBigUInt64LE(2),
+    added: payload.readBigUInt64LE(10),
+    changed: payload.readBigUInt64LE(18),
+    deleted: payload.readBigUInt64LE(26),
+    changesHash: payload.readBigUInt64LE(34),
+    status: payload.readUInt8(42),
+  };
+}
+
 function lengthPrefixed(text) {
   const bytes = Buffer.from(text, 'utf8');
   if (bytes.length > 0xffff) throw new Error(`filter pattern is too long: ${text}`);

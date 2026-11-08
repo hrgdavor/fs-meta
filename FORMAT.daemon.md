@@ -891,7 +891,8 @@ and both are a set to the consumer.
 
 **The scan waits for the whole stage.** A stage is scanned only when `ackedThrough(stage) >= releasedThrough(stage)`;
 one of two builders finishing early must not scan a folder the other is still writing. A stage with **no** builders
-is scanned once per release (tracked in `undeclared_stage_scanned`), not once per tick.
+is scanned once per release (tracked in `undeclared_stage_scanned`), not once per tick. A file whose size or mtime
+moves while it is being hashed is not published: the pass fails as `UnstableFile` and retries on the next one.
 
 **Timeouts.** A builder that has unacknowledged work for `stage_timeout_ms` (default 60 s;
 `FSMETA_STAGE_TIMEOUT_MS` overrides it for the daemon, and 0 disables) is treated as failed whether or not it sent
