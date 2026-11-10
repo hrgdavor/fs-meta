@@ -21,7 +21,7 @@ subproject: what is here, how to run it, and where it plugs in.
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`FORMAT.md`](FORMAT.md)                                 | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
 | `src/main.zig` + `build.zig*`                            | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
-| `src/main/java/hr/hrg/fsmeta/`                           | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.7`); it validates, decodes and loads the trio and connects to the daemon; it is not a watcher |
+| `src/main/java/hr/hrg/fsmeta/`                           | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.8`); it validates, decodes and loads the trio and connects to the daemon (including the staged-build frames); it is not a watcher |
 | `js/`                                                    | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
 | `conformance/`                                           | the shared vector file every reader asserts, and the generator that produces it                     |
 | [`examples/stage-publisher/`](examples/stage-publisher/) | a runnable scp-like stage client: copy while the stage batch arrives, hook after the commit         |
@@ -109,7 +109,7 @@ bun fs-meta/js/fsmeta-cli.mjs repair                 # re-pair entries and names
 
 # the Java port (same commands; needs the module built and JDK 25)
 bun scripts/mvn-fast.js -pl :fs-meta package
-java -cp fs-meta/target/fs-meta-0.3.7.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
+java -cp fs-meta/target/fs-meta-0.3.8.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
 
 # both implementations' tests
 bun test fs-meta/js                                  # 26 tests: vectors, round trip, CLI
@@ -196,6 +196,20 @@ if (load.ok) {
 }
 ```
 
+```java
+// The daemon's staged-build protocol: subscribe at stage 1 as a builder and acknowledge a batch
+try (FsMetaDaemonClient client = FsMetaDaemonClient.connect(socket, fromBatch, fromStageBatch, 1, true,
+        List.of(), List.of())) {
+    for (FsMetaDaemonClient.Event event = client.nextEvent(); ; event = client.nextEvent()) {
+        if (event instanceof FsMetaDaemonClient.StageBatchStart start) client.sendBuildStarted(start.generation());
+        if (event instanceof FsMetaDaemonClient.StageBatchEnd end) {
+            client.sendBuildDone(end.generation(), FsMetaDaemonClient.BUILD_OK);
+            break;
+        }
+    }
+}
+```
+
 ```js
 // Ask the daemon for the names it currently has — the whole state, not a change set
 import { namesForRoot } from './fs-meta/js/daemon.mjs';
@@ -206,6 +220,23 @@ if (current) {
   console.log(current.generation, current.source); // 'trio', 'trio+replay' or 'replay'
 }
 ```
+
+```js
+// A live staged subscription: stage frames, STAGE_READY and BUILD_STARTED/BUILD_DONE
+import { StageClient } from './fs-meta/js/daemon.mjs';
+
+const client = await StageClient.connect('/run/fsmeta/root.sock', {
+  stage: 1, builder: true, fromBatch: 5n, fromStageBatch: 2n,
+});
+for await (const event of client.events) {
+  if (event.type === 'stage_change') console.log(event.name, event.flags);
+  if (event.type === 'stage_batch_end') client.sendBuildDone(event.generation, 0);
+}
+```
+
+`StageClient.connect` uses `SUBSCRIBE_V3`; pass `fromStageBatch: null` to use `SUBSCRIBE_V2`. The Java client has
+the same pair as `connect(...)` and `connectV2(...)`. `subscribeV2Payload`/`subscribeV3Payload` and the
+`STAGE_*` payload parsers are exported for clients that bring their own socket loop.
 
 `namesForRoot` reads the root's trio as the baseline at generation `g` (when the reader is available) and asks the
 daemon for only the batches after `g`, so the answer stays complete after batch retention has pruned generation 1 and
@@ -256,8 +287,8 @@ Maven releases go through [`pom-release.xml`](pom-release.xml), never a bare `mv
 has the prerequisites (JDK 25, real Maven 3.9.9, the `central` token and GPG), the commands, the two-POM guard, and
 the npm and Zig release notes.
 
-`hr.hrg:wyhash:1.2.0`, `hr.hrg:gitignore:0.3.5` and `hr.hrg:fs-meta:0.3.7` are on Maven Central; fs-meta pins the
-first two releases and publishes the third there. `@hrg/fs-meta@0.3.7` is on npm, with the scoped `@hrg/wyhash`
+`hr.hrg:wyhash:1.2.0`, `hr.hrg:gitignore:0.3.5` and the previous `hr.hrg:fs-meta:0.3.7` are on Maven Central; this
+checkout is `0.3.8`, which adds the staged-build client API. `@hrg/fs-meta@0.3.7` is on npm, with the scoped `@hrg/wyhash`
 import and the `files` whitelist; `md-fix-tables` depends on it. No local install is needed for either port.
 
 ## Next

@@ -241,6 +241,30 @@ export function subscribeV3Payload({
   return Buffer.concat(parts);
 }
 
+/** `SUBSCRIBE_V2`: the stage header without the stage-batch replay cursor. A V2 subscriber starts at the stage
+ *  head; use {@link subscribeV3Payload} when the producer's archived artifact batches are needed. */
+export function subscribeV2Payload({
+  fromBatch = 0n,
+  stage = 0,
+  builder = false,
+  include = [],
+  exclude = [],
+} = {}) {
+  const head = Buffer.alloc(12);
+  head.writeBigUInt64LE(u64(fromBatch), 0);
+  head.writeUInt16LE(stage, 8);
+  head.writeUInt16LE(builder ? 1 : 0, 10);
+  const includeCount = Buffer.alloc(2);
+  includeCount.writeUInt16LE(include.length, 0);
+  const parts = [head, includeCount];
+  for (const pattern of include) parts.push(lengthPrefixed(pattern));
+  const excludeCount = Buffer.alloc(2);
+  excludeCount.writeUInt16LE(exclude.length, 0);
+  parts.push(excludeCount);
+  for (const pattern of exclude) parts.push(lengthPrefixed(pattern));
+  return Buffer.concat(parts);
+}
+
 /** `BUILD_STARTED`: the generation a builder is working from. */
 export function buildStartedPayload(generation) {
   const payload = Buffer.alloc(8);
@@ -384,6 +408,310 @@ function filterMatches(filter, name) {
     if (pattern.regex.test(pattern.anchored ? name : base)) return true;
   }
   return false;
+}
+
+/**
+ * A live staged subscription (`FORMAT.socket.md` § BUILD_STAGES).
+ *
+ * `connectStageClient()` sends `HELLO` and `SUBSCRIBE_V3`, then exposes every frame as an event:
+ * `batch_start` / `change` / `batch_end` for the root stream and `stage_ready` /
+ * `stage_batch_start` / `stage_change` / `stage_batch_end` for the producer stage. A builder can
+ * acknowledge with `sendBuildStarted()` / `sendBuildDone()`.
+ *
+ * The root stream is kept as well as the stage stream: a builder needs the generation it is
+ * acknowledging, and a consumer may want both the source batch and the artifact batch. Events are
+ * delivered in wire order; `nextEvent()` and `events` are for pull-style callers, `onEvent` for a
+ * callback-style one.
+ */
+export class StageClient {
+  /**
+   * @param {import('node:net').Socket} socket
+   * @param {{ stage?: number, builder?: boolean, onEvent?: (event: any) => void }} options
+   */
+  constructor(socket, { stage = 0, builder = false, onEvent = null } = {}) {
+    this.socket = socket;
+    this.stage = stage;
+    this.builder = builder;
+    this.onEvent = onEvent;
+    this.serverGeneration = 0n;
+    this.closed = false;
+    this.buffered = Buffer.alloc(0);
+    this.queue = [];
+    this.waiters = [];
+    this.failure = null;
+    this.currentStage = stage;
+    this.currentBatch = null;
+    this.currentStageBatch = null;
+
+    socket.on('data', chunk => this.#onData(chunk));
+    socket.on('error', error => this.#fail(error));
+    socket.on('close', () => {
+      this.closed = true;
+      this.#wake();
+    });
+  }
+
+  /**
+   * Connect, greet, and subscribe.
+   *
+   * @param {string} socketPath
+   * @param {{
+   *   stage?: number,
+   *   builder?: boolean,
+   *   fromBatch?: bigint|number,
+   *   fromStageBatch?: bigint|number|null,
+   *   include?: string[],
+   *   exclude?: string[],
+   *   onEvent?: (event: any) => void,
+   *   timeoutMs?: number,
+   * }} [options] `fromStageBatch: null` selects `SUBSCRIBE_V2` (no stage archive); the default is V3.
+   * @returns {Promise<StageClient>}
+   */
+  static connect(socketPath, options = {}) {
+    const {
+      stage = 0, builder = false, fromBatch = 0n, fromStageBatch = 0n,
+      include = [], exclude = [], timeoutMs = 10_000, onEvent = null,
+    } = options;
+    return new Promise((resolvePromise, reject) => {
+      const socket = connect({ path: socketPath });
+      socket.setNoDelay(true);
+      const client = new StageClient(socket, { stage, builder, onEvent });
+      let connected = false;
+      const timer = setTimeout(() => {
+        client.close();
+        const error = new Error(`daemon did not greet within ${timeoutMs} ms`);
+        error.reachable = connected;
+        reject(error);
+      }, timeoutMs);
+      timer.unref?.();
+
+      socket.on('connect', () => {
+        connected = true;
+        socket.write(frame(KIND.HELLO, helloPayload({ generation: fromBatch })));
+        const v2 = fromStageBatch === null;
+        socket.write(frame(v2 ? KIND.SUBSCRIBE_V2 : KIND.SUBSCRIBE_V3, v2
+          ? subscribeV2Payload({ fromBatch, stage, builder, include, exclude })
+          : subscribeV3Payload({
+            fromBatch,
+            fromStageBatch,
+            stage,
+            builder,
+            include,
+            exclude,
+          })));
+      });
+      socket.on('error', () => {});
+      const poll = setInterval(() => {
+        const hello = client.queue.find(event => event.type === 'hello');
+        if (!hello) return;
+        clearInterval(poll);
+        clearTimeout(timer);
+        client.#removeQueued('hello');
+        resolvePromise(client);
+      }, 0);
+      poll.unref?.();
+      socket.once('error', error => {
+        clearInterval(poll);
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  /** The next event, or a rejection after `timeoutMs` / a protocol error. */
+  nextEvent(timeoutMs = 0) {
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.queue.length > 0) return Promise.resolve(this.queue.shift());
+    if (this.closed) return Promise.reject(new Error('the stage connection is closed'));
+    if (timeoutMs <= 0) {
+      return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    }
+    return Promise.race([
+      new Promise((resolve, reject) => this.waiters.push({ resolve, reject })),
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no stage event within ${timeoutMs} ms`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  }
+
+  /** Pull events until the connection closes. */
+  get events() {
+    const client = this;
+    return {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            try {
+              return { value: await client.nextEvent(), done: false };
+            } catch (error) {
+              if (client.closed && !client.failure) return { value: undefined, done: true };
+              throw error;
+            }
+          },
+          async return() {
+            client.close();
+            return { value: undefined, done: true };
+          },
+        };
+      },
+    };
+  }
+
+  /** `BUILD_STARTED`: the generation this builder is working from. */
+  sendBuildStarted(generation) {
+    this.#requireOpen();
+    this.socket.write(frame(KIND.BUILD_STARTED, buildStartedPayload(generation)));
+  }
+
+  /** `BUILD_DONE`: acknowledge through `generation` with status `ok|failed|cancelled`. */
+  sendBuildDone(generation, status = 0) {
+    this.#requireOpen();
+    if (status !== 0 && status !== 1 && status !== 2) throw new Error(`unknown build status ${status}`);
+    this.socket.write(frame(KIND.BUILD_DONE, buildDonePayload(generation, status)));
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    try { this.socket.end(); } catch {}
+    try { this.socket.destroy(); } catch {}
+    this.#wake();
+  }
+
+  #requireOpen() {
+    if (this.closed) throw new Error('the stage connection is closed');
+    if (this.failure) throw this.failure;
+  }
+
+  #removeQueued(type) {
+    this.queue = this.queue.filter(event => event.type !== type);
+  }
+
+  #emit(event) {
+    this.onEvent?.(event);
+    this.queue.push(event);
+    this.#wake();
+  }
+
+  #wake() {
+    while (this.waiters.length > 0 && this.queue.length > 0) {
+      this.waiters.shift().resolve(this.queue.shift());
+    }
+    if (this.closed) {
+      while (this.waiters.length > 0) this.waiters.shift().reject(new Error('the stage connection is closed'));
+    }
+  }
+
+  #fail(error) {
+    this.failure = error;
+    while (this.waiters.length > 0) this.waiters.shift().reject(error);
+  }
+
+  #onData(chunk) {
+    this.buffered = Buffer.concat([this.buffered, chunk]);
+    try {
+      while (this.buffered.length >= FRAME_HEADER) {
+        const length = this.buffered.readUInt32LE(4);
+        if (length > MAX_FRAME) throw new Error(`daemon sent a ${length}-byte frame; the limit is ${MAX_FRAME}`);
+        if (this.buffered.length < FRAME_HEADER + length) return;
+        const kind = this.buffered.readUInt16LE(0);
+        const payload = this.buffered.subarray(FRAME_HEADER, FRAME_HEADER + length);
+        this.buffered = this.buffered.subarray(FRAME_HEADER + length);
+        this.#dispatch(kind, payload);
+      }
+    } catch (error) {
+      this.#fail(error);
+      this.close();
+    }
+  }
+
+  #dispatch(kind, payload) {
+    switch (kind) {
+      case KIND.HELLO: {
+        if (payload.length !== HELLO_PAYLOAD) throw new Error('daemon sent a short HELLO');
+        const protocol = payload.readUInt16LE(0);
+        if (protocol >>> 8 !== PROTOCOL >>> 8) throw new Error(`daemon speaks protocol 0x${protocol.toString(16)}`);
+        if (payload.readUInt16LE(2) !== ENTRY_SIZE) throw new Error('daemon uses a different entry size');
+        if (payload.readUInt8(4) !== 0) throw new Error('daemon uses a different hash');
+        this.serverGeneration = payload.readBigUInt64LE(8);
+        this.#emit({ type: 'hello', generation: this.serverGeneration, protocol });
+        return;
+      }
+      case KIND.STATE:
+        this.#emit({ type: 'state', payload });
+        return;
+      case KIND.GIT_EVENT:
+        this.#emit({ type: 'git_event', kind: payload.readUInt8(2), payload });
+        return;
+      case KIND.PING:
+        this.socket.write(frame(KIND.PONG, Buffer.alloc(0)));
+        return;
+      case KIND.PONG:
+        return;
+      case KIND.START_BATCH:
+        if (payload.length !== 16) throw new Error('daemon sent a short START_BATCH');
+        this.currentBatch = { generation: payload.readBigUInt64LE(0), parent: payload.readBigUInt64LE(8) };
+        this.#emit({ type: 'batch_start', ...this.currentBatch });
+        return;
+      case KIND.CHANGE_ENTRY: {
+        const entry = parseEntry(payload);
+        this.#emit({ type: 'change', ...entry });
+        return;
+      }
+      case KIND.END_BATCH: {
+        if (payload.length !== 40) throw new Error('daemon sent a short END_BATCH');
+        const event = {
+          type: 'batch_end',
+          generation: payload.readBigUInt64LE(0),
+          added: payload.readBigUInt64LE(8),
+          changed: payload.readBigUInt64LE(16),
+          deleted: payload.readBigUInt64LE(24),
+          changesHash: payload.readBigUInt64LE(32),
+        };
+        this.currentBatch = null;
+        this.#emit(event);
+        return;
+      }
+      case KIND.STAGE_READY:
+        if (payload.length !== 18) throw new Error('daemon sent a short STAGE_READY');
+        this.#emit({
+          type: 'stage_ready',
+          stage: payload.readUInt16LE(0),
+          headBatch: payload.readBigUInt64LE(2),
+          releasedThrough: payload.readBigUInt64LE(10),
+        });
+        return;
+      case KIND.STAGE_BATCH_START: {
+        const start = parseStageBatchStart(payload);
+        this.currentStage = start.stage;
+        this.currentStageBatch = start;
+        this.#emit({ type: 'stage_batch_start', ...start });
+        return;
+      }
+      case KIND.STAGE_CHANGE_ENTRY: {
+        const entry = parseEntry(payload);
+        this.#emit({ type: 'stage_change', stage: this.currentStage, ...entry });
+        return;
+      }
+      case KIND.STAGE_BATCH_END: {
+        const end = parseStageBatchEnd(payload);
+        this.currentStageBatch = null;
+        this.#emit({ type: 'stage_batch_end', ...end });
+        return;
+      }
+      case KIND.ERROR: {
+        if (payload.length < 2) throw new Error('daemon sent a short ERROR');
+        const code = payload.readUInt16LE(0);
+        const detail = payload.subarray(2).toString('utf8');
+        const error = new Error(`daemon refused the subscribe (${errorWord(code)}): ${detail}`);
+        error.code = errorWord(code);
+        throw error;
+      }
+      default:
+        throw new Error(`daemon sent unknown frame kind 0x${kind.toString(16)}`);
+    }
+  }
 }
 
 /**

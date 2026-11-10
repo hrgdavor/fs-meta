@@ -31,11 +31,13 @@ import {
   replayNames,
   rootsConfigPath,
   subscribePayload,
+  subscribeV2Payload,
   subscribeV3Payload,
   buildStartedPayload,
   buildDonePayload,
   parseStageBatchStart,
   parseStageBatchEnd,
+  StageClient,
 } from './daemon.mjs';
 import { publish, scanTree } from './fsmeta.mjs';
 
@@ -112,6 +114,7 @@ function includePatterns(payload) {
 async function fakeDaemon({ generation = 0n, onSubscribe }) {
   const path = socketPath('daemon');
   const subscribes = [];
+  const control = [];
   const server = createServer((socket) => {
     let buffered = Buffer.alloc(0);
     let greeted = false;
@@ -130,6 +133,11 @@ async function fakeDaemon({ generation = 0n, onSubscribe }) {
         } else if (kind === KIND.SUBSCRIBE) {
           subscribes.push(payload);
           onSubscribe(socket, payload);
+        } else if (kind === KIND.SUBSCRIBE_V3) {
+          subscribes.push(payload);
+          onSubscribe(socket, payload, kind);
+        } else if (kind === KIND.BUILD_STARTED || kind === KIND.BUILD_DONE) {
+          control.push({ kind, payload });
         }
       }
     });
@@ -144,6 +152,7 @@ async function fakeDaemon({ generation = 0n, onSubscribe }) {
   return {
     path,
     subscribes,
+    control,
     close: () => new Promise((resolveListener) => server.close(resolveListener)),
   };
 }
@@ -237,6 +246,12 @@ describe('frames', () => {
     assert.equal(payload.readUInt16LE(22), 5);
     assert.equal(payload.subarray(24, 29).toString('utf8'), '*.jar');
 
+    const v2 = subscribeV2Payload({ fromBatch: 8n, stage: 2, builder: false, include: [], exclude: [] });
+    assert.equal(v2.readBigUInt64LE(0), 8n);
+    assert.equal(v2.readUInt16LE(8), 2);
+    assert.equal(v2.readUInt16LE(10), 0);
+    assert.equal(v2.readUInt16LE(12), 0);
+
     assert.equal(buildStartedPayload(9n).readBigUInt64LE(0), 9n);
     const done = buildDonePayload(9n, 1);
     assert.equal(done.readBigUInt64LE(0), 9n);
@@ -258,6 +273,75 @@ describe('frames', () => {
     end.writeUInt8(0, 42);
     assert.equal(parseStageBatchEnd(end).added, 2n);
     assert.equal(parseStageBatchEnd(end).status, 0);
+  });
+
+  test('StageClient consumes STAGE_READY and the stage batch, and sends BUILD_*', async () => {
+    const daemon = await fakeDaemon({
+      generation: 4n,
+      onSubscribe(socket, payload, kind) {
+        assert.equal(kind, KIND.SUBSCRIBE_V3);
+        assert.equal(payload.readBigUInt64LE(0), 3n);
+        assert.equal(payload.readBigUInt64LE(8), 2n);
+        assert.equal(payload.readUInt16LE(16), 1);
+        assert.equal(payload.readUInt16LE(18), 1); // builder
+        const ready = Buffer.alloc(18);
+        ready.writeUInt16LE(1, 0);
+        ready.writeBigUInt64LE(4n, 2);
+        ready.writeBigUInt64LE(3n, 10);
+        socket.write(frame(KIND.STAGE_READY, ready));
+        const start = Buffer.alloc(26);
+        start.writeUInt16LE(1, 0);
+        start.writeBigUInt64LE(2n, 2);
+        start.writeBigUInt64LE(1n, 10);
+        socket.write(frame(KIND.STAGE_BATCH_START, start));
+        socket.write(frame(KIND.STAGE_CHANGE_ENTRY, entryBytes('build/classes/A.class', CHANGE_ADDED | 0x02)));
+        const end = Buffer.alloc(43);
+        end.writeUInt16LE(1, 0);
+        end.writeBigUInt64LE(2n, 2);
+        end.writeBigUInt64LE(1n, 10);
+        socket.write(frame(KIND.STAGE_BATCH_END, end));
+      },
+    });
+    const client = await StageClient.connect(daemon.path, {
+      stage: 1,
+      builder: true,
+      fromBatch: 3n,
+      fromStageBatch: 2n,
+    });
+    try {
+      assert.deepEqual(await client.nextEvent(1000), {
+        type: 'stage_ready',
+        stage: 1,
+        headBatch: 4n,
+        releasedThrough: 3n,
+      });
+      assert.deepEqual(await client.nextEvent(1000), {
+        type: 'stage_batch_start',
+        stage: 1,
+        generation: 2n,
+        parent: 1n,
+        startedNs: 0n,
+      });
+      assert.deepEqual(await client.nextEvent(1000), {
+        type: 'stage_change',
+        stage: 1,
+        name: 'build/classes/A.class',
+        flags: CHANGE_ADDED | 0x02,
+      });
+      const end = await client.nextEvent(1000);
+      assert.equal(end.type, 'stage_batch_end');
+      assert.equal(end.generation, 2n);
+      assert.equal(end.added, 1n);
+      client.sendBuildStarted(2n);
+      client.sendBuildDone(2n, 0);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(daemon.control.length, 2);
+      assert.equal(daemon.control[0].kind, KIND.BUILD_STARTED);
+      assert.equal(daemon.control[1].kind, KIND.BUILD_DONE);
+    } finally {
+      client.close();
+      await daemon.close();
+    }
   });
 
   test('parseEntry reads flags and name, and rejects a short payload', () => {

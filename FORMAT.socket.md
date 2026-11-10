@@ -417,8 +417,9 @@ write-order stream.
 
 **Failure and disconnect.** A builder that leaves is no longer a barrier; the daemon releases the next stage and
 logs that it advanced without an acknowledgement. A `BUILD_DONE{status = failed}` does the same and records the
-status. A builder that never acknowledges holds its successor until it disconnects; there is deliberately no
-timeout in this version, because a timeout a slow compiler trips over is worse than the visible log line.
+status. A builder that has unacknowledged work for `stage_timeout_ms` (default 60 s, `FSMETA_STAGE_TIMEOUT_MS`
+overrides, 0 disables) is treated as failed: the daemon advances the release, logs it and increments
+`stage_timeouts`. The client is not sent a synthetic event; the log and `root status` are the record.
 
 **`fsmeta serve` does not implement this section.** It is a replay-only server with no scheduler and no rounds:
 it accepts the original `SUBSCRIBE`, and a `SUBSCRIBE_V2` to it is refused with `ERROR{protocol}`. The daemon is

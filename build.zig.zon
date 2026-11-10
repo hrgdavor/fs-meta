@@ -1,6 +1,6 @@
 .{
     .name = .watcher,
-    .version = "0.3.7",
+    .version = "0.3.8",
     .fingerprint = 0xb28fe6ac387cc966,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

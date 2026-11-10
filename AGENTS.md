@@ -44,6 +44,15 @@ server, control plane, publish service, or a second daemon — not even behind a
 that needs live updates subscribes to the Zig daemon (`SUBSCRIBE` / `CHANGE_ENTRY`) or polls the trio; it never
 starts a competing watcher.
 
+**A new daemon API is not a daemon port.** When the Zig daemon adds capabilities or frames to the socket protocol
+(for example `SUBSCRIBE_V2`/`SUBSCRIBE_V3`, `BUILD_STARTED`/`BUILD_DONE`, `STAGE_READY` and the stage-batch frames),
+that expands the **wire contract**, not the set of daemons. It does **not** mean the Java or Bun ports should grow a
+daemon, watcher, scheduler or server side; the Zig daemon remains the only implementation of that side. It does mean
+**every client must add support for the new API in the same change**: the Zig client/CLI paths, the Java client and
+the JS/Bun client all encode and decode the new frames, expose the corresponding client API, are covered by tests,
+and are released with an updated version when the published artifact changes. A client that ignores a protocol frame
+because "the daemon is Zig's job" is a stale client, not a compliant port.
+
 ## 2. Format invariants that must not drift
 
 - **`glob` is abandoned and strictly not supported; `wildmatch` is the only wildcard syntax.** That applies here, in

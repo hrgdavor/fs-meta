@@ -6,7 +6,7 @@
 
     <groupId>hr.hrg</groupId>
     <artifactId>fs-meta</artifactId>
-    <version>0.3.7</version>
+    <version>0.3.8</version>
     <packaging>jar</packaging>
 
     <name>fs-meta</name>

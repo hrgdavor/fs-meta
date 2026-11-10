@@ -26,10 +26,10 @@ The version is pinned in three places and must agree: `pom.xml`, `package.json` 
 6. **A GPG key and `MAVEN_GPG_PASSPHRASE`.** Signing is off by default (`gpg.skip=true`); a release passes
    `-Dgpg.skip=false`. The profile passes `--pinentry-mode loopback`, so gpg reads `MAVEN_GPG_PASSPHRASE` instead of
    opening a prompt a batch build cannot answer. A passphrase stored in `settings.xml` is not used.
-7. **A release version and a tag.** The POM and `package.json` are `0.3.7`, and the annotated `v0.3.7` tag points at
-   the published commit `90e97a3`. The older `v0.3.6` predates the JavaScript daemon client and this publishing
-   setup. Tag the released commit for every future release; do not publish an artifact whose tag points at different
-   code.
+7. **A release version and a tag.** The POM and `package.json` are `0.3.8`; tag that commit before publishing.
+   `v0.3.7` points at the previous published commit `90e97a3`, and `v0.3.6` predates the JavaScript daemon client
+   and this publishing setup. Tag the released commit for every future release; do not publish an artifact whose
+   tag points at different code.
 
 ## Publishing the Maven artifact
 
@@ -85,8 +85,8 @@ publisher does not use `altDeploymentRepository`.
 
 - Check the artifact under `https://repo1.maven.org/maven2/hr/hrg/fs-meta/<version>/`.
 - Consumers should depend on `hr.hrg:fs-meta:<version>` from Central, not on a local `mvn install`.
-- `md-fix-tables` depends on `@hrg/fs-meta` 0.3.7 from npm and `@hrg/wyhash` 1.2.0; bump both pins after a new
-  release. Its walk fallback stays useful when no daemon answers.
+- `md-fix-tables` depends on `@hrg/fs-meta` and `@hrg/wyhash` 1.2.0; bump both pins after a new release. Its walk
+  fallback stays useful when no daemon answers.
 
 ### Common failures
 
@@ -103,9 +103,9 @@ publisher does not use `altDeploymentRepository`.
 
 `package.json` is non-private (`private: false`) and declares `publishConfig.access: public`.
 
-**0.3.7 is on npm and matches this checkout** (scoped `@hrg/wyhash` import, `@hrg/wyhash >=1.2.0` peer, `files`
-whitelist, `publishing.md`). `@hrg/wyhash` 1.2.0 is on npm. For a later release, bump `pom.xml`,
-`pom-release.xml`, `package.json` and `build.zig.zon` together, tag the commit, then:
+**0.3.8 is this checkout** (the staged-build client API and the scoped `@hrg/wyhash` import); **0.3.7 is the
+previous published version**. `@hrg/wyhash` 1.2.0 is on npm. For a release, bump `pom.xml`, `pom-release.xml`,
+`package.json` and `build.zig.zon` together, tag the commit, then:
 
 ```text
 bun test js
