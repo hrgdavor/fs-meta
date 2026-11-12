@@ -2,11 +2,11 @@
 
 This checkout produces three artifacts, and a release is the same commit for all of them:
 
-| artifact              | coordinate       | where                                        |
-| --------------------- | ---------------- | -------------------------------------------- |
-| Java client/reader    | `hr.hrg:fs-meta` | Maven Central, through the Central publisher |
-| JavaScript/Bun client | `@hrg/fs-meta`   | npm                                          |
-| Zig engine and daemon | source tag       | this repository (no binary release workflow) |
+| artifact              | coordinate        | where                                         |
+| --------------------- | ----------------- | --------------------------------------------- |
+| Java client/reader    | `hr.hrg:fs-meta`  | Maven Central, through the Central publisher  |
+| JavaScript/Bun client | `@hrg/fs-meta`    | npm                                           |
+| Zig engine and daemon | `fsmeta` binaries | GitHub Releases, built from the tagged source |
 
 The version is pinned in three places and must agree: `pom.xml`, `package.json` and `build.zig.zon`. Run
 `bun scripts/check-poms.mjs` after editing either POM; it also asserts that the POMs have no SNAPSHOT dependency.
@@ -123,6 +123,18 @@ Bun's native hash is unaffected. See the wyhash project's `publishing.md` for th
 
 ## Publishing the Zig engine
 
-The Zig engine is consumed as source. There is no release workflow in this repository and no binary artifact: build
-it with Zig 0.17.0 (`zig build`) or fetch the tagged source. Tag the same commit as the Maven/npm release so the
-daemon, the Java client and the JavaScript client describe one version.
+The Zig engine is also published as **GitHub Release binaries**. Pushing a `v*` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which cross-compiles and attaches:
+
+- `fsmeta-<version>-x86_64-linux-musl.tar.gz`
+- `fsmeta-<version>-aarch64-linux-musl.tar.gz`
+- `fsmeta-<version>-x86_64-macos.tar.gz`
+- `fsmeta-<version>-aarch64-macos.tar.gz`
+- `fsmeta-<version>-x86_64-windows.zip`
+
+Each archive contains the `fsmeta` binary plus `README.md`, `FORMAT.md`, `FORMAT.socket.md` and `FORMAT.daemon.md`.
+The workflow checks out `hrgdavor/socutil` as a sibling because `build.zig.zon` uses the `../socutil` path dependency;
+`workflow_dispatch` takes a tag and a `socutil_ref` input. Tag the same commit as the Maven/npm release so the daemon,
+the Java client and the JavaScript client describe one version.
+
+Source consumers still build with Zig 0.17.0 (`zig build`) or fetch the tagged source.
