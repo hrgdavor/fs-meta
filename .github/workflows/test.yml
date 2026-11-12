@@ -8,22 +8,36 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # The engine's build.zig names `../socutil` as a path dependency, so the two checkouts are siblings under
+      # the workspace and every command runs from the fs-meta directory.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: fs-meta
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hrgdavor/socutil
+          path: socutil
 
       # build.zig refuses any compiler but 0.17 on purpose: that version moved the whole std.Io surface, so a
-      # different minor does not build this code. The gitignore dependency is fetched from its tag, so this job
-      # needs no sibling checkout.
+      # different minor does not build this code. The other dependencies are fetched from their tags.
       - uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
         with:
           version: 0.17.0
 
       - name: Test
+        working-directory: fs-meta
         run: zig build test --summary all
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
+      - name: Install JavaScript dependencies
+        working-directory: fs-meta
+        run: bun install --frozen-lockfile
+
       # The integration tests drive the built CLI: hex batch ids, the reconcile range, and the optional baseline.
       - name: Batch history, end to end
+        working-directory: fs-meta
         run: |
           zig build -Doptimize=ReleaseFast
           bun test test
@@ -32,5 +46,6 @@ jobs:
       # passwordless sudo; run only those cases as root. The socket/mode cases are deliberately not selected: a
       # root daemon is expected to refuse to start, so they belong to the unprivileged run.
       - name: Privileged refusal (root runner)
+        working-directory: fs-meta
         run: |
           sudo -E env "PATH=$PATH" bun test test/daemon.test.mjs -t "a privileged process is refused"

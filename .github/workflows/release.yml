@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create or update (for example v0.3.8)'
+        required: true
+      socutil_ref:
+        description: 'socutil ref to build against'
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # fs-meta's build.zig uses the sibling `../socutil` path dependency, so both checkouts live under the
+      # workspace and the engine is built from the `fs-meta` directory.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: fs-meta
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: hrgdavor/socutil
+          path: socutil
+          ref: ${{ inputs.socutil_ref || 'main' }}
+
+      - uses: mlugg/setup-zig@v2 # v2
+        with:
+          version: 0.17.0
+
+      - name: Build and package binaries
+        working-directory: fs-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows; do
+            echo "::group::build $target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseFast
+
+            pkg="fsmeta-${VERSION}-${target}"
+            mkdir -p "dist/$pkg"
+            if [[ "$target" == *windows* ]]; then
+              cp zig-out/bin/fsmeta.exe "dist/$pkg/fsmeta.exe"
+            else
+              cp zig-out/bin/fsmeta "dist/$pkg/fsmeta"
+            fi
+            cp README.md FORMAT.md FORMAT.socket.md FORMAT.daemon.md "dist/$pkg/"
+
+            if [[ "$target" == *windows* ]]; then
+              (cd dist && zip -qr "$pkg.zip" "$pkg")
+            else
+              tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+            fi
+            rm -rf "dist/$pkg"
+            echo "::endgroup::"
+          done
+
+          sha256sum dist/*.tar.gz dist/*.zip > dist/SHA256SUMS
+          ls -lh dist
+
+      - name: Publish GitHub release
+        working-directory: fs-meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          VERSION="${TAG#v}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "fs-meta $VERSION" --generate-notes
+          fi
