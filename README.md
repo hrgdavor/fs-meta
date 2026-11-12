@@ -26,6 +26,14 @@ subproject: what is here, how to run it, and where it plugs in.
 | `conformance/`                                           | the shared vector file every reader asserts, and the generator that produces it                     |
 | [`examples/stage-publisher/`](examples/stage-publisher/) | a runnable scp-like stage client: copy while the stage batch arrives, hook after the commit         |
 
+## Install a binary
+
+GitHub Releases carry prebuilt `fsmeta` binaries for Linux (x86_64/aarch64, static musl), macOS (x86_64/aarch64) and
+Windows (x86_64): <https://github.com/hrgdavor/fs-meta/releases>. Download the archive for the platform, unpack it, and
+run `fsmeta` — no Zig toolchain is needed. The release is published by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) when a `v*` tag is pushed; the workflow builds against
+the sibling `socutil` checkout because the engine consumes that library.
+
 **Not a `jcodebuddy` artifact.** The module has its own group id, artifact id and version and **no parent** — it
 does not inherit `jcodebuddy-parent`, and it names no `jcodebuddy`/`hipster` type. It is listed in the root POM's
 `<modules>` so the reactor (and the recorded gate) builds and tests it, which is a build relationship rather than
