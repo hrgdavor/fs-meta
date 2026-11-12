@@ -58,6 +58,8 @@ const usage =
     \\  fsmeta match   <root> <pattern> [--since <timestamp>]
     \\                                   wildmatch the trio (git's syntax, never glob's); one line per match
     \\                                   `glob` is a deprecated alias of `match`
+    \\  fsmeta find    <root> <pattern> [--since <timestamp>] [--json]
+    \\                                   the same query, paths only: one name per line, no size/mtime/hash
     \\  fsmeta changed <root> <since>  files changed since <since>; one line per match
     \\  fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]
     \\                                   the change record after <from>; batch-gap and batch-too-old are errors
@@ -269,7 +271,11 @@ pub fn main(init: std.process.Init) !void {
     // `glob` is abandoned as a name and as a dialect; `match` is the command, and the old name stays for scripts.
     if (std.mem.eql(u8, command, "match") or std.mem.eql(u8, command, "glob")) {
         const pattern = second orelse return fail(io, gpa, "match needs a pattern");
-        return runGlob(io, arena, gpa, target, pattern, since, json_output);
+        return runGlob(io, arena, gpa, target, pattern, since, json_output, false);
+    }
+    if (std.mem.eql(u8, command, "find")) {
+        const pattern = second orelse return fail(io, gpa, "find needs a pattern");
+        return runGlob(io, arena, gpa, target, pattern, since, json_output, true);
     }
     if (std.mem.eql(u8, command, "changed")) {
         const since_arg = second orelse return fail(io, gpa, "changed needs a since timestamp");
@@ -397,7 +403,16 @@ fn httpThread(gpa: std.mem.Allocator, config: socutil.Config) void {
 }
 
 /// Load the trio, run a match/glob query, and print one line per match (or a JSON array with --json).
-fn runGlob(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: []const u8, pattern: []const u8, since: ?[]const u8, json: bool) !void {
+fn runGlob(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    pattern: []const u8,
+    since: ?[]const u8,
+    json: bool,
+    paths_only: bool,
+) !void {
     var cache = try loadCache(arena, io, root);
     defer cache.deinit();
 
@@ -417,8 +432,13 @@ fn runGlob(io: std.Io, arena: std.mem.Allocator, gpa: std.mem.Allocator, root: [
     defer arena.free(results);
 
     if (json) {
-        const out = try query.toJson(arena, results);
+        const out = if (paths_only) try query.toNamesJson(arena, results) else try query.toJson(arena, results);
         try write(io, out);
+    } else if (paths_only) {
+        for (results) |match| {
+            try write(io, match.name);
+            try write(io, "\n");
+        }
     } else {
         for (results) |match| {
             const line = try std.fmt.allocPrint(arena, "{s} {d} {d} {d}\n", .{

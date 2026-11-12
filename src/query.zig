@@ -237,6 +237,28 @@ pub fn toJson(allocator: std.mem.Allocator, matches: []const Match) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Serialize just the matched names as a JSON array of strings (`fsmeta find --json`). No metadata:
+/// a caller that wants the entries uses `match --json` or reads the trio.
+pub fn toNamesJson(allocator: std.mem.Allocator, matches: []const Match) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    if (matches.len == 0) {
+        try writer.writeAll("[]\n");
+        return out.toOwnedSlice();
+    }
+
+    try writer.writeAll("[\n");
+    for (matches, 0..) |match, index| {
+        try writer.writeAll("  ");
+        try jsonWriteString(writer, match.name);
+        try writer.writeAll(if (index + 1 == matches.len) "\n" else ",\n");
+    }
+    try writer.writeAll("]\n");
+    return out.toOwnedSlice();
+}
+
 fn jsonWriteString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |byte| {

@@ -95,7 +95,8 @@ subject failed, 2 usage), so a pipeline does not care which one answers.
 zig-out/bin/fsmeta.exe scan <root>                    # walk the tree, write .fs-meta/
 zig-out/bin/fsmeta.exe verify <root>                   # is the trio usable?
 zig-out/bin/fsmeta.exe refresh <root>                  # rescan and publish a new generation
-zig-out/bin/fsmeta.exe glob <root> <pattern> [--since <ts>] [--json]   # git wildmatch; no '/' = basename at any depth
+zig-out/bin/fsmeta.exe match <root> <pattern> [--since <ts>] [--json]  # git wildmatch; no '/' = basename at any depth
+zig-out/bin/fsmeta.exe find <root> <pattern> [--since <ts>] [--json]   # the same matches, paths only
 zig-out/bin/fsmeta.exe changed <root> <since> [--json]
 zig-out/bin/fsmeta.exe reconcile <root> <from> [to] [--json] [--baseline <root>] [--include <pat>] [--exclude <pat>]
 
@@ -126,6 +127,20 @@ override is needed.
 chooses the content-hash mode (`text` is the default, which makes a CRLF and an LF checkout agree), and
 `--ignore NAME` adds a directory name to skip. The walk's ignore rules are `FORMAT.md` § 16.
 
+### `find` — match paths without the fingerprint columns
+
+`fsmeta match` prints `name mtime size hash`; `fsmeta find` asks the same query and prints **only the workspace-relative
+path**, one per line, with no footer. It answers from the same trio and uses the same `wildmatch`/anchoring rules:
+
+```sh
+fsmeta find <root> '*.md'                 # markdown paths at any depth
+fsmeta find <root> 'src/**' --since 1h    # recent paths under src/
+fsmeta find <root> '*.md' --json          # ["README.md", "docs/guide.md"]
+```
+
+`find` and `match` share the `--since` and `--json` conventions; `find --json` is an array of strings, while
+`match --json` keeps the full entry objects.
+
 ### `reconcile` — combined change set for a batch range
 
 `fsmeta reconcile <root> <from> [to] [--json] [--baseline <root>]` gives the **combined set of changes**
@@ -155,7 +170,7 @@ fsmeta reconcile <root> <from> --include '*.md'          # only markdown changes
 fsmeta reconcile <root> <from> --include 'src/**' --exclude '*.test.*'
 ```
 
-Patterns use git's `wildmatch` (the same matcher as `glob` and `.gitignore`): `*` matches any sequence, `?`
+Patterns use git's `wildmatch` (the same matcher as `match`/`find` and `.gitignore`): `*` matches any sequence, `?`
 one character, `[abc]` one of the listed. A pattern without `/` matches the basename at any depth; a pattern
 with `/` matches the whole workspace-relative path. Include patterns select; exclude patterns suppress and win
 over include. Both empty (or omitted) means pass-all. The filter is applied after the collapse, so the counts

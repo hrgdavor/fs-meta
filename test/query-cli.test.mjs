@@ -345,6 +345,37 @@ describe('fsmeta match', () => {
 });
 
 // ──────────────────────────────────────────────
+// `find`
+// ──────────────────────────────────────────────
+
+describe('fsmeta find', () => {
+  test('lists only paths: same membership and order as match, no metadata and no footer', () => {
+    const { root } = publishTree();
+    const matched = parseMatches(runOk('match', root, '*.txt'), `match ${root} '*.txt'`);
+    const expected = matched.map((match) => match.name);
+
+    const text = runOk('find', root, '*.txt');
+    const names = text.split('\n');
+    check(names.at(-1), '', `find must end with LF, like every query command`, text);
+    names.pop();
+    check(names, expected, `find '*.txt' must list the same names as match, in the same order`, text);
+    for (const name of names) {
+      check(name.includes(' '), false, `find must print only the path, never the metadata fields: ${JSON.stringify(name)}`, text);
+    }
+    check(text.endsWith(' names\n'), false, `find must not print match's "<n> names" footer`, text);
+
+    const parsed = JSON.parse(runOk('find', root, '*.txt', '--json'));
+    check(parsed, expected, `find --json must be an array of the same path strings`, JSON.stringify(parsed));
+  });
+
+  test('--since is the same mtime filter as match', () => {
+    const { root } = publishTree();
+    const futureInstant = new Date(Date.now() + 86_400_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    check(runOk('find', root, '*.txt', '--since', futureInstant), '', 'a future --since must match nothing, with no footer', '');
+  });
+});
+
+// ──────────────────────────────────────────────
 // `glob` alias
 // ──────────────────────────────────────────────
 
@@ -532,6 +563,15 @@ describe('fsmeta query exit codes', () => {
     );
     check(noPattern.stdout.includes('\nusage:'), true, 'a usage error must print the usage text', noPattern.stdout);
     check(noPattern.stderr, '', 'usage errors are printed to stdout, not stderr', noPattern.stderr);
+
+    const noFindPattern = run('find', root);
+    check(noFindPattern.code, 2, 'find without a pattern is a usage error and must exit 2', noFindPattern.stdout);
+    check(
+      noFindPattern.stdout.startsWith('fsmeta: find needs a pattern\n'),
+      true,
+      'find must name its own missing pattern, not match\'s',
+      noFindPattern.stdout,
+    );
 
     const unknown = run('match', root, '*.txt', '--bogus');
     check(unknown.code, 2, 'an unknown option is a usage error and must exit 2', unknown.stdout);

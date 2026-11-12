@@ -618,11 +618,12 @@ is the only wildcard syntax: in `fs-meta`, in `gitignore` itself, and in `jcodeb
 different dialect is read by `wildmatch`'s rules, not rejected, so the only way to be sure is to check against the
 shared vectors. `java-watch*` predates this decision and is exempt for now.
 
-The command is `fsmeta match <root> <pattern>`; `glob` is a deprecated alias kept for scripts, and the
-pattern it accepts. The pattern is a **git `wildmatch` pattern**,
-matched by exactly the `gitignore` project's matcher — the same code the `.gitignore` chain uses
-(`gitignore.globMatch`, pinned to `gitignore` v0.2.0 in `build.zig.zon`). There is no second glob dialect in
-fs-meta; a new pattern syntax anywhere is a format change, not a local convenience (AGENTS.md § 2, DEC-051).
+The commands are `fsmeta match <root> <pattern>` and `fsmeta find <root> <pattern>`; `glob` is a deprecated alias of
+`match`, kept for scripts. Both accept the same **git `wildmatch` pattern**, matched by exactly the `gitignore`
+project's matcher — the same code the `.gitignore` chain uses (`gitignore.globMatch`, pinned to `gitignore` v0.3.5 in
+`build.zig.zon`). `match` prints the entry fields; `find` prints the matched path only. There is no second glob
+dialect in fs-meta; a new pattern syntax anywhere is a format change, not a local convenience (AGENTS.md § 2,
+DEC-051).
 
 A query is matched against a **name path** (§ 3: `/`-separated, no trailing slash, no `.` component). The
 anchoring rule is gitignore's own:
