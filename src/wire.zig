@@ -23,13 +23,14 @@ const format = @import("format.zig");
 ///
 /// `0x0101` adds the `STATE` frame (§ STATE), `0x0102` adds `GIT_EVENT` (§ GIT_EVENT), `0x0103` adds the staged-build
 /// barrier (`SUBSCRIBE_V2`, `BUILD_STARTED`, `BUILD_DONE`, `STAGE_READY`), `0x0104` adds the streamed stage batch
-/// (`STAGE_BATCH_START`, `STAGE_CHANGE_ENTRY`, `STAGE_BATCH_END`), and `0x0105` adds `SUBSCRIBE_V3` with its
-/// `from_stage_batch` replay cursor (§ BUILD_STAGES). There are no deployed
+/// (`STAGE_BATCH_START`, `STAGE_CHANGE_ENTRY`, `STAGE_BATCH_END`), `0x0105` adds `SUBSCRIBE_V3` with its
+/// `from_stage_batch` replay cursor, and `0x0106` adds the app-published batch frames (§ APP_BATCHES) so a builder
+/// can report its own output without the daemon scanning the whole stage folder. There are no deployed
 /// clients, so the minor bump is the whole compatibility story: every implementation is updated together, and no
 /// capability bit gate is carried for a population of zero. A `0x0100` peer is still accepted — `checkHello` compares
-/// majors — but it will not understand `0x09`, `0x0A` or `0x0B`–`0x12`, which is why the daemon speaks `0x0105` and
+/// majors — but it will not understand `0x09`, `0x0A` or `0x0B`–`0x15`, which is why the daemon speaks `0x0106` and
 /// the document says so. `fsmeta serve` announces the same version and simply never emits the daemon-only frames.
-pub const protocol: u16 = 0x0105;
+pub const protocol: u16 = 0x0106;
 
 /// The prefix is 8 bytes: `u16 kind`, `u16 flags`, `u32 length`.
 pub const prefix_size = 8;
@@ -75,6 +76,12 @@ pub const Kind = enum(u16) {
     stage_batch_end = 0x11,
     /// `SUBSCRIBE_V2` plus the stage-batch replay cursor (protocol `0x0105`).
     subscribe_v3 = 0x12,
+    /// An app opens a build batch for an output stage (protocol `0x0106`). Client to server.
+    app_batch_start = 0x13,
+    /// One file an app generated (or deleted) in an open batch (protocol `0x0106`). Client to server.
+    app_batch_file = 0x14,
+    /// An app closes its batch; the daemon publishes the buffered files as a stage batch (protocol `0x0106`).
+    app_batch_end = 0x15,
 
     pub fn fromInt(value: u16) ?Kind {
         return switch (value) {
@@ -96,6 +103,9 @@ pub const Kind = enum(u16) {
             0x10 => .stage_change_entry,
             0x11 => .stage_batch_end,
             0x12 => .subscribe_v3,
+            0x13 => .app_batch_start,
+            0x14 => .app_batch_file,
+            0x15 => .app_batch_end,
             else => null,
         };
     }
@@ -122,6 +132,7 @@ pub const ReadError = error{
     InvalidState,
     InvalidGitEvent,
     InvalidBuild,
+    InvalidAppBatch,
 };
 
 /// Write the 8-byte prefix for a payload of `length` bytes.
@@ -502,6 +513,115 @@ pub const StageBatchEnd = struct {
     }
 };
 
+// ---------------------------------------------------------------- app-published batches
+
+/// `APP_BATCH_START`: `u64 batch_id`, `u16 stage`, `u16 flags`, `u64 started_ns`.
+pub const app_batch_start_size = 20;
+
+/// `APP_BATCH_FILE`'s fixed header: `u64 batch_id`, `u8 change`, `u16 name_len`, then the name bytes.
+pub const app_batch_file_header_size = 11;
+
+/// `APP_BATCH_END`: `u64 batch_id`, `u8 status`.
+pub const app_batch_end_size = 9;
+
+/// What an app did to one path in its batch. `upsert` is a file it wrote (the daemon hashes it); `delete` is a
+/// file it removed. The daemon never scans for the files in between: the app names what it produced.
+pub const AppChange = enum(u8) {
+    upsert = 0,
+    delete = 1,
+};
+
+/// `APP_BATCH_START` (kind `0x13`, protocol `0x0106`), client to server.
+///
+/// `stage` is the stage this batch **produces**, not the stage the connection consumes: a compiler may subscribe
+/// at stage 0 (the source stream) and publish its output as stage 1. Several batches may be open at once on one
+/// connection, which is why every frame carries `batch_id`.
+pub const AppBatchStart = struct {
+    batch_id: u64,
+    stage: u16,
+    /// Reserved; refused when set.
+    flags: u16 = 0,
+    /// The app's clock, diagnostics only (ordering is `batch_id`, never a timestamp).
+    started_ns: u64 = 0,
+
+    pub fn write(self: AppBatchStart, out: *[prefix_size + app_batch_start_size]u8) void {
+        writePrefix(out[0..prefix_size], .app_batch_start, 0, app_batch_start_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u64, body[0..8], self.batch_id, .little);
+        std.mem.writeInt(u16, body[8..10], self.stage, .little);
+        std.mem.writeInt(u16, body[10..12], self.flags, .little);
+        std.mem.writeInt(u64, body[12..20], self.started_ns, .little);
+    }
+
+    pub fn read(payload: []const u8) ReadError!AppBatchStart {
+        if (payload.len != app_batch_start_size) return error.LengthMismatch;
+        const flags = std.mem.readInt(u16, payload[10..12], .little);
+        if (flags != 0) return error.UnsupportedFlags;
+        const stage = std.mem.readInt(u16, payload[8..10], .little);
+        if (stage > max_stage) return error.InvalidAppBatch;
+        return .{
+            .batch_id = std.mem.readInt(u64, payload[0..8], .little),
+            .stage = stage,
+            .flags = flags,
+            .started_ns = std.mem.readInt(u64, payload[12..20], .little),
+        };
+    }
+};
+
+/// `APP_BATCH_FILE` (kind `0x14`, protocol `0x0106`), client to server. Self-delimiting:
+/// `length == app_batch_file_header_size + name_len`, and `name` is borrowed from the payload.
+pub const AppBatchFile = struct {
+    batch_id: u64,
+    change: AppChange,
+    name: []const u8,
+
+    pub fn write(self: AppBatchFile, out: []u8) void {
+        std.debug.assert(out.len == prefix_size + app_batch_file_header_size + self.name.len);
+        writePrefix(out[0..prefix_size], .app_batch_file, 0, @intCast(app_batch_file_header_size + self.name.len));
+        const body = out[prefix_size..];
+        std.mem.writeInt(u64, body[0..8], self.batch_id, .little);
+        body[8] = @intFromEnum(self.change);
+        std.mem.writeInt(u16, body[9..11], @intCast(self.name.len), .little);
+        @memcpy(body[app_batch_file_header_size..][0..self.name.len], self.name);
+    }
+
+    pub fn read(payload: []const u8) ReadError!AppBatchFile {
+        if (payload.len < app_batch_file_header_size) return error.LengthMismatch;
+        const name_length = std.mem.readInt(u16, payload[9..11], .little);
+        if (name_length == 0) return error.InvalidAppBatch;
+        if (payload.len != app_batch_file_header_size + name_length) return error.LengthMismatch;
+        if (payload[8] > 1) return error.InvalidAppBatch;
+        return .{
+            .batch_id = std.mem.readInt(u64, payload[0..8], .little),
+            .change = @enumFromInt(payload[8]),
+            .name = payload[app_batch_file_header_size..],
+        };
+    }
+};
+
+/// `APP_BATCH_END` (kind `0x15`, protocol `0x0106`), client to server. `status` is the builder's vocabulary:
+/// a failed or cancelled batch is discarded and never reaches the stage state.
+pub const AppBatchEnd = struct {
+    batch_id: u64,
+    status: BuildStatus = .ok,
+
+    pub fn write(self: AppBatchEnd, out: *[prefix_size + app_batch_end_size]u8) void {
+        writePrefix(out[0..prefix_size], .app_batch_end, 0, app_batch_end_size);
+        const body = out[prefix_size..];
+        std.mem.writeInt(u64, body[0..8], self.batch_id, .little);
+        body[8] = @intFromEnum(self.status);
+    }
+
+    pub fn read(payload: []const u8) ReadError!AppBatchEnd {
+        if (payload.len != app_batch_end_size) return error.LengthMismatch;
+        if (payload[8] > 2) return error.InvalidAppBatch;
+        return .{
+            .batch_id = std.mem.readInt(u64, payload[0..8], .little),
+            .status = @enumFromInt(payload[8]),
+        };
+    }
+};
+
 // ---------------------------------------------------------------- the handshake
 
 pub const Role = enum(u8) { server = 0, client = 1 };
@@ -584,7 +704,7 @@ test "a prefix round-trips, and the kinds cannot look like JSON" {
     try testing.expectEqual(@as(u32, 100), frame.length);
 
     var kind: u16 = 0x01;
-    while (kind <= 0x12) : (kind += 1) {
+    while (kind <= 0x15) : (kind += 1) {
         var prefix: [prefix_size]u8 = undefined;
         writePrefix(&prefix, Kind.fromInt(kind).?, 0, 0);
         try testing.expect(prefix[0] < 0x7B);
@@ -774,6 +894,53 @@ test "the stage batch frames round-trip, and the entry keeps CHANGE_ENTRY's payl
     var bad_status = end_bytes[prefix_size..];
     bad_status[42] = 3;
     try testing.expectError(error.InvalidBuild, StageBatchEnd.read(bad_status));
+}
+
+test "the app batch frames round-trip, and malformed batches are refused" {
+    var start_bytes: [prefix_size + app_batch_start_size]u8 = undefined;
+    (AppBatchStart{ .batch_id = 9, .stage = 1, .started_ns = 77 }).write(&start_bytes);
+    try testing.expectEqual(Kind.app_batch_start, (try readPrefix(start_bytes[0..prefix_size])).kind);
+    const start = try AppBatchStart.read(start_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u64, 9), start.batch_id);
+    try testing.expectEqual(@as(u16, 1), start.stage);
+    try testing.expectEqual(@as(u64, 77), start.started_ns);
+
+    var bad_flags: [app_batch_start_size]u8 = undefined;
+    @memcpy(&bad_flags, start_bytes[prefix_size..]);
+    bad_flags[10] = 1;
+    try testing.expectError(error.UnsupportedFlags, AppBatchStart.read(&bad_flags));
+    var bad_stage: [app_batch_start_size]u8 = undefined;
+    @memcpy(&bad_stage, start_bytes[prefix_size..]);
+    std.mem.writeInt(u16, bad_stage[8..10], max_stage + 1, .little);
+    try testing.expectError(error.InvalidAppBatch, AppBatchStart.read(&bad_stage));
+
+    var file_bytes: [prefix_size + app_batch_file_header_size + 7]u8 = undefined;
+    (AppBatchFile{ .batch_id = 9, .change = .upsert, .name = "A.class" }).write(&file_bytes);
+    const file_prefix = try readPrefix(file_bytes[0..prefix_size]);
+    try testing.expectEqual(Kind.app_batch_file, file_prefix.kind);
+    try testing.expectEqual(@as(u32, app_batch_file_header_size + 7), file_prefix.length);
+    const file = try AppBatchFile.read(file_bytes[prefix_size..]);
+    try testing.expectEqual(@as(u64, 9), file.batch_id);
+    try testing.expectEqual(AppChange.upsert, file.change);
+    try testing.expectEqualStrings("A.class", file.name);
+
+    // A name length that disagrees with the payload, or a change outside the two states, is refused.
+    var lying: [app_batch_file_header_size + 7]u8 = undefined;
+    @memcpy(&lying, file_bytes[prefix_size..]);
+    std.mem.writeInt(u16, lying[9..11], 8, .little);
+    try testing.expectError(error.LengthMismatch, AppBatchFile.read(&lying));
+    var bad_change: [app_batch_file_header_size + 7]u8 = undefined;
+    @memcpy(&bad_change, file_bytes[prefix_size..]);
+    bad_change[8] = 2;
+    try testing.expectError(error.InvalidAppBatch, AppBatchFile.read(&bad_change));
+
+    var end_bytes: [prefix_size + app_batch_end_size]u8 = undefined;
+    (AppBatchEnd{ .batch_id = 9, .status = .cancelled }).write(&end_bytes);
+    try testing.expectEqual(Kind.app_batch_end, (try readPrefix(end_bytes[0..prefix_size])).kind);
+    try testing.expectEqual(BuildStatus.cancelled, (try AppBatchEnd.read(end_bytes[prefix_size..])).status);
+    var bad_status = end_bytes[prefix_size..];
+    bad_status[8] = 3;
+    try testing.expectError(error.InvalidAppBatch, AppBatchEnd.read(bad_status));
 }
 
 test "a git event is exactly twenty bytes, and a worktree event is the only variable one" {

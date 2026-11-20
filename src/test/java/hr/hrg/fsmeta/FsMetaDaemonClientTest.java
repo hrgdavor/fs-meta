@@ -142,9 +142,58 @@ class FsMetaDaemonClientTest {
         }
     }
 
+    @Test
+    void appBatchFramesAreSentWithTheProducedStage() throws Exception {
+        try (FakeServer server = FakeServer.start()) {
+            List<Frame> control = new ArrayList<>();
+            AtomicReference<Throwable> serverFailure = new AtomicReference<>();
+            Thread peer = new Thread(() -> {
+                try (SocketChannel channel = server.accept()) {
+                    assertEquals(0x01, readFrame(channel).kind);
+                    writeFrame(channel, 0x01, helloPayload(0));
+                    assertEquals(0x12, readFrame(channel).kind);
+                    control.add(readFrame(channel));
+                    control.add(readFrame(channel));
+                    control.add(readFrame(channel));
+                } catch (Throwable failure) {
+                    serverFailure.set(failure);
+                }
+            });
+            peer.start();
+            try (FsMetaDaemonClient client = FsMetaDaemonClient.connect(server.path, 0, 0, 0, false,
+                    List.of(), List.of())) {
+                client.sendAppBatchStart(7, 1, 99);
+                client.sendAppBatchFile(7, "build/classes/A$Inner.class", FsMetaDaemonClient.APP_CHANGE_UPSERT);
+                client.sendAppBatchEnd(7, FsMetaDaemonClient.BUILD_OK);
+            }
+            peer.join(5000);
+            if (serverFailure.get() != null) throw new AssertionError(serverFailure.get());
+            assertEquals(0x13, control.get(0).kind);
+            ByteBuffer start = little(control.get(0).payload);
+            assertEquals(7L, start.getLong());
+            assertEquals(1, Short.toUnsignedInt(start.getShort()));
+            assertEquals(0, Short.toUnsignedInt(start.getShort()));
+            assertEquals(99L, start.getLong());
+            assertEquals(0x14, control.get(1).kind);
+            ByteBuffer file = little(control.get(1).payload);
+            assertEquals(7L, file.getLong());
+            assertEquals(FsMetaDaemonClient.APP_CHANGE_UPSERT, Byte.toUnsignedInt(file.get()));
+            int nameLength = Short.toUnsignedInt(file.getShort());
+            byte[] name = new byte[nameLength];
+            file.get(name);
+            assertEquals("build/classes/A$Inner.class", new String(name, StandardCharsets.UTF_8));
+            assertEquals(0x15, control.get(2).kind);
+            ByteBuffer end = little(control.get(2).payload);
+            assertEquals(7L, end.getLong());
+            assertEquals(FsMetaDaemonClient.BUILD_OK, Byte.toUnsignedInt(end.get()));
+        } catch (UnsupportedOperationException | IOException unsupported) {
+            Assumptions.abort("Unix domain sockets are unavailable on this host: " + unsupported.getMessage());
+        }
+    }
+
     private static byte[] helloPayload(long generation) {
         ByteBuffer payload = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
-        payload.putShort((short) 0x0105);
+        payload.putShort((short) 0x0106);
         payload.putShort((short) 64);
         payload.put((byte) 0);
         payload.put((byte) 0); // server

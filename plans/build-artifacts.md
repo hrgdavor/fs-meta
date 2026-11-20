@@ -1,9 +1,10 @@
 # Build artifacts and staged builds
 
-**Status:** B1–B11 are implemented (protocol `0x0104`, the barrier, `.fs-meta/build.json`, the `stage` ignore source,
+**Status:** B1–B13 are implemented (protocol `0x0106`, the barrier, `.fs-meta/build.json`, the `stage` ignore source,
 the stage state/trio/batches under `.fs-meta/stages/<NN>/`, streaming stage-batch frames while the walk runs, the
 one-shot `fsmeta stage status|scan|diff` CLI, `SUBSCRIBE_V3`/`from_stage_batch` replay, the scp-like publisher
-example, `root status` stage counters and a builder timeout, tests and the reference documents).
+example, `root status` stage counters and a builder timeout, app-published batches and their tracked-output case,
+tests and the reference documents).
 
 ## 1. The situation
 
@@ -445,6 +446,49 @@ future live stage tail would have to preserve too; a raw watch event does not ha
   and the root's other sources still apply. A declared stage folder is hidden from the root, so this is a config
   error rather than a loop.
 
+### 7.9 App-published batches
+
+The folder scan is the fallback, not the only producer. A compiler already knows what it wrote: one `.java` file
+becomes one class, or several when it has inner classes, and a docs generator rewrites one Markdown file from a
+snippet. Waiting for every builder of a stage to finish and then walking the whole folder loses that knowledge, and
+several compile jobs running at once all look like one round. `APP_BATCH_START`, `APP_BATCH_FILE` and
+`APP_BATCH_END` let the app send the batch on the socket it is already using, while it generates the files
+([`FORMAT.socket.md`](../FORMAT.socket.md) § APP_BATCHES).
+
+The frames carry an explicit **produced** stage. A compiler subscribes at stage 0 (the source stream), sends an app
+batch whose stage is 1, and the daemon publishes it to stage-1 listeners; a bundler that consumes stage 1 publishes
+stage 2 the same way. The subscription stage says what the app reads, the batch stage says what it writes — the
+compiler does not have to pretend it is a stage-0 builder to publish stage 1.
+
+- **Several batches at once.** Each `batch_id` is an independent buffer. A Java compile of two sources may have two
+  batches open, and the first to end publishes its own stage batch without waiting for the other. This is the
+  property the single `BUILD_DONE` barrier cannot express.
+- **The daemon hashes, the app only names.** An `upsert` is stat'd and hashed when the batch ends, with the stage's
+  hash mode; a file that moved while it was hashed fails the batch rather than publishing a half-written artifact.
+  This is the stability rule a raw watch event does not have, and it is why the app's sentence "this file is
+  generated" is worth a frame.
+- **Stage-owned and tracked outputs.** A name below the produced stage's declared folders is an artifact and joins
+  `.fs-meta/stages/<NN>/`. A name elsewhere is a **tracked output** — the docs case, where `docs/Guide.md` is a
+  regular file in the root trio that the generator rewrites in place, and the user also edits it (adding a snippet
+  ref) and saves. A tracked name is reported in the stage batch but never enters the stage state: the root trio
+  already owns it, and one tree must not be described by two trios. The root still publishes its own batch for the
+  file; the stage batch is the "generated" signal. A tool that rewrites a file it also watches must compare the hash
+  it wrote (idempotence) because its own write is a legitimate source change.
+- **The barrier stays separate.** App batches do not move `done_through`; a builder still sends `BUILD_DONE` for
+  its stage. A listener may publish app batches. A stage with no app batches behaves exactly as § 7.4 describes.
+- **No interference.** An app batch is only accepted for a stage declared in `build.json`; a root without staged
+  builds refuses the frames. Holding the app batch map, the timeout and the counters is the whole addon on the
+  daemon side; the engine, the root trio, `SUBSCRIBE`, replay and the stage barrier are unchanged. The stage state
+  is still a separate, regenerable trio ("another root" in the plan's sense), and a tracked output never makes it
+  into that trio.
+
+Mechanics follow the existing stage batch: one `STAGE_BATCH_START … STAGE_BATCH_END` to the next stage, one stage
+generation when something changed, counts as the commit. A batch that named only unchanged bytes publishes nothing.
+A batch that names no files is a boundary-only round and falls back to the folder scan, which keeps a script that
+cannot name its outputs working. A failed or cancelled batch is discarded. Open batches are bounded (64 per root,
+65 536 names each), time out (`FSMETA_APP_BATCH_TIMEOUT_MS`, default 120 s) and are dropped with their connection;
+`root status` reports open/published/failed/timed-out counts.
+
 ## 8. Acceptance tests
 
 These are the tests that make the barrier a fact rather than a diagram:
@@ -514,6 +558,19 @@ The status and trigger work (B5/B13) adds:
 32. `root status --json` reports `stage_blocked` (or `-1`), its generation, builders, batches, failures, timeouts,
     and the last scan's timestamp/duration/error.
 
+App-published batches (§ 7.9) add:
+
+33. Two app batches are open at once; ending one publishes exactly its files and leaves the other's buffer intact.
+34. A compiler subscribes at stage 0 and publishes a stage-1 batch; a stage-1 listener receives the entries and the
+    exact counts without any `BUILD_DONE` from the app.
+35. A tracked output (`docs/Guide.md`) is hashed and reported in the stage batch, and the stage state's
+    `files.txt` does not contain it; the root trio still sees the file.
+36. An app batch naming another stage's folder, `..`, `.git` or `.fs-meta` is `ERROR{protocol}`; an unknown batch id
+    and a duplicate open id are refused the same way.
+37. A failed or cancelled `APP_BATCH_END` publishes nothing and moves neither the stage generation nor the state.
+38. An open batch times out, is counted, and its buffered names are dropped; a disconnected app's open batches are
+    dropped with it.
+
 ## 9. Steps
 
 | #   | Step                                                                                 | Gate                                                                                               |
@@ -530,8 +587,10 @@ The status and trigger work (B5/B13) adds:
 | B10 | **done** — `fsmeta stage status/scan/diff`; CLI and daemon share `stage.refresh`     | § 8 test 19                                                                                        |
 | B11 | **done** — `STAGE_BATCH_START`/`STAGE_CHANGE_ENTRY`/`STAGE_BATCH_END`, observation order, `SUBSCRIBE_V3` and `from_stage_batch` replay; root batches still hash-ordered | a stage-1 client can distinguish, consume and replay a stage batch; § 8 test 27 |
 | B12 | **done** — [`examples/stage-publisher/`](../examples/stage-publisher/) implements the § 7.7 publisher: copy while streaming, commit at `STAGE_BATCH_END`, hook once; [`test/stage-publisher.test.mjs`](../test/stage-publisher.test.mjs) proves the copy is visible before the end | [`test/stage-publisher.test.mjs`](../test/stage-publisher.test.mjs) |
+| B13 | **done** — `APP_BATCH_START`/`APP_BATCH_FILE`/`APP_BATCH_END`: several concurrent app batches, explicit produced stage, daemon-side hashing, stage-owned and tracked outputs, timeout and counters; Java and JS clients expose the frames; `stage.ingest` applies a batch without a folder walk | the § 8 tests 33–38 and `zig build test` |
 
-B1–B12 are implemented; B9's first version (scan first, then stream) is recorded in § 7.6 as history and was
+B1–B13 are implemented; B9's first version (scan first, then stream) is recorded in § 7.6 as history and was
 replaced by emission from `scan.Options.on_fact` while the walk runs. B11 includes the `SUBSCRIBE_V3` cursor and
-archive replay, B12 is the runnable publisher example, and B5 adds the status view, timeout, config polling, and
-the multi-builder/no-builder scan gates. There are no open steps in this plan.
+archive replay, B12 is the runnable publisher example, B13 is the app-published batch with its tracked-output case,
+and B5 adds the status view, timeout, config polling, and the multi-builder/no-builder scan gates. There are no open
+steps in this plan.

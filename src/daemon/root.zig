@@ -91,6 +91,17 @@ pub fn safetyPassDue(now_ms: i64, last_event_ms: i64, last_pass_ms: i64, interva
     return now_ms - since >= interval_ms;
 }
 
+/// How long one app batch may stay open before the daemon drops it. A compiler that crashes mid-batch must not
+/// leak its buffered names forever; `FSMETA_APP_BATCH_TIMEOUT_MS` overrides, `0` disables the policy.
+pub const app_batch_timeout_default_ms: i64 = 120_000;
+/// The most app batches one root tracks at once. Multiple concurrent compiler jobs are the feature; an unbounded
+/// map fed by a buggy client is not.
+pub const max_app_batches: usize = 64;
+/// The most files one app batch may name.
+pub const max_app_batch_files: usize = 65_536;
+/// The most path bytes one app batch may buffer, so a client cannot turn the name list into unbounded memory.
+pub const max_app_batch_name_bytes: usize = 16 * 1024 * 1024;
+
 /// Why a pass ran. The wire only knows `STATE.reason`, which has no "timer" value (and gaining one would be a
 /// protocol change), so `event` and `safety` both report `.watcher` there and are told apart by the counters —
 /// which is the distinction that matters when a root looks stale.
@@ -186,6 +197,16 @@ pub const Snapshot = struct {
     last_stage_scan_ms: i64 = 0,
     last_stage_scan_duration_ms: i64 = 0,
     last_stage_error: []const u8 = "",
+    /// App-published batches (`FORMAT.socket.md` § APP_BATCHES): how many are open now, how many published a
+    /// stage batch, how many failed or timed out, and the deadline for an open one.
+    app_batches: u32 = 0,
+    app_batches_published: u64 = 0,
+    app_batch_failures: u64 = 0,
+    app_batch_timeouts: u64 = 0,
+    app_batch_timeout_ms: i64 = app_batch_timeout_default_ms,
+    /// The retained pass arena's capacity: the high-water mark of one scan, and the steady-state memory a root
+    /// keeps instead of freeing and re-allocating the tree on every pass.
+    pass_arena_bytes: u64 = 0,
     /// This root's own `gitwatch`, reported so a caller that is not the daemon can ask whether a hook spool for it
     /// would ever be read (`fsmeta daemon hooks install` refuses when it would not: `plans/worktrees.md` § 5c, M5).
     gitwatch: bool = true,
@@ -317,6 +338,120 @@ const Subscriber = struct {
     fn deinitFilter(self: *Subscriber, allocator: std.mem.Allocator) void {
         allocator.free(self.filter_storage);
         self.filter.deinit(allocator);
+    }
+};
+
+/// One file an app named in an open batch. The daemon hashes `upsert` at `APP_BATCH_END`; `delete` removes the
+/// name from the stage state (or, for a tracked output, reports a delete without touching the root trio).
+const AppFile = struct {
+    name: []const u8,
+    delete: bool,
+};
+
+/// An app-published build batch (`FORMAT.socket.md` § APP_BATCHES): several may be open at once on one
+/// connection, which is why `id` is part of every frame. `stage` is the stage the batch **produces**, not the
+/// stage the connection subscribed to.
+const AppBatch = struct {
+    owner: *Subscriber,
+    id: u64,
+    stage: u16,
+    files: std.ArrayListUnmanaged(AppFile) = .empty,
+    name_bytes: usize = 0,
+    started_ms: i64 = 0,
+    last_ms: i64 = 0,
+
+    fn deinit(self: *AppBatch, allocator: std.mem.Allocator) void {
+        for (self.files.items) |file| allocator.free(file.name);
+        self.files.deinit(allocator);
+    }
+};
+
+/// One consumer of a streamed stage batch, with the counts the commit frame carries. The counts are per target
+/// because each subscriber's filter can hide entries.
+const StageTarget = struct {
+    subscriber: *Subscriber,
+    added: u64 = 0,
+    changed: u64 = 0,
+    deleted: u64 = 0,
+};
+
+/// The live `STAGE_BATCH_START … STAGE_BATCH_END` sink used by both a folder scan and an app batch. It lives at
+/// file scope so the two producers share one framing implementation instead of two subtly different ones.
+const StageBatchStream = struct {
+    root: *RootRuntime,
+    producer_stage: u16,
+    targets: []StageTarget,
+    generation: u64 = 0,
+    started: bool = false,
+    finished: bool = false,
+
+    fn start(raw: *anyopaque, stage: u16, generation: u64, parent: u64) void {
+        const stream: *@This() = @ptrCast(@alignCast(raw));
+        _ = parent;
+        stream.generation = generation;
+        stream.started = true;
+        for (stream.targets) |*target| {
+            if (!target.subscriber.alive) continue;
+            var bytes: [wire.prefix_size + wire.stage_batch_start_size]u8 = undefined;
+            (wire.StageBatchStart{
+                .stage = stage,
+                .generation = generation,
+                .parent = if (generation > 0) generation - 1 else 0,
+                .started_ns = @intCast(@max(std.Io.Clock.real.now(stream.root.io).nanoseconds, 0)),
+            }).write(&bytes);
+            writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
+                target.subscriber.alive = false;
+            };
+        }
+    }
+
+    fn change(raw: *anyopaque, item: stage_mod.Change) void {
+        const stream: *@This() = @ptrCast(@alignCast(raw));
+        for (stream.targets) |*target| {
+            if (!target.subscriber.alive or !target.subscriber.filter.matches(item.name)) continue;
+            const frame = stream.root.allocator.alloc(u8, wire.prefix_size + format.entry_size + item.name.len) catch return;
+            defer stream.root.allocator.free(frame);
+            wire.writeChangeEntryAs(frame, .stage_change_entry, item.entry, item.name);
+            writeAll(stream.root.io, target.subscriber.stream, frame) catch {
+                target.subscriber.alive = false;
+                continue;
+            };
+            switch (item.kind) {
+                .added => target.added += 1,
+                .changed => target.changed += 1,
+                .deleted => target.deleted += 1,
+            }
+        }
+    }
+
+    fn finish(raw: *anyopaque, stage: u16, generation: u64, added: u64, changed: u64, deleted: u64, ok: bool) void {
+        _ = added;
+        _ = changed;
+        _ = deleted;
+        const stream: *@This() = @ptrCast(@alignCast(raw));
+        stream.finishWith(stage, generation, ok);
+    }
+
+    fn finishWith(stream: *@This(), stage: u16, generation: u64, ok: bool) void {
+        if (!stream.started or stream.finished) return;
+        stream.finished = true;
+        for (stream.targets) |*target| {
+            if (!target.subscriber.alive) continue;
+            if (ok) target.subscriber.from_stage_batch = generation;
+            var bytes: [wire.prefix_size + wire.stage_batch_end_size]u8 = undefined;
+            (wire.StageBatchEnd{
+                .stage = stage,
+                .generation = generation,
+                .added = target.added,
+                .changed = target.changed,
+                .deleted = target.deleted,
+                .status = if (ok) .ok else .failed,
+            }).write(&bytes);
+            writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
+                target.subscriber.alive = false;
+            };
+        }
+        stream.root.dropDeadLocked();
     }
 };
 
@@ -525,6 +660,13 @@ pub const RootRuntime = struct {
     /// The root's last-seen `build.json` stamp. `.fs-meta` is not a watcher event, so the tick polls this.
     build_config_stamp: ?u64 = null,
     build_config_checked: bool = false,
+    /// Open app batches (`FORMAT.socket.md` § APP_BATCHES). Each is owned by the connection that started it and is
+    /// removed when it ends, when that connection leaves, or when it has been open for `app_batch_timeout_ms`.
+    app_batches: std.ArrayListUnmanaged(AppBatch) = .empty,
+    app_batch_timeout_ms: i64 = app_batch_timeout_default_ms,
+    app_batches_published: u64 = 0,
+    app_batch_failures: u64 = 0,
+    app_batch_timeouts: u64 = 0,
     /// The generation at which each undeclared-builder stage was last scanned, so a stage with no builders is
     /// checked once per release rather than on every tick.
     undeclared_stage_scanned: [wire.max_stage + 1]u64 = @splat(0),
@@ -563,6 +705,11 @@ pub const RootRuntime = struct {
     /// The watcher, present exactly while the root is `waking` or `watching`. `null` when asleep, `off`, or
     /// when this platform refused to arm one (the degraded case `last_error` names).
     watcher: ?Watcher = null,
+    /// Scratch storage for one pass. It is **reset and retained** between passes rather than allocated and freed
+    /// each time: a pass over a large tree is tens of megabytes, and a fresh arena per pass makes the allocator
+    /// grow its committed heap without bound even when every chunk is freed. The high-water mark of one pass is
+    /// the steady-state cost of the root.
+    pass_arena: std.heap.ArenaAllocator = undefined,
     /// Stable storage for the handler: nightwatch keeps this pointer for the watcher's lifetime.
     event_handler: EventHandler = undefined,
     /// Raised by nightwatch's thread on every event; read by `tick` to notice a burst.
@@ -603,6 +750,7 @@ pub const RootRuntime = struct {
         };
         self.event_handler = .{ .handler = .{ .vtable = &EventHandler.vtable }, .root = self };
         self.git_listener = .{ .ctx = self, .notify = gitNotify, .git_dir = "" };
+        self.pass_arena = std.heap.ArenaAllocator.init(parent_allocator);
         return self;
     }
 
@@ -699,6 +847,9 @@ pub const RootRuntime = struct {
         if (self.claim) |*claim| reaper.release(claim, io);
         reaper.removeRootFiles(io, self.arena, self.layout, self.record.id);
         self.subscribers.deinit(self.allocator);
+        for (self.app_batches.items) |*batch| batch.deinit(self.allocator);
+        self.app_batches.deinit(self.allocator);
+        self.pass_arena.deinit();
         self.allocator.destroy(self);
     }
 
@@ -756,8 +907,8 @@ pub const RootRuntime = struct {
             .passes = self.machine.passes,
             .wakes = self.machine.wakes,
             .rotated_by_bytes = self.rotated_by_bytes,
-        .event_passes = self.event_passes,
-        .safety_passes = self.safety_passes,
+            .event_passes = self.event_passes,
+            .safety_passes = self.safety_passes,
             .last_pass_ms = self.last_pass_ms,
             .last_pass_duration_ms = self.last_pass_duration_ms,
             .last_pass_files = self.last_pass_files,
@@ -782,6 +933,12 @@ pub const RootRuntime = struct {
             .last_stage_scan_ms = self.last_stage_scan_ms,
             .last_stage_scan_duration_ms = self.last_stage_scan_duration_ms,
             .last_stage_error = self.last_stage_error,
+            .app_batches = @intCast(self.app_batches.items.len),
+            .app_batches_published = self.app_batches_published,
+            .app_batch_failures = self.app_batch_failures,
+            .app_batch_timeouts = self.app_batch_timeouts,
+            .app_batch_timeout_ms = self.app_batch_timeout_ms,
+            .pass_arena_bytes = @intCast(self.pass_arena.queryCapacity()),
             .gitwatch = self.record.gitwatch,
             .worktrees = self.record.worktrees,
             .worktree = if (self.git) |location| location.is_gitfile else false,
@@ -1027,6 +1184,7 @@ pub const RootRuntime = struct {
         }
         self.syncWatcherLocked();
 
+        self.checkAppBatchTimeoutsLocked(now_ms);
         self.checkStageTimeoutsLocked(now_ms);
         if (self.machine.phase == .watching and self.checkBuildConfigLocked(now_ms)) return;
 
@@ -1723,9 +1881,8 @@ pub const RootRuntime = struct {
         const was_waking = self.machine.phase == .waking;
         if (was_waking) self.armWatcherLocked();
 
-        var pass_arena_state = std.heap.ArenaAllocator.init(self.allocator);
-        defer pass_arena_state.deinit();
-        const arena = pass_arena_state.allocator();
+        _ = self.pass_arena.reset(.retain_capacity);
+        const arena = self.pass_arena.allocator();
 
         var stamp_buffer: [32]u8 = undefined;
         const options: engine.Options = .{
@@ -2126,91 +2283,7 @@ pub const RootRuntime = struct {
         _ = declaration.find(producer_stage) orelse return;
         const consumer_stage = producer_stage + 1;
 
-        const Target = struct {
-            subscriber: *Subscriber,
-            added: u64 = 0,
-            changed: u64 = 0,
-            deleted: u64 = 0,
-        };
-        const StageStream = struct {
-            root: *RootRuntime,
-            producer_stage: u16,
-            targets: []Target,
-            generation: u64 = 0,
-            started: bool = false,
-            finished: bool = false,
-
-            fn start(raw: *anyopaque, stage: u16, generation: u64, parent: u64) void {
-                const stream: *@This() = @ptrCast(@alignCast(raw));
-                _ = parent;
-                stream.generation = generation;
-                stream.started = true;
-                for (stream.targets) |*target| {
-                    if (!target.subscriber.alive) continue;
-                    var bytes: [wire.prefix_size + wire.stage_batch_start_size]u8 = undefined;
-                    (wire.StageBatchStart{
-                        .stage = stage,
-                        .generation = generation,
-                        .parent = if (generation > 0) generation - 1 else 0,
-                        .started_ns = @intCast(@max(std.Io.Clock.real.now(stream.root.io).nanoseconds, 0)),
-                    }).write(&bytes);
-                    writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
-                        target.subscriber.alive = false;
-                    };
-                }
-            }
-
-            fn change(raw: *anyopaque, item: stage_mod.Change) void {
-                const stream: *@This() = @ptrCast(@alignCast(raw));
-                for (stream.targets) |*target| {
-                    if (!target.subscriber.alive or !target.subscriber.filter.matches(item.name)) continue;
-                    const frame = stream.root.allocator.alloc(u8, wire.prefix_size + format.entry_size + item.name.len) catch return;
-                    defer stream.root.allocator.free(frame);
-                    wire.writeChangeEntryAs(frame, .stage_change_entry, item.entry, item.name);
-                    writeAll(stream.root.io, target.subscriber.stream, frame) catch {
-                        target.subscriber.alive = false;
-                        continue;
-                    };
-                    switch (item.kind) {
-                        .added => target.added += 1,
-                        .changed => target.changed += 1,
-                        .deleted => target.deleted += 1,
-                    }
-                }
-            }
-
-            fn finish(raw: *anyopaque, stage: u16, generation: u64, added: u64, changed: u64, deleted: u64, ok: bool) void {
-                _ = added;
-                _ = changed;
-                _ = deleted;
-                const stream: *@This() = @ptrCast(@alignCast(raw));
-                stream.finishWith(stage, generation, ok);
-            }
-
-            fn finishWith(stream: *@This(), stage: u16, generation: u64, ok: bool) void {
-                if (!stream.started or stream.finished) return;
-                stream.finished = true;
-                for (stream.targets) |*target| {
-                    if (!target.subscriber.alive) continue;
-                    if (ok) target.subscriber.from_stage_batch = generation;
-                    var bytes: [wire.prefix_size + wire.stage_batch_end_size]u8 = undefined;
-                    (wire.StageBatchEnd{
-                        .stage = stage,
-                        .generation = generation,
-                        .added = target.added,
-                        .changed = target.changed,
-                        .deleted = target.deleted,
-                        .status = if (ok) .ok else .failed,
-                    }).write(&bytes);
-                    writeAll(stream.root.io, target.subscriber.stream, &bytes) catch {
-                        target.subscriber.alive = false;
-                    };
-                }
-                stream.root.dropDeadLocked();
-            }
-        };
-
-        var targets: std.ArrayListUnmanaged(Target) = .empty;
+        var targets: std.ArrayListUnmanaged(StageTarget) = .empty;
         defer targets.deinit(arena);
         for (self.subscribers.items) |subscriber| {
             if (subscriber.alive and subscriber.stage == consumer_stage) {
@@ -2218,16 +2291,16 @@ pub const RootRuntime = struct {
             }
         }
 
-        var stream_ctx = StageStream{
+        var stream_ctx = StageBatchStream{
             .root = self,
             .producer_stage = producer_stage,
             .targets = targets.items,
         };
         const stream: ?stage_mod.Stream = if (targets.items.len > 0) .{
             .ctx = &stream_ctx,
-            .on_start = StageStream.start,
-            .on_change = StageStream.change,
-            .on_finish = StageStream.finish,
+            .on_start = StageBatchStream.start,
+            .on_change = StageBatchStream.change,
+            .on_finish = StageBatchStream.finish,
         } else null;
 
         var stamp_buffer: [32]u8 = undefined;
@@ -2255,6 +2328,255 @@ pub const RootRuntime = struct {
         }
         // The stage batch is now visible; a later stage with no builders may be due a scan against it.
         self.scanStagesWithoutBuildersLocked(arena);
+    }
+
+    /// Register an app batch (`APP_BATCH_START`). The stage must already be declared in `build.json`: a root with
+    /// no staged build has no stage state for the batch to land in, so this addon stays inert for it.
+    fn startAppBatchLocked(self: *RootRuntime, subscriber: *Subscriber, started: wire.AppBatchStart, now_ms: i64) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const declaration = build_config.load(arena_state.allocator(), self.io, self.record.root) catch |err| {
+            server.refuse(self.io, subscriber.stream, .protocol, "build.json is not usable ({s})", .{@errorName(err)});
+            return error.Refused;
+        };
+        _ = declaration.find(started.stage) orelse {
+            server.refuse(self.io, subscriber.stream, .protocol, "APP_BATCH_START stage {d} is not declared in build.json", .{started.stage});
+            return error.Refused;
+        };
+        for (self.app_batches.items) |batch| {
+            if (batch.owner == subscriber and batch.id == started.batch_id) {
+                server.refuse(self.io, subscriber.stream, .protocol, "APP_BATCH_START names an open batch {d}", .{started.batch_id});
+                return error.Refused;
+            }
+        }
+        if (self.app_batches.items.len >= max_app_batches) {
+            server.refuse(self.io, subscriber.stream, .protocol, "too many open app batches (limit {d})", .{max_app_batches});
+            return error.Refused;
+        }
+        try self.app_batches.append(self.allocator, .{
+            .owner = subscriber,
+            .id = started.batch_id,
+            .stage = started.stage,
+            .started_ms = now_ms,
+            .last_ms = now_ms,
+        });
+        self.log("app batch {d}: stage {d} started", .{ started.batch_id, started.stage });
+    }
+
+    /// Buffer one file an app says it generated (`APP_BATCH_FILE`). Nothing is read yet: the batch is a unit, and
+    /// `APP_BATCH_END` is when the daemon hashes the set and publishes it.
+    fn appendAppFileLocked(self: *RootRuntime, subscriber: *Subscriber, file: wire.AppBatchFile, now_ms: i64) !void {
+        const batch = self.findAppBatchLocked(subscriber, file.batch_id) orelse {
+            server.refuse(self.io, subscriber.stream, .protocol, "APP_BATCH_FILE names unknown batch {d}", .{file.batch_id});
+            return error.Refused;
+        };
+        if (!format.nameValid(file.name) or std.fs.path.isAbsolute(file.name) or appPathReserved(file.name)) {
+            server.refuse(self.io, subscriber.stream, .protocol, "APP_BATCH_FILE path is not a workspace name", .{});
+            return error.Refused;
+        }
+        if (batch.files.items.len >= max_app_batch_files) {
+            server.refuse(self.io, subscriber.stream, .protocol, "app batch {d} names more than {d} files", .{ file.batch_id, max_app_batch_files });
+            return error.Refused;
+        }
+        if (batch.name_bytes + file.name.len > max_app_batch_name_bytes) {
+            server.refuse(self.io, subscriber.stream, .protocol, "app batch {d} buffers more than {d} name bytes", .{ file.batch_id, max_app_batch_name_bytes });
+            return error.Refused;
+        }
+        // A repeated name is the last word: a compiler may rewrite a class within one batch.
+        for (batch.files.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, file.name)) {
+                existing.delete = file.change == .delete;
+                batch.last_ms = now_ms;
+                return;
+            }
+        }
+        const name = try self.allocator.dupe(u8, file.name);
+        errdefer self.allocator.free(name);
+        try batch.files.append(self.allocator, .{ .name = name, .delete = file.change == .delete });
+        batch.name_bytes += name.len;
+        batch.last_ms = now_ms;
+    }
+
+    fn findAppBatchLocked(self: *RootRuntime, owner: *Subscriber, id: u64) ?*AppBatch {
+        for (self.app_batches.items) |*batch| {
+            if (batch.owner == owner and batch.id == id) return batch;
+        }
+        return null;
+    }
+
+    /// Close an app batch (`APP_BATCH_END`). A failed or cancelled batch is discarded; an empty ok batch is a
+    /// boundary-only round and falls back to the ordinary folder scan, so an app that cannot name its outputs (a
+    /// script writing a folder) still gets the existing behavior.
+    fn finishAppBatchLocked(self: *RootRuntime, arena: std.mem.Allocator, subscriber: *Subscriber, end: wire.AppBatchEnd, now_ms: i64) !void {
+        _ = now_ms;
+        var index: usize = 0;
+        var found = false;
+        while (index < self.app_batches.items.len) : (index += 1) {
+            const batch = &self.app_batches.items[index];
+            if (batch.owner == subscriber and batch.id == end.batch_id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            server.refuse(self.io, subscriber.stream, .protocol, "APP_BATCH_END names unknown batch {d}", .{end.batch_id});
+            return error.Refused;
+        }
+        var batch = self.app_batches.orderedRemove(index);
+        defer batch.deinit(self.allocator);
+
+        if (end.status != .ok) {
+            self.log("app batch {d}: stage {d} {s}; {d} file(s) discarded", .{ batch.id, batch.stage, @tagName(end.status), batch.files.items.len });
+            return;
+        }
+        if (batch.files.items.len == 0) {
+            // No file list: the batch is a boundary. The stage scan is the existing producer, so a script that
+            // wrote the whole folder behaves exactly as it did before this feature.
+            self.scanStageAfterBuildLocked(arena, batch.stage);
+            return;
+        }
+        try self.ingestAppBatchLocked(arena, &batch);
+    }
+
+    /// Apply one app batch to its stage: validate the names against `build.json`, hash the files, and publish the
+    /// stage batch to the next stage. This is the one path that lets a compiler report its own output instead of
+    /// waiting for a folder scan.
+    fn ingestAppBatchLocked(self: *RootRuntime, arena: std.mem.Allocator, batch: *const AppBatch) !void {
+        const scan_started = nowMs(self.io);
+        const declaration = build_config.load(arena, self.io, self.record.root) catch |err| {
+            self.app_batch_failures += 1;
+            self.last_stage_error = @errorName(err);
+            self.log("app batch {d}: build.json is not usable ({s})", .{ batch.id, @errorName(err) });
+            return;
+        };
+        _ = declaration.find(batch.stage) orelse {
+            self.app_batch_failures += 1;
+            self.log("app batch {d}: stage {d} is no longer declared", .{ batch.id, batch.stage });
+            return;
+        };
+        const consumer_stage = batch.stage + 1;
+
+        var changes: std.ArrayListUnmanaged(stage_mod.IngestChange) = .empty;
+        defer changes.deinit(arena);
+        for (batch.files.items) |file| {
+            changes.append(arena, .{
+                .name = file.name,
+                .kind = if (file.delete) .delete else .upsert,
+            }) catch {
+                self.app_batch_failures += 1;
+                return;
+            };
+        }
+
+        var targets: std.ArrayListUnmanaged(StageTarget) = .empty;
+        defer targets.deinit(arena);
+        for (self.subscribers.items) |subscriber| {
+            if (subscriber.alive and subscriber.stage == consumer_stage) {
+                targets.append(arena, .{ .subscriber = subscriber }) catch return;
+            }
+        }
+        var stream_ctx = StageBatchStream{
+            .root = self,
+            .producer_stage = batch.stage,
+            .targets = targets.items,
+        };
+        const stream: ?stage_mod.Stream = if (targets.items.len > 0) .{
+            .ctx = &stream_ctx,
+            .on_start = StageBatchStream.start,
+            .on_change = StageBatchStream.change,
+            .on_finish = StageBatchStream.finish,
+        } else null;
+
+        var stamp_buffer: [32]u8 = undefined;
+        const options = stage_mod.Options{
+            .write = true,
+            .updated = rfc3339Utc(nowMs(self.io), &stamp_buffer),
+            .stream = stream,
+        };
+        const outcome = stage_mod.ingest(arena, self.io, self.record.root, declaration, batch.stage, changes.items, options) catch |err| switch (err) {
+            // The stage state is the baseline the batch is applied to. Missing (first build, deleted cache, or a
+            // changed `configHash`) is not an app error: cold-scan once, which learns the folder, then retry.
+            error.NoStageState => blk: {
+                self.scanStageAfterBuildLocked(arena, batch.stage);
+                const reloaded = build_config.load(arena, self.io, self.record.root) catch |load_err| {
+                    self.app_batch_failures += 1;
+                    self.last_stage_error = @errorName(load_err);
+                    stream_ctx.finishWith(batch.stage, stream_ctx.generation, false);
+                    return;
+                };
+                break :blk stage_mod.ingest(arena, self.io, self.record.root, reloaded, batch.stage, changes.items, options) catch |retry_err| {
+                    stream_ctx.finishWith(batch.stage, stream_ctx.generation, false);
+                    self.app_batch_failures += 1;
+                    self.last_stage_error = @errorName(retry_err);
+                    self.log("app batch {d}: stage {d} ingest failed after cold scan ({s})", .{ batch.id, batch.stage, @errorName(retry_err) });
+                    return;
+                };
+            },
+            error.StageFileOutside, error.InvalidName => {
+                stream_ctx.finishWith(batch.stage, stream_ctx.generation, false);
+                self.app_batch_failures += 1;
+                self.last_stage_error = @errorName(err);
+                server.refuse(self.io, batch.owner.stream, .protocol, "app batch {d} names a path outside stage {d}'s declared folders", .{ batch.id, batch.stage });
+                return error.Refused;
+            },
+            else => {
+                stream_ctx.finishWith(batch.stage, stream_ctx.generation, false);
+                self.app_batch_failures += 1;
+                self.last_stage_error = @errorName(err);
+                self.last_stage_scan_ms = scan_started;
+                self.last_stage_scan_duration_ms = nowMs(self.io) - scan_started;
+                self.log("app batch {d}: stage {d} ingest failed ({s})", .{ batch.id, batch.stage, @errorName(err) });
+                return;
+            },
+        };
+
+        self.last_stage_scan_ms = scan_started;
+        self.last_stage_scan_duration_ms = nowMs(self.io) - scan_started;
+        self.last_stage_error = "";
+        if (outcome.published) {
+            self.stage_batches += 1;
+            self.app_batches_published += 1;
+        }
+        self.log("app batch {d}: stage {d} generation {d}, {d} change(s), {d} tracked", .{
+            batch.id, batch.stage, outcome.generation, outcome.added + outcome.changed + outcome.deleted, outcome.tracked,
+        });
+        // The app named its outputs, so the no-builder folder scan is not needed for this round: mark the stage as
+        // scanned through the current release so the next tick does not walk the folder again for the same round.
+        self.undeclared_stage_scanned[batch.stage] = self.releasedThroughLocked(batch.stage);
+    }
+
+    /// Drop every open batch owned by a connection that is leaving. A crashed compiler's buffer must not linger.
+    fn dropAppBatchesLocked(self: *RootRuntime, owner: *Subscriber) void {
+        var index: usize = 0;
+        while (index < self.app_batches.items.len) {
+            if (self.app_batches.items[index].owner != owner) {
+                index += 1;
+                continue;
+            }
+            var batch = self.app_batches.orderedRemove(index);
+            self.log("app batch {d}: discarded because its connection left", .{batch.id});
+            batch.deinit(self.allocator);
+        }
+    }
+
+    /// A batch that stays open past `app_batch_timeout_ms` is dropped. The app is gone or hung; holding memory for
+    /// it is not a feature.
+    fn checkAppBatchTimeoutsLocked(self: *RootRuntime, now_ms: i64) void {
+        if (self.app_batch_timeout_ms <= 0) return;
+        var index: usize = 0;
+        while (index < self.app_batches.items.len) {
+            const batch = &self.app_batches.items[index];
+            const since = if (batch.last_ms > 0) batch.last_ms else batch.started_ms;
+            if (since == 0 or now_ms < since or now_ms - since < self.app_batch_timeout_ms) {
+                index += 1;
+                continue;
+            }
+            var timed = self.app_batches.orderedRemove(index);
+            self.app_batch_timeouts += 1;
+            self.app_batch_failures += 1;
+            self.log("app batch {d}: timed out after {d} ms; {d} file(s) discarded", .{ timed.id, self.app_batch_timeout_ms, timed.files.items.len });
+            timed.deinit(self.allocator);
+        }
     }
 
     /// Send one batch as `START_BATCH` … `END_BATCH`, applying the subscriber's filter. The replay
@@ -2398,6 +2720,9 @@ pub const RootRuntime = struct {
                 continue;
             }
             _ = self.subscribers.orderedRemove(index);
+            // The connection task may free this subscriber as soon as it returns; an app batch that still names
+            // it as its owner must not keep a pointer to that memory.
+            self.dropAppBatchesLocked(subscriber);
             if (subscriber.registered) {
                 subscriber.registered = false;
                 self.machine.unsubscribe(nowMs(self.io));
@@ -2692,6 +3017,56 @@ pub const RootRuntime = struct {
                     self.maybeScanStageAfterAckLocked(pump_arena_state.allocator(), subscriber.stage);
                     self.unlock();
                 },
+                .app_batch_start => {
+                    const started = wire.AppBatchStart.read(payload) catch {
+                        server.refuse(io, stream, .protocol, "malformed APP_BATCH_START", .{});
+                        break;
+                    };
+                    self.lock();
+                    if (!subscriber.alive) {
+                        self.unlock();
+                        break;
+                    }
+                    self.startAppBatchLocked(subscriber, started, nowMs(self.io)) catch {
+                        self.unlock();
+                        break;
+                    };
+                    self.unlock();
+                },
+                .app_batch_file => {
+                    const file = wire.AppBatchFile.read(payload) catch {
+                        server.refuse(io, stream, .protocol, "malformed APP_BATCH_FILE", .{});
+                        break;
+                    };
+                    self.lock();
+                    if (!subscriber.alive) {
+                        self.unlock();
+                        break;
+                    }
+                    self.appendAppFileLocked(subscriber, file, nowMs(self.io)) catch {
+                        self.unlock();
+                        break;
+                    };
+                    self.unlock();
+                },
+                .app_batch_end => {
+                    const end = wire.AppBatchEnd.read(payload) catch {
+                        server.refuse(io, stream, .protocol, "malformed APP_BATCH_END", .{});
+                        break;
+                    };
+                    self.lock();
+                    if (!subscriber.alive) {
+                        self.unlock();
+                        break;
+                    }
+                    // The ingest reads and hashes files and may stream a stage batch, so its frames and names get
+                    // their own arena rather than the daemon's long-lived one.
+                    var app_arena_state = std.heap.ArenaAllocator.init(self.allocator);
+                    defer app_arena_state.deinit();
+                    const finished = self.finishAppBatchLocked(app_arena_state.allocator(), subscriber, end, nowMs(self.io));
+                    self.unlock();
+                    finished catch break;
+                },
                 else => break,
             }
         }
@@ -2709,6 +3084,8 @@ pub const RootRuntime = struct {
                 break;
             }
         }
+        // A compiler that left must not leave buffered file names behind.
+        self.dropAppBatchesLocked(subscriber);
         self.machine.unsubscribe(nowMs(self.io));
         // A builder that leaves is no longer a barrier: the stage after it may run. Pump before the early return
         // for an `off` root, because the socket and its subscribers still exist there.
@@ -2788,6 +3165,16 @@ fn openMetaDir(io: std.Io, root: []const u8, allocator: std.mem.Allocator) !std.
 /// itself forever. `.git` is not part of what a trio describes (`FORMAT.md` § 16), so a ref update is not a
 /// reason to scan. The check is per path *segment*, because nightwatch delivers absolute paths and a directory
 /// named `a.git` is a directory like any other.
+/// A path segment an app batch may not name: the daemon's own metadata and git's store are host state, never
+/// build output. The name-shape check is `format.nameValid`; this is the extra reserved-name rule.
+fn appPathReserved(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, ".git") or std.mem.eql(u8, segment, ".fs-meta")) return true;
+    }
+    return false;
+}
+
 fn isIgnoredPath(path: []const u8) bool {
     var segments = std.mem.tokenizeAny(u8, path, "/\\");
     while (segments.next()) |segment| {
@@ -3052,6 +3439,7 @@ fn testStreamRuntime(
         .root_path = root,
         .machine = state.Machine.init(.off, 0),
         .git_registry = git_registry,
+        .pass_arena = std.heap.ArenaAllocator.init(allocator),
     };
 }
 
@@ -3559,6 +3947,141 @@ test "a stage is scanned only after every builder acknowledges, and a no-builder
     try testing.expectEqual(@as(u64, 2), runtime.undeclared_stage_scanned[0]);
     runtime.scanStagesWithoutBuildersLocked(arena);
     try testing.expectEqual(@as(u64, 2), runtime.undeclared_stage_scanned[0]);
+}
+
+test "app batches publish independently and a tracked output stays out of the stage state" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, ".fs-meta");
+    try tmp_root.dir.createDirPath(io, "build/classes");
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/A.class", .data = "AAA" });
+    try tmp_root.dir.writeFile(io, .{
+        .sub_path = ".fs-meta/build.json",
+        .data = "{\"version\":1,\"stages\":[{\"stage\":0,\"folders\":[\"build/classes\"]}]}",
+    });
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    defer runtime.app_batches.deinit(allocator);
+
+    // Establish the stage state before any app batch: `ingest` refuses without the baseline.
+    runtime.scanStageAfterBuildLocked(arena, 0);
+
+    var tmp_consumer = testing.tmpDir(.{});
+    defer tmp_consumer.cleanup();
+    var consumer_pair = try connectTestPair(io, arena, &tmp_consumer.sub_path);
+    defer closeTestPair(&consumer_pair, io);
+    var consumer = Subscriber{ .stream = consumer_pair.server_side, .from_batch = 0, .stage = 1, .from_stage_batch = 0 };
+    try runtime.subscribers.append(allocator, &consumer);
+    defer runtime.subscribers.deinit(allocator);
+
+    var tmp_app = testing.tmpDir(.{});
+    defer tmp_app.cleanup();
+    var app_pair = try connectTestPair(io, arena, &tmp_app.sub_path);
+    defer closeTestPair(&app_pair, io);
+    var app = Subscriber{ .stream = app_pair.server_side, .from_batch = 0, .stage = 0 };
+
+    // Two batches are open at once; ending the first must publish only its own file.
+    try runtime.startAppBatchLocked(&app, .{ .batch_id = 1, .stage = 0 }, 1_000);
+    try runtime.startAppBatchLocked(&app, .{ .batch_id = 2, .stage = 0 }, 1_001);
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/B.class", .data = "BBB" });
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/C.class", .data = "CCC" });
+    try runtime.appendAppFileLocked(&app, .{ .batch_id = 1, .change = .upsert, .name = "build/classes/B.class" }, 1_002);
+    try runtime.appendAppFileLocked(&app, .{ .batch_id = 2, .change = .upsert, .name = "build/classes/C.class" }, 1_003);
+    try runtime.finishAppBatchLocked(arena, &app, .{ .batch_id = 1 }, 1_004);
+
+    var consumer_buffer: [2048]u8 = undefined;
+    var reader = std.Io.net.Stream.Reader.init(consumer_pair.client, io, &consumer_buffer);
+    try testing.expectEqual(wire.Kind.stage_batch_start, (try readTestFrame(&reader.interface)).kind);
+    const first_change = try readTestFrame(&reader.interface);
+    try testing.expectEqual(wire.Kind.stage_change_entry, first_change.kind);
+    const first_name = first_change.payload[format.entry_size..][0..std.mem.readInt(u32, first_change.payload[40..44], .little)];
+    try testing.expectEqualStrings("build/classes/B.class", first_name);
+    const first_end = try readTestFrame(&reader.interface);
+    try testing.expectEqual(wire.Kind.stage_batch_end, first_end.kind);
+
+    // The second batch is still open and was not swept into the first commit; ending it now publishes C.
+    try runtime.finishAppBatchLocked(arena, &app, .{ .batch_id = 2 }, 1_005);
+    var second_buffer: [2048]u8 = undefined;
+    var second_reader = std.Io.net.Stream.Reader.init(consumer_pair.client, io, &second_buffer);
+    try testing.expectEqual(wire.Kind.stage_batch_start, (try readTestFrame(&second_reader.interface)).kind);
+    const second_change = try readTestFrame(&second_reader.interface);
+    const second_name = second_change.payload[format.entry_size..][0..std.mem.readInt(u32, second_change.payload[40..44], .little)];
+    try testing.expectEqualStrings("build/classes/C.class", second_name);
+    try testing.expectEqual(wire.Kind.stage_batch_end, (try readTestFrame(&second_reader.interface)).kind);
+
+    // A tracked docs file is reported in its own batch but never enters the stage state.
+    try tmp_root.dir.createDirPath(io, "docs");
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "docs/Guide.md", .data = "# generated snippet\n" });
+    try runtime.startAppBatchLocked(&app, .{ .batch_id = 3, .stage = 0 }, 1_006);
+    try runtime.appendAppFileLocked(&app, .{ .batch_id = 3, .change = .upsert, .name = "docs/Guide.md" }, 1_007);
+    try runtime.finishAppBatchLocked(arena, &app, .{ .batch_id = 3 }, 1_008);
+    var third_buffer: [2048]u8 = undefined;
+    var third_reader = std.Io.net.Stream.Reader.init(consumer_pair.client, io, &third_buffer);
+    try testing.expectEqual(wire.Kind.stage_batch_start, (try readTestFrame(&third_reader.interface)).kind);
+    const third_change = try readTestFrame(&third_reader.interface);
+    const third_name = third_change.payload[format.entry_size..][0..std.mem.readInt(u32, third_change.payload[40..44], .little)];
+    try testing.expectEqualStrings("docs/Guide.md", third_name);
+    try testing.expectEqual(wire.Kind.stage_batch_end, (try readTestFrame(&third_reader.interface)).kind);
+
+    const state_files = try tmp_root.dir.readFileAlloc(io, ".fs-meta/stages/00/files.txt", arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, state_files, "build/classes/B.class") != null);
+    try testing.expect(std.mem.indexOf(u8, state_files, "build/classes/C.class") != null);
+    try testing.expect(std.mem.indexOf(u8, state_files, "docs/Guide.md") == null);
+
+    // A failed batch publishes nothing and leaves the stage state alone.
+    const generation_before = runtime.stage_batches;
+    try tmp_root.dir.writeFile(io, .{ .sub_path = "build/classes/D.class", .data = "DDD" });
+    try runtime.startAppBatchLocked(&app, .{ .batch_id = 4, .stage = 0 }, 1_009);
+    try runtime.appendAppFileLocked(&app, .{ .batch_id = 4, .change = .upsert, .name = "build/classes/D.class" }, 1_010);
+    try runtime.finishAppBatchLocked(arena, &app, .{ .batch_id = 4, .status = .failed }, 1_011);
+    try testing.expectEqual(generation_before, runtime.stage_batches);
+    const state_after = try tmp_root.dir.readFileAlloc(io, ".fs-meta/stages/00/files.txt", arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, state_after, "build/classes/D.class") == null);
+}
+
+test "a repeated pass reuses the retained pass arena instead of allocating a new one" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_root = testing.tmpDir(.{});
+    defer tmp_root.cleanup();
+    try tmp_root.dir.createDirPath(io, "src");
+    for (0..50) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "src/f{d}.txt", .{index}) catch unreachable;
+        try tmp_root.dir.writeFile(io, .{ .sub_path = name, .data = "content\n" });
+    }
+    const relative_root = try std.fs.path.join(arena, &.{ ".zig-cache/tmp", &tmp_root.sub_path });
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, arena);
+
+    var git_registry = gitwatch.Registry.initCounting(io, allocator);
+    defer git_registry.deinit();
+    var runtime = testStreamRuntime(io, allocator, arena, root, &git_registry);
+    // The runtime is stack-allocated in these tests, so the retained arena is released by hand.
+    defer runtime.pass_arena.deinit();
+    defer runtime.app_batches.deinit(allocator);
+
+    _ = runtime.runPassLocked(1_000, .event);
+    const first_capacity = runtime.pass_arena.queryCapacity();
+    try testing.expect(first_capacity > 0);
+
+    _ = runtime.runPassLocked(2_000, .event);
+    const second_capacity = runtime.pass_arena.queryCapacity();
+    // The second pass resets the arena and keeps its chunks; it must not add a second tree-sized allocation.
+    try testing.expect(second_capacity <= first_capacity);
 }
 
 test "a builder that starts and never acknowledges times out and releases its successor" {

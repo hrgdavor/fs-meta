@@ -73,6 +73,15 @@ This is the intended deployment, not an implementation detail:
   `root status` reports the blocked stage and stage counters, and a builder with unacknowledged work has a timeout.
   The JS client exports the stage frame helpers (`subscribeV3Payload`, `buildStartedPayload`, `buildDonePayload`,
   `parseStageBatchStart`, `parseStageBatchEnd`).
+- **A builder can publish its own batch.** `APP_BATCH_START`/`APP_BATCH_FILE`/`APP_BATCH_END` let a compiler,
+  packager or docs generator send the files it wrote on the socket it already holds, several batches at once. The
+  frame's stage is the stage the batch **produces**, so a compiler can read stage 0 and publish stage 1; the daemon
+  stats and hashes each named file and sends one stage batch to the next stage. A file below the stage's declared
+  folders joins the stage state; a regular tracked file elsewhere (a Markdown doc rewritten in place by a snippet
+  injector) is reported to the next stage but stays in the root trio, never in the stage state. App batches are
+  independent of the `BUILD_DONE` barrier, are bounded and time out, and are refused on a root with no
+  `build.json`. `FORMAT.socket.md` § APP_BATCHES is the contract; the JS client has `startAppBatch`/
+  `appBatchFile`/`endAppBatch`, the Java client `sendAppBatchStart`/`sendAppBatchFile`/`sendAppBatchEnd`.
 - **The Java, Bun and Node ports are clients/readers, never daemons.** They validate and decode the trio and can
   speak the socket protocol. They do not run a second watch loop in-process and do not start a daemon; that would
   duplicate the engine and defeat the point. The Java port's writer exists for repair/tests, not as a production
@@ -260,6 +269,16 @@ for await (const event of client.events) {
 `StageClient.connect` uses `SUBSCRIBE_V3`; pass `fromStageBatch: null` to use `SUBSCRIBE_V2`. The Java client has
 the same pair as `connect(...)` and `connectV2(...)`. `subscribeV2Payload`/`subscribeV3Payload` and the
 `STAGE_*` payload parsers are exported for clients that bring their own socket loop.
+
+```js
+// A compiler that consumes stage 0 and publishes its class output as stage 1, one batch per source file
+const compiler = await StageClient.connect(socket, { stage: 0, builder: true, fromBatch: 5n });
+compiler.startAppBatch(1n, 1, 0n);              // batch id, produced stage, started_ns
+compiler.appBatchFile(1n, 'build/classes/A.class');
+compiler.appBatchFile(1n, 'build/classes/A$Inner.class');
+compiler.endAppBatch(1n, 'ok');                // the daemon hashes both and sends the stage-1 batch
+compiler.sendBuildDone(5n, 0);                 // the barrier is still acknowledged separately
+```
 
 `namesForRoot` reads the root's trio as the baseline at generation `g` (when the reader is available) and asks the
 daemon for only the batches after `g`, so the answer stays complete after batch retention has pruned generation 1 and

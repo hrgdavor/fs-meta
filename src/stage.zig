@@ -38,6 +38,9 @@ pub const Outcome = struct {
     added: u64 = 0,
     changed: u64 = 0,
     deleted: u64 = 0,
+    /// Entries that name a tracked workspace file rather than a stage-owned artifact. They are reported in the
+    /// stage batch and never enter the stage state, because the root trio already owns that name.
+    tracked: u64 = 0,
     /// The exact change set, for `stage scan --json` and for a future streamed stage batch.
     plan: ?batch_mod.Plan = null,
     /// A cold scan: there was no usable previous state, or its `configHash`/root identity did not match.
@@ -52,6 +55,15 @@ const Previous = struct {
 };
 
 pub const ChangeKind = enum { added, changed, deleted };
+
+/// What an app says it did to one path when it closes a build batch (`APP_BATCH_FILE`). The app names the files;
+/// the daemon reads and hashes them, so the stage state sees settled files rather than watcher events.
+pub const IngestKind = enum { upsert, delete };
+
+pub const IngestChange = struct {
+    name: []const u8,
+    kind: IngestKind,
+};
 
 /// One change as the scanner settles it. The entry carries the change bit, so a stream writer can hand it to
 /// `wire.writeChangeEntryAs` unchanged.
@@ -148,19 +160,54 @@ pub fn refresh(
     }
 
     const generation = if (previous) |state| state.generation + 1 else 1;
-    var hash_hex: [16]u8 = undefined;
-    const config_hash = format.hex(stage.config_hash, &hash_hex);
     var created = options.updated;
     if (previous) |state| created = state.created;
 
     const dir = state_dir orelse return outcome;
-    const written = try publish_mod.publish(arena, io, dir, &cache, .{
+    try writeStageState(arena, io, dir, &stage, &cache, owned_plan, .{
         .generation = generation,
-        .normalize = @tagName(stage.hash_mode),
-        .root_dev = identity.hi,
-        .root_ino = identity.lo,
         .created = created,
         .updated = options.updated,
+        .identity = identity,
+    });
+
+    outcome.generation = generation;
+    outcome.published = true;
+    if (scanned.started) {
+        if (options.stream) |stream| {
+            if (stream.on_finish) |finish| finish(stream.ctx, stage.number, generation, outcome.added, outcome.changed, outcome.deleted, true);
+        }
+    }
+    return outcome;
+}
+
+/// The state write shared by a folder scan and an app batch: the trio first, then the archive batch when the plan
+/// names a change. Keeping one writer is what makes `stage scan` and `APP_BATCH_END` produce the same state.
+const StateWrite = struct {
+    generation: u64,
+    created: []const u8,
+    updated: []const u8,
+    identity: scan.FileId,
+};
+
+fn writeStageState(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    stage: *const build_config.Stage,
+    cache: *const cache_mod.Cache,
+    plan: batch_mod.Plan,
+    request: StateWrite,
+) !void {
+    var hash_hex: [16]u8 = undefined;
+    const config_hash = format.hex(stage.config_hash, &hash_hex);
+    _ = try publish_mod.publish(arena, io, dir, cache, .{
+        .generation = request.generation,
+        .normalize = @tagName(stage.hash_mode),
+        .root_dev = request.identity.hi,
+        .root_ino = request.identity.lo,
+        .created = request.created,
+        .updated = request.updated,
         .writer = "fs-meta/stage/1",
         .scan = .{
             .hash_mode = @tagName(stage.hash_mode),
@@ -176,29 +223,325 @@ pub fn refresh(
             .config_hash = config_hash,
         },
     });
-    _ = written;
 
-    if (owned_plan.entries.len > 0) {
-        try batch_mod.write(arena, io, dir, owned_plan, .{
-            .generation = generation,
-            .parent = generation - 1,
+    if (plan.entries.len > 0) {
+        try batch_mod.write(arena, io, dir, plan, .{
+            .generation = request.generation,
+            .parent = request.generation - 1,
             .normalize = @tagName(stage.hash_mode),
-            .root_dev = identity.hi,
-            .root_ino = identity.lo,
-            .created = created,
-            .updated = options.updated,
+            .root_dev = request.identity.hi,
+            .root_ino = request.identity.lo,
+            .created = request.created,
+            .updated = request.updated,
             .writer = "fs-meta/stage/1",
         });
     }
+}
+
+/// Ingest the files an app named in a build batch (`FORMAT.socket.md` § APP_BATCHES). The app has already written
+/// them and closed them; this pass stats and hashes exactly those paths, merges them into the stage state, and
+/// publishes one stage generation. It never walks a folder, so several concurrent app batches cannot see each
+/// other's files: a batch names a set, and that set is the change.
+///
+/// A stage with no state is `error.NoStageState`: the caller first runs a cold `refresh`, which is the only way to
+/// learn what the folder already held. A file that moves while it is hashed is `error.UnstableFile`; the caller
+/// reports the batch as failed rather than publishing half of it.
+pub fn ingest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    declaration: build_config.Config,
+    stage_number: u16,
+    changes: []const IngestChange,
+    options: Options,
+) !Outcome {
+    const stage = declaration.find(stage_number) orelse return error.StageNotDeclared;
+
+    // A batch is one unit: validate every name before touching any file or the state. A name inside this stage's
+    // declared folders is a stage-owned artifact; any other workspace name is a **tracked** output (the docs
+    // snippet case), reported to the next stage but left to the root trio. Another stage's folder is an error.
+    for (changes) |change| {
+        if (!format.nameValid(change.name)) return error.InvalidName;
+        if (std.fs.path.isAbsolute(change.name)) return error.InvalidName;
+        if (reservedPath(change.name)) return error.InvalidName;
+        if (declaration.stageOf(change.name)) |owner| {
+            if (owner.number != stage.number) return error.StageFileOutside;
+        }
+    }
+
+    var outcome = Outcome{ .stage = stage.number };
+
+    var root_dir = try openRoot(io, root);
+    defer root_dir.close(io);
+    var meta = try safe_dir.openOrCreateDirectory(io, root_dir, format.directory_name, .{ .iterate = true });
+    defer meta.close(io);
+    var stages = try safe_dir.openOrCreateDirectory(io, meta, StateDir, .{ .iterate = true });
+    defer stages.close(io);
+    var stage_name_buffer: [2]u8 = undefined;
+    const stage_name = std.fmt.bufPrint(&stage_name_buffer, "{d:0>2}", .{stage.number}) catch unreachable;
+    var state_dir = try safe_dir.openOrCreateDirectory(io, stages, stage_name, .{ .iterate = true });
+    defer state_dir.close(io);
+
+    const identity = rootIdentity(arena, io, root);
+    var previous = (try loadPrevious(arena, io, state_dir, stage, identity)) orelse return error.NoStageState;
+    defer previous.cache.deinit();
+    outcome.generation = previous.generation;
+
+    // The state is a set of facts, so start from the previous generation and apply the batch on top. Unlisted
+    // entries keep their cached fingerprints: an app batch changes only what it names.
+    var by_name: std.StringArrayHashMapUnmanaged(scan.Fact) = .empty;
+    defer by_name.deinit(arena);
+    for (try cacheFacts(arena, &previous.cache)) |fact| try by_name.put(arena, fact.name, fact);
+
+    // Tracked entries are notifications, not stage state: `docs/Guide.md` is already in the root trio, so putting it
+    // in `.fs-meta/stages/<NN>/` would describe one tree twice. They still form one batch with the artifacts, so a
+    // consumer sees the build round as a whole.
+    var tracked_entries: std.ArrayListUnmanaged(format.Entry) = .empty;
+    defer tracked_entries.deinit(arena);
+    var tracked_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer tracked_names.deinit(arena);
+
+    for (changes) |change| {
+        const tracked = declaration.stageOf(change.name) == null;
+        if (tracked) {
+            const entry = switch (change.kind) {
+                .delete => trackedDeleteEntry(change.name),
+                .upsert => blk: {
+                    const fact = try factForPath(arena, io, root, change.name, stage.hash_mode);
+                    break :blk factEntry(fact, .changed);
+                },
+            };
+            try tracked_entries.append(arena, entry);
+            try tracked_names.append(arena, try arena.dupe(u8, change.name));
+            outcome.tracked += 1;
+            continue;
+        }
+        switch (change.kind) {
+            .delete => try removeFact(arena, &by_name, change.name),
+            .upsert => {
+                try ensureParentDirs(arena, io, root, &by_name, change.name);
+                const fact = try factForPath(arena, io, root, change.name, stage.hash_mode);
+                try by_name.put(arena, fact.name, fact);
+            },
+        }
+    }
+
+    const facts = by_name.values();
+    std.mem.sort(scan.Fact, facts, {}, factLessThan);
+    var cache = try cacheFromFacts(arena, facts, previous.generation);
+    defer cache.deinit();
+
+    const before = try cacheItems(arena, &previous.cache);
+    const after = try cacheItems(arena, &cache);
+    const stage_plan = try batch_mod.diff(arena, before, after);
+
+    // One batch, in report order for the tracked notifications and `(nameHash, name)` order for the stage diff.
+    var merged_entries: std.ArrayListUnmanaged(format.Entry) = .empty;
+    defer merged_entries.deinit(arena);
+    var merged_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer merged_names.deinit(arena);
+    try merged_entries.appendSlice(arena, tracked_entries.items);
+    try merged_names.appendSlice(arena, tracked_names.items);
+    try merged_entries.appendSlice(arena, stage_plan.entries);
+    try merged_names.appendSlice(arena, stage_plan.names);
+
+    const owned_names = try arena.alloc([]const u8, merged_names.items.len);
+    for (merged_names.items, 0..) |name, index| owned_names[index] = try arena.dupe(u8, name);
+    const owned_plan = batch_mod.Plan{
+        .entries = try arena.dupe(format.Entry, merged_entries.items),
+        .names = owned_names,
+    };
+    outcome.plan = owned_plan;
+    for (owned_plan.entries) |entry| switch (batch_mod.kindOf(entry) orelse continue) {
+        .added => outcome.added += 1,
+        .changed => outcome.changed += 1,
+        .deleted => outcome.deleted += 1,
+    };
+
+    // A batch that named only unchanged files (a touch, a rebuild that wrote the same bytes) publishes nothing
+    // and does not move the generation, exactly like a folder scan with no diff.
+    if (owned_plan.entries.len == 0) return outcome;
+    const generation = previous.generation + 1;
+
+    if (options.stream) |stream| {
+        if (stream.on_start) |start| start(stream.ctx, stage.number, generation, previous.generation);
+        if (stream.on_change) |change| {
+            for (owned_plan.entries, owned_plan.names) |entry, name| {
+                const kind = batch_mod.kindOf(entry) orelse continue;
+                const change_kind: ChangeKind = switch (kind) {
+                    .added => .added,
+                    .changed => .changed,
+                    .deleted => .deleted,
+                };
+                change(stream.ctx, .{ .kind = change_kind, .entry = entry, .name = name });
+            }
+        }
+    }
+
+    try writeStageState(arena, io, state_dir, &stage, &cache, owned_plan, .{
+        .generation = generation,
+        .created = previous.created,
+        .updated = options.updated,
+        .identity = identity,
+    });
 
     outcome.generation = generation;
     outcome.published = true;
-    if (scanned.started) {
-        if (options.stream) |stream| {
-            if (stream.on_finish) |finish| finish(stream.ctx, stage.number, generation, outcome.added, outcome.changed, outcome.deleted, true);
-        }
+    if (options.stream) |stream| {
+        if (stream.on_finish) |finish| finish(stream.ctx, stage.number, generation, outcome.added, outcome.changed, outcome.deleted, true);
     }
     return outcome;
+}
+
+/// A path segment the walker never lists, so a batch may not name it either: an app must not publish into the
+/// metadata directory or into git's store.
+fn reservedPath(name: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, name, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, ".git") or std.mem.eql(u8, segment, ".fs-meta")) return true;
+    }
+    return false;
+}
+
+/// A tracked deletion has no stage-state entry to borrow from: the root trio owns the name, so only its identity
+/// and the delete bit are known here.
+fn trackedDeleteEntry(name: []const u8) format.Entry {
+    return .{
+        .mtime_ns = 0,
+        .size_bytes = 0,
+        .content_hash = 0,
+        .name_hash = format.wyhash(name),
+        .name_offset = 0,
+        .name_length = 0,
+        .flags_word = format.flags.regular_file | 0x80,
+        .file_id_lo = 0,
+        .file_id_hi = 0,
+    };
+}
+
+/// Every entry of a loaded stage state as a scan fact, so `ingest` can apply a batch without walking a folder.
+fn cacheFacts(arena: std.mem.Allocator, cache: *const cache_mod.Cache) ![]scan.Fact {
+    var facts: std.ArrayListUnmanaged(scan.Fact) = .empty;
+    try facts.ensureTotalCapacity(arena, cache.files.count() + cache.dirs.count());
+    for (cache.files.keys()) |name| {
+        const state = cache.files.get(name).?;
+        facts.appendAssumeCapacity(.{
+            .name = name,
+            .kind = state.kind,
+            .mtime_ns = state.mtime_ns,
+            .size_bytes = state.size_bytes,
+            .content_hash = state.content_hash orelse 0,
+            .hash_lf = state.hash_lf,
+            .file_id_lo = state.file_id_lo,
+            .file_id_hi = state.file_id_hi,
+        });
+    }
+    for (cache.dirs.keys()) |name| {
+        if (name.len == 0) continue; // the root is bookkeeping, never a listed entry
+        const state = cache.dirs.get(name).?;
+        facts.appendAssumeCapacity(.{
+            .name = name,
+            .kind = .dir,
+            .mtime_ns = state.mtime_ns,
+            .size_bytes = 0,
+            .content_hash = 0,
+            .hash_lf = false,
+            .file_id_lo = state.file_id_lo,
+            .file_id_hi = state.file_id_hi,
+        });
+    }
+    return facts.toOwnedSlice(arena);
+}
+
+/// Remove one name from the pending set. A directory removes its subtree: a reported folder deletion is a delete
+/// of every name below it, exactly as a folder scan's surviving-set diff produces.
+fn removeFact(arena: std.mem.Allocator, map: *std.StringArrayHashMapUnmanaged(scan.Fact), name: []const u8) !void {
+    if (map.get(name)) |fact| {
+        if (fact.kind != .dir) {
+            _ = map.orderedRemove(name);
+            return;
+        }
+    }
+    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer doomed.deinit(arena);
+    for (map.keys()) |key| {
+        if (cache_mod.Cache.isUnder(key, name)) try doomed.append(arena, key);
+    }
+    for (doomed.items) |key| _ = map.orderedRemove(key);
+}
+
+/// Add the missing ancestors of `name` as directory facts. A generated file's new package folder is part of the
+/// stage state, so the state's direct-child lists stay consistent without a folder walk.
+fn ensureParentDirs(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    map: *std.StringArrayHashMapUnmanaged(scan.Fact),
+    name: []const u8,
+) !void {
+    var parent = cache_mod.Cache.parentOf(name);
+    while (parent.len > 0 and map.get(parent) == null) {
+        const full = try joinPath(arena, root, parent);
+        const stat = std.Io.Dir.cwd().statFile(io, full, .{ .follow_symlinks = false }) catch return error.MissingParent;
+        if (stat.kind != .directory) return error.MissingParent;
+        const fact = scan.Fact{
+            .name = try arena.dupe(u8, parent),
+            .kind = .dir,
+            .mtime_ns = mtimeNs(stat.mtime),
+            .size_bytes = 0,
+            .content_hash = 0,
+            .hash_lf = false,
+            .file_id_lo = 0,
+            .file_id_hi = 0,
+        };
+        try map.put(arena, fact.name, fact);
+        parent = cache_mod.Cache.parentOf(parent);
+    }
+}
+
+/// Stat and hash one path an app reported. The pre/post stat is the same stability rule the folder walker uses:
+/// a file that moved while it was hashed is not a settled artifact.
+fn factForPath(arena: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8, hash_mode: build_config.HashMode) !scan.Fact {
+    const full = try joinPath(arena, root, name);
+    const stat = try std.Io.Dir.cwd().statFile(io, full, .{ .follow_symlinks = false });
+    const kind: format.Kind = switch (stat.kind) {
+        .file => .regular_file,
+        .directory => .dir,
+        .sym_link => .symlink,
+        else => return error.UnsupportedKind,
+    };
+    var fact = scan.Fact{
+        .name = try arena.dupe(u8, name),
+        .kind = kind,
+        .mtime_ns = mtimeNs(stat.mtime),
+        .size_bytes = if (kind == .dir) 0 else stat.size,
+        .content_hash = 0,
+        .hash_lf = false,
+        .file_id_lo = 0,
+        .file_id_hi = 0,
+    };
+    if (kind == .regular_file) {
+        const hashed = try scan.hashFileAt(io, full, hash_mode);
+        fact.content_hash = hashed.hash;
+        fact.hash_lf = hashed.hash_lf;
+        const after = std.Io.Dir.cwd().statFile(io, full, .{ .follow_symlinks = false }) catch return error.UnstableFile;
+        if (after.size != stat.size or mtimeNs(after.mtime) != fact.mtime_ns) return error.UnstableFile;
+        const id = fileIdFor(arena, io, full);
+        fact.file_id_lo = id.lo;
+        fact.file_id_hi = id.hi;
+    }
+    return fact;
+}
+
+/// `{ dev, ino }` for one path, through its parent handle. Identity is a cache hint, so an unreadable path is
+/// `0, 0` rather than an error.
+fn fileIdFor(arena: std.mem.Allocator, io: std.Io, full: []const u8) scan.FileId {
+    const absolute = std.Io.Dir.cwd().realPathFileAlloc(io, full, arena) catch return .{ .lo = 0, .hi = 0 };
+    const parent_path = std.fs.path.dirname(absolute) orelse return .{ .lo = 0, .hi = 0 };
+    const base = std.fs.path.basename(absolute);
+    var parent = std.Io.Dir.openDirAbsolute(io, parent_path, .{}) catch return .{ .lo = 0, .hi = 0 };
+    defer parent.close(io);
+    return scan.fileIdAt(parent, io, base);
 }
 
 /// The stage batch archive, shaped like `server.BatchWindow` so the same loader fits.
@@ -936,6 +1279,126 @@ test "a stage stream emits entries before the state is committed" {
     try testing.expect(probe.saw_before_state);
     try testing.expect(probe.finished);
     try testing.expect(probe.finished_with_state);
+}
+
+test "an app batch ingests exactly the files it names and never scans the folder" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, io, "build/classes/A.class", "AAA");
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    try writeTestFile(tmp.dir, io, ".fs-meta/build.json",
+        \\{"version":1,"stages":[{"stage":0,"folders":["build/classes"]}]}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try testRoot(arena, &tmp);
+    const declaration = try build_config.load(arena, io, root);
+    const first = try refresh(arena, io, root, declaration, 0, .{ .updated = "2026-11-20T00:00:00Z" });
+    try testing.expectEqual(@as(u64, 1), first.generation);
+
+    // Two files are named; the folder contains a third that the batch does not name, and it must stay untouched
+    // (the point of an app batch is that it is not a folder scan).
+    try writeTestFile(tmp.dir, io, "build/classes/A.class", "AAB");
+    try writeTestFile(tmp.dir, io, "build/classes/Inner.class", "INNER");
+    try writeTestFile(tmp.dir, io, "build/classes/Unreported.class", "UNREPORTED");
+    const second = try ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "build/classes/A.class", .kind = .upsert },
+        .{ .name = "build/classes/Inner.class", .kind = .upsert },
+    }, .{ .updated = "2026-11-20T00:00:01Z" });
+    try testing.expect(second.published);
+    try testing.expectEqual(@as(u64, 2), second.generation);
+    try testing.expectEqual(@as(u64, 1), second.changed);
+    try testing.expectEqual(@as(u64, 1), second.added);
+    const state_document = try tmp.dir.readFileAlloc(io, ".fs-meta/stages/00/files.txt", arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, state_document, "Unreported.class") == null);
+
+    // Writing the same bytes again is not a change, so the generation does not move.
+    const untouched = try ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "build/classes/A.class", .kind = .upsert },
+        .{ .name = "build/classes/Inner.class", .kind = .upsert },
+    }, .{ .updated = "2026-11-20T00:00:02Z" });
+    try testing.expect(!untouched.published);
+    try testing.expectEqual(@as(u64, 2), untouched.generation);
+
+    // A reported delete removes that name only.
+    try tmp.dir.deleteFile(io, "build/classes/Inner.class");
+    const deleted = try ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "build/classes/Inner.class", .kind = .delete },
+    }, .{ .updated = "2026-11-20T00:00:03Z" });
+    try testing.expect(deleted.published);
+    try testing.expectEqual(@as(u64, 3), deleted.generation);
+    try testing.expectEqual(@as(u64, 1), deleted.deleted);
+}
+
+test "an app batch outside its stage's folders, or without a stage state, is refused" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, io, "build/classes/A.class", "AAA");
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    try writeTestFile(tmp.dir, io, ".fs-meta/build.json",
+        \\{"version":1,"stages":[{"stage":0,"folders":["build/classes"]},{"stage":1,"folders":["dist"]}]}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try testRoot(arena, &tmp);
+    const declaration = try build_config.load(arena, io, root);
+
+    // No state yet: the caller must cold-scan first, because only a scan knows the folder's older files.
+    try testing.expectError(error.NoStageState, ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "build/classes/A.class", .kind = .upsert },
+    }, .{}));
+
+    _ = try refresh(arena, io, root, declaration, 0, .{ .updated = "2026-11-20T00:00:00Z" });
+    try testing.expectError(error.StageFileOutside, ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "dist/app.jar", .kind = .upsert },
+    }, .{}));
+    // A tracked name is legal, but it must exist when the batch closes (the app wrote it before END).
+    try testing.expectError(error.FileNotFound, ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "src/Main.java", .kind = .upsert },
+    }, .{}));
+    try testing.expectError(error.InvalidName, ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "build/classes/../escape.class", .kind = .upsert },
+    }, .{}));
+}
+
+test "a tracked app output is reported in the batch but never enters the stage state" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestFile(tmp.dir, io, "build/classes/A.class", "AAA");
+    try writeTestFile(tmp.dir, io, "docs/Guide.md", "old");
+    try tmp.dir.createDirPath(io, ".fs-meta");
+    try writeTestFile(tmp.dir, io, ".fs-meta/build.json",
+        \\{"version":1,"stages":[{"stage":0,"folders":["build/classes"]}]}
+    );
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try testRoot(arena, &tmp);
+    const declaration = try build_config.load(arena, io, root);
+    _ = try refresh(arena, io, root, declaration, 0, .{ .updated = "2026-11-20T00:00:00Z" });
+
+    // The docs file is a regular tracked file: the snippet injector writes it in place. The stage batch names it,
+    // so the next stage is notified, but the stage state must not describe a tree the root trio owns.
+    try writeTestFile(tmp.dir, io, "docs/Guide.md", "new snippet");
+    const outcome = try ingest(arena, io, root, declaration, 0, &.{
+        .{ .name = "docs/Guide.md", .kind = .upsert },
+    }, .{ .updated = "2026-11-20T00:00:01Z" });
+    try testing.expect(outcome.published);
+    try testing.expectEqual(@as(u64, 1), outcome.tracked);
+    try testing.expectEqual(@as(u64, 2), outcome.generation);
+    const plan = outcome.plan.?;
+    try testing.expectEqual(@as(usize, 1), plan.entries.len);
+    try testing.expectEqualStrings("docs/Guide.md", plan.names[0]);
+    const state_files = try tmp.dir.readFileAlloc(io, ".fs-meta/stages/00/files.txt", arena, std.Io.Limit.limited(1 << 20));
+    try testing.expect(std.mem.indexOf(u8, state_files, "docs/Guide.md") == null);
 }
 
 test "a stage diff reports changes without publishing" {

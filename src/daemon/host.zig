@@ -112,6 +112,8 @@ pub const Host = struct {
     /// `FSMETA_STAGE_TIMEOUT_MS`: a started builder that has not acknowledged for this long is failed. `0`
     /// disables the policy; an unparsable value leaves the per-root default.
     stage_timeout_ms: ?i64 = null,
+    /// `FSMETA_APP_BATCH_TIMEOUT_MS`: how long an app batch may stay open. `0` disables the policy.
+    app_batch_timeout_ms: ?i64 = null,
     /// Test-only (`FORMAT.daemon.md` § 8): `FSMETA_GIT_ARM=off` does not arm the metadata watcher, so the hook spool
     /// path (M5) can be exercised on its own. Not a user switch: the git dirs are still resolved, the latch still
     /// polls, and the spool is still read; only the metadata *watch* — and so the timeline only it can see — is off.
@@ -147,6 +149,12 @@ pub const Host = struct {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (std.fmt.parseInt(i64, trimmed, 10)) |ms| {
                 if (ms >= 0) self.stage_timeout_ms = ms;
+            } else |_| {}
+        }
+        if (options.env.get("FSMETA_APP_BATCH_TIMEOUT_MS")) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (std.fmt.parseInt(i64, trimmed, 10)) |ms| {
+                if (ms >= 0) self.app_batch_timeout_ms = ms;
             } else |_| {}
         }
         // A test guard, not a feature (`FORMAT.daemon.md` § 8): the hook path is proved on its own by taking the
@@ -288,6 +296,7 @@ pub const Host = struct {
         runtime.daemon_started_at_ms = self.started_at_ms;
         runtime.git_arm_enabled = !self.git_arm_disabled;
         if (self.stage_timeout_ms) |ms| runtime.stage_timeout_ms = ms;
+        if (self.app_batch_timeout_ms) |ms| runtime.app_batch_timeout_ms = ms;
 
         // The socket path is rewritten on every start: the runtime directory may have moved since the record
         // was written, and a stale path in the list would point at nothing.
@@ -581,7 +590,8 @@ pub const Host = struct {
             if (!registry.isValidTick(tick_ms)) {
                 const message = try std.fmt.allocPrint(
                     self.arena,
-                    "tick_ms must be between {d} and {d}", .{ registry.min_tick_ms, registry.max_tick_ms },
+                    "tick_ms must be between {d} and {d}",
+                    .{ registry.min_tick_ms, registry.max_tick_ms },
                 );
                 try refuse(writer, control.Exit.failure, message);
                 return;
@@ -740,6 +750,7 @@ pub const Host = struct {
         runtime.daemon_started_at_ms = self.started_at_ms;
         runtime.git_arm_enabled = !self.git_arm_disabled;
         if (self.stage_timeout_ms) |ms| runtime.stage_timeout_ms = ms;
+        if (self.app_batch_timeout_ms) |ms| runtime.app_batch_timeout_ms = ms;
         std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = try self.layout.rootLog(self.arena, record.id),
             .data = "",
@@ -987,7 +998,8 @@ pub const Host = struct {
             if (!registry.isValidTick(tick_ms)) {
                 const message = try std.fmt.allocPrint(
                     self.arena,
-                    "tick_ms must be between {d} and {d}", .{ registry.min_tick_ms, registry.max_tick_ms },
+                    "tick_ms must be between {d} and {d}",
+                    .{ registry.min_tick_ms, registry.max_tick_ms },
                 );
                 try refuse(writer, control.Exit.failure, message);
                 return;
@@ -1334,6 +1346,16 @@ pub fn writeSnapshot(writer: *std.Io.Writer, snapshot: root_mod.Snapshot) !void 
     try control.intField(writer, "last_stage_scan_ms", snapshot.last_stage_scan_ms);
     try control.intField(writer, "last_stage_scan_duration_ms", snapshot.last_stage_scan_duration_ms);
     try control.stringField(writer, "last_stage_error", snapshot.last_stage_error);
+    // App-published batches (`FORMAT.socket.md` § APP_BATCHES): open count, published/failed/timed-out counters,
+    // and the timeout. These are counts, never trio content.
+    try control.intField(writer, "app_batches", snapshot.app_batches);
+    try control.intField(writer, "app_batches_published", snapshot.app_batches_published);
+    try control.intField(writer, "app_batch_failures", snapshot.app_batch_failures);
+    try control.intField(writer, "app_batch_timeouts", snapshot.app_batch_timeouts);
+    try control.intField(writer, "app_batch_timeout_ms", snapshot.app_batch_timeout_ms);
+    // The retained pass arena's high-water mark: the steady-state scan memory of this root, and the number to
+    // watch for a regression in the per-pass allocation path.
+    try control.intField(writer, "pass_arena_bytes", snapshot.pass_arena_bytes);
     // The root's own switches, so a caller that is not this daemon (`fsmeta daemon hooks install`) can ask whether a
     // hook spool for it would ever be read (`plans/worktrees.md` § 5c).
     try control.boolField(writer, "gitwatch", snapshot.gitwatch);
@@ -1440,6 +1462,12 @@ fn sampleSnapshot() root_mod.Snapshot {
         .last_stage_scan_ms = 1_700_000_000_100,
         .last_stage_scan_duration_ms = 9,
         .last_stage_error = "",
+        .app_batches = 2,
+        .app_batches_published = 5,
+        .app_batch_failures = 1,
+        .app_batch_timeouts = 3,
+        .app_batch_timeout_ms = 120_000,
+        .pass_arena_bytes = 16 * 1024 * 1024,
         .last_error = "",
         .created_at = "2026-10-26T06:50:00Z",
     };
@@ -1484,6 +1512,13 @@ test "a snapshot reply is valid JSON with the documented field names" {
     try testing.expectEqual(@as(i64, 4), root.get("stage_blocked_generation").?.integer);
     try testing.expectEqual(@as(i64, 2), root.get("stage_builders").?.integer);
     try testing.expectEqual(@as(i64, 9), root.get("last_stage_scan_duration_ms").?.integer);
+    // App-published batches (§ APP_BATCHES) are counted in the same object; they are daemon state, not trio content.
+    try testing.expectEqual(@as(i64, 2), root.get("app_batches").?.integer);
+    try testing.expectEqual(@as(i64, 5), root.get("app_batches_published").?.integer);
+    try testing.expectEqual(@as(i64, 1), root.get("app_batch_failures").?.integer);
+    try testing.expectEqual(@as(i64, 3), root.get("app_batch_timeouts").?.integer);
+    try testing.expectEqual(@as(i64, 120_000), root.get("app_batch_timeout_ms").?.integer);
+    try testing.expectEqual(@as(i64, 16 * 1024 * 1024), root.get("pass_arena_bytes").?.integer);
     try testing.expect(std.mem.endsWith(u8, out.written(), "\n"));
 }
 

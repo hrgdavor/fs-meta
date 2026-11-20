@@ -78,6 +78,12 @@ therefore sees the whole previous list or the whole next one, never a half-writt
 few hundred roots, per-root files under `~/.config/fsmeta/roots/` are the documented alternative, read by one
 `readdir` (still not a search).
 
+**How a client resolves a path to a root** is a separate, client-side contract: ask the live daemon with
+`roots`, then read `roots.json`, then — offline only — walk up for `.fs-meta`; the deepest serving root wins,
+and a nested root is not in its parent's stream. It is [`doc/root-discovery.md`](doc/root-discovery.md); there
+is no `root.which` command, because the client needs the same rule against `roots.json` when no daemon runs.
+It is not a second registry and it does not change this list.
+
 ### 1c. `<id>` is derived, not random
 
 ```
@@ -196,6 +202,20 @@ Four rules, and each of them is a bug if it is not followed:
    watcher** — a change it found is a change the watcher missed. A pass on a 20 000-name tree is ~70 ms
    (`doc/benchmark.md`), so the net costs ~0.1% of a core, and only while a root is watching. The counters in § 4
    (`safety_passes` vs `event_passes`) say whether it has ever earned that.
+
+**The pass arena is retained, not re-created.** One pass over a developer tree allocates the whole cache, the facts
+and the plan — tens of megabytes on a few thousand files. The daemon resets **one** per-root arena after each pass
+(`ArenaAllocator.reset(.retain_capacity)`) instead of allocating a fresh arena and freeing it. A fresh arena per pass
+looked correct and leaked nothing at the API level: `deinit` freed every chunk. But "free" in the release allocator
+(`std.heap.smp_allocator`) is not "return to the OS": small blocks live in per-thread 64 KiB slabs and free lists,
+large chunks go through the page allocator, and a freed slab is reused only by the thread that freed it. A pass runs
+on the `std.Io` worker pool, so the next pass is not guaranteed to run on the same thread; its freed slabs are
+stranded in another thread's free list and the process's committed heap grows with every pass. A 5 000-file root
+watching for a few hours reached 9 GB of resident memory in the field. With the retained arena the allocator sees one
+allocation rather than one per pass, and the same root stays at its high-water mark (44 MB measured over 240 passes,
+including gitwatch). `pass_arena_bytes` in `root status` is that high-water mark, so a regression in the per-pass
+allocation path is visible instead of inferred from RSS. The arena is released with the root, never shared between
+roots, and always reset under the root's lock.
 
 The wake-scan cost (a full pass after a sleep) is measured in
 [`doc/benchmark.md`](doc/benchmark.md#the-wake-scan): on one host, with 20 001 files in 100 directories, a cold
@@ -871,8 +891,8 @@ so a slow stage-0 build never blocks the watcher thread.
 
 **A builder leaving releases the barrier.** `unregister` removes the subscriber and pumps before returning, so the
 next stage is not stranded by a crash. A `BUILD_DONE{status = failed}` does the same; the daemon logs the stage,
-the generation and the status. A builder that stays connected and never acknowledges holds its successor; this
-version deliberately has no timeout, because one a slow compiler trips over is worse than the log line.
+the generation and the status. A builder that stays connected and never acknowledges holds its successor until the
+timeout below releases it.
 
 **`fsmeta serve` does not implement the barrier.** It has no scheduler and no rounds, so it accepts only the
 original `SUBSCRIBE` ([`FORMAT.socket.md`](FORMAT.socket.md) § BUILD_STAGES). The daemon is the staged server.
@@ -904,9 +924,24 @@ document) and compares it with the previous digest. A change clears the undeclar
 pass (while `watching`), so the root walk's stage exclusions follow the new declaration. A same-size, same-mtime edit
 is therefore still noticed.
 
+**An app can publish its own batch.** `APP_BATCH_START`/`APP_BATCH_FILE`/`APP_BATCH_END`
+([`FORMAT.socket.md`](FORMAT.socket.md) § APP_BATCHES) are handled on the connection task under the root lock and
+buffered in `RootRuntime.app_batches` — no persisted file, like the barrier. `stage.ingest` applies a batch by
+statting and hashing exactly the named files, merging them into the stage state, and sending one stage batch; a name
+outside the produced stage's declared folders is a tracked output, reported to the next stage but left to the root
+trio. The daemon does not scan a folder for an app batch that names files, and an empty batch falls back to the
+ordinary stage scan. The addon is inert on a root with no `build.json` (the frame is refused) and never changes
+`SUBSCRIBE`, replay, the root trio or the barrier. Open batches are capped (`max_app_batches`), time out
+(`app_batch_timeout_ms`, default 120 s, `FSMETA_APP_BATCH_TIMEOUT_MS`, 0 disables) and are dropped with their
+connection; a failed ingest is logged and counted, never turned into a partial stage state.
+
 **`root status --json`** reports the stage state under the same snapshot object: `stage_batches`,
 `stage_scan_failures`, `stage_timeouts`, `stage_blocked` (`-1` when nothing waits), `stage_blocked_generation`,
-`stage_builders`, `stage_timeout_ms`, `last_stage_scan_ms`, `last_stage_scan_duration_ms` and `last_stage_error`.
+`stage_builders`, `stage_timeout_ms`, `last_stage_scan_ms`, `last_stage_scan_duration_ms`,
+`last_stage_error`, and the app-batch counters `app_batches` (open now), `app_batches_published`,
+`app_batch_failures`, `app_batch_timeouts` and `app_batch_timeout_ms`. `pass_arena_bytes` is the retained pass
+arena's high-water mark: the steady-state scan memory of that root, kept and reused instead of allocated and freed on
+every pass (see § 2b).
 
 ## 9. What is not implemented
 

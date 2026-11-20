@@ -30,7 +30,7 @@ import java.util.List;
 public final class FsMetaDaemonClient implements AutoCloseable {
 
     /** The fixed protocol major/minor this client speaks ({@code FORMAT.socket.md} § Versioning). */
-    public static final int PROTOCOL = 0x0105;
+    public static final int PROTOCOL = 0x0106;
     /** Subscribe after the daemon's current generation. */
     public static final long LATEST = -1;
     /** The largest stage number a {@code SUBSCRIBE_V2}/{@code SUBSCRIBE_V3} may name. */
@@ -240,6 +240,55 @@ public final class FsMetaDaemonClient implements AutoCloseable {
         payload.putLong(generation);
         payload.put((byte) status);
         writeFrame(channel, 0x0d, payload.array());
+    }
+
+    /** `APP_BATCH_FILE.change`: the file was written (the daemon hashes it). */
+    public static final int APP_CHANGE_UPSERT = 0;
+    /** `APP_BATCH_FILE.change`: the file was removed by the app. */
+    public static final int APP_CHANGE_DELETE = 1;
+
+    /** Open an app-published batch (`APP_BATCH_START`, protocol 0x0106).
+     *
+     * @param batchId the app's id; several batches may be open at once on one connection
+     * @param stage the stage this batch <em>produces</em>, not the stage this connection consumes
+     * @param startedNs the app's clock, diagnostics only
+     */
+    public void sendAppBatchStart(long batchId, int stage, long startedNs) throws IOException {
+        if (stage < 0 || stage > MAX_STAGE) throw new IllegalArgumentException("stage outside 0.." + MAX_STAGE);
+        ByteBuffer payload = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putLong(batchId);
+        payload.putShort((short) stage);
+        payload.putShort((short) 0);
+        payload.putLong(startedNs);
+        writeFrame(channel, 0x13, payload.array());
+    }
+
+    /** Name one file the app generated (or removed) in an open batch (`APP_BATCH_FILE`, protocol 0x0106). */
+    public void sendAppBatchFile(long batchId, String name, int change) throws IOException {
+        if (change != APP_CHANGE_UPSERT && change != APP_CHANGE_DELETE) {
+            throw new IllegalArgumentException("unknown app batch change " + change);
+        }
+        byte[] encoded = name.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length == 0 || encoded.length > 0xffff) {
+            throw new IllegalArgumentException("file name outside 1..65535 UTF-8 bytes");
+        }
+        ByteBuffer payload = ByteBuffer.allocate(11 + encoded.length).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putLong(batchId);
+        payload.put((byte) change);
+        payload.putShort((short) encoded.length);
+        payload.put(encoded);
+        writeFrame(channel, 0x14, payload.array());
+    }
+
+    /** Close an app batch (`APP_BATCH_END`, protocol 0x0106); a failed or cancelled batch is discarded. */
+    public void sendAppBatchEnd(long batchId, int status) throws IOException {
+        if (status != BUILD_OK && status != BUILD_FAILED && status != BUILD_CANCELLED) {
+            throw new IllegalArgumentException("unknown build status " + status);
+        }
+        ByteBuffer payload = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN);
+        payload.putLong(batchId);
+        payload.put((byte) status);
+        writeFrame(channel, 0x15, payload.array());
     }
 
     @Override

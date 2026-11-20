@@ -38,7 +38,7 @@ const KIND = {
   STAGE_BATCH_END: 0x11,
   SUBSCRIBE_V3: 0x12,
 };
-const PROTOCOL = 0x0105;
+const PROTOCOL = 0x0106;
 const ENTRY_SIZE = 64;
 const CHANGE_MASK = 0x20 | 0x40 | 0x80;
 

@@ -105,6 +105,16 @@ because "the daemon is Zig's job" is a stale client, not a compliant port.
   `SUBSCRIBE_V3`/`from_stage_batch`; the archived entries are hash-ordered, live stage entries observation-ordered.
   A builder timeout, the `stage_blocked`/counter fields in `root status`, and the `build.json` change poll are
   daemon state, never trio fields. A plain `SUBSCRIBE` must stay the stage-0, pass-all listener it is today.
+  An app-published batch (`APP_BATCH_*`) is a second producer of the same stage batch, not a third state: the daemon
+  hashes the files the app names, a stage-owned file joins `.fs-meta/stages/<NN>/`, and a tracked output stays in the
+  root trio and out of the stage state. App batches are refused on a root with no `build.json`; they never advance
+  the `BUILD_DONE` barrier.
+
+- **A pass reuses the root's retained scratch arena.** A scan over a few thousand files allocates tens of
+  megabytes; a fresh `ArenaAllocator` per pass looks leak-free at the API level but makes the process's committed
+  heap grow with every pass (observed: 9 GB after a few hours on a 5 000-file root). `RootRuntime.pass_arena` is
+  reset with `retain_capacity` under the root lock and reported as `pass_arena_bytes`; do not replace it with a
+  local per-pass arena, and do not share it between roots.
 
 - **A boundary is ignored, not scanned twice.** A directory whose `.git` entry confirms is another repository — a
   clone, a submodule checkout or a linked worktree — and the walk neither lists nor enters it. A served nested root is

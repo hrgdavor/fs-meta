@@ -32,6 +32,17 @@ zig-out/bin/fsmeta.exe root status a1b2c3d4 --json        # one root, in detail
 zig-out/bin/fsmeta.exe daemon stop
 ```
 
+On PowerShell, pass the resolved path rather than `.\`:
+
+```powershell
+fsmeta root add (Get-Location).Path
+```
+
+`Set-Location` changes PowerShell's location but not always the native process's working directory, so `root add .\`
+can be resolved against the directory the shell process started in and report that an unrelated root is already
+served. `(Get-Location).Path` is absolute and has no such ambiguity. If the directory really is inside an already
+served root, add it as an intentional nested root with `--nested`; the parent's managed ignore still hides it.
+
 **Three modes, and one trade-off.** `off` never watches: the socket still answers a subscribe with one scan, but
 nothing is observed. `always` watches whether or not anybody is listening. `auto` — the default — watches only
 while at least one client is subscribed, and goes **asleep** after `idle_timeout_ms` (five minutes by default) with
@@ -79,6 +90,11 @@ each of them before its first pass — and if the write cannot be arranged the a
 warned through. The block is repaired by the parent's next pass, and the guard is not one of the `worktrees`/`gitwatch`
 switches. `plans/worktrees.md` § 5 is the rule; `FORMAT.daemon.md` § 4 has the lifecycle. `root add --nested` is only
 an acknowledgement: the parent's managed line is still written, and the reply says the intent was recorded.
+
+**A tool resolves a path to its serving root; it never assumes the project root is a root.** A project may be one
+root or several (one per subproject), and a nested root is not in its parent's stream. The order — daemon query,
+`roots.json`, offline `.fs-meta` walk — the deepest-ancestor rule, per-root subscriptions and the root-aware
+operation rules are in [`root-discovery.md`](root-discovery.md).
 
 **The scan rule is not one of the switches.** A directory whose `.git` entry confirms is another repository — a clone,
 a submodule checkout or a **linked worktree** — and it is a **boundary**: the walk neither lists nor enters it, so a

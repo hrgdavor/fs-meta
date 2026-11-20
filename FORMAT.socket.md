@@ -152,6 +152,9 @@ simultaneous-greeting rule anyway.
 | `0x10` | `STAGE_CHANGE_ENTRY` | the same 64-byte entry + name as `CHANGE_ENTRY` — see § BUILD_STAGES                   |
 | `0x11` | `STAGE_BATCH_END`    | `u16 stage`, `u64 generation`, `u64 added`, `u64 changed`, `u64 deleted`, `u64 changes_hash`, `u8 status` — see § BUILD_STAGES |
 | `0x12` | `SUBSCRIBE_V3`       | `u64 from_batch`, `u64 from_stage_batch`, `u16 stage`, `u16 flags`, then the `SUBSCRIBE` filter section — see § BUILD_STAGES |
+| `0x13` | `APP_BATCH_START`    | `u64 batch_id`, `u16 stage`, `u16 flags`, `u64 started_ns` — see § APP_BATCHES         |
+| `0x14` | `APP_BATCH_FILE`     | `u64 batch_id`, `u8 change`, `u16 name_len`, name bytes — see § APP_BATCHES            |
+| `0x15` | `APP_BATCH_END`      | `u64 batch_id`, `u8 status` — see § APP_BATCHES                                        |
 
 **`HELLO` is defined once**, in § Handshake; the row above is a pointer that keeps the kind numbering in one place,
 not a second payload layout.
@@ -318,7 +321,7 @@ apart; coalescing is per `(kind, phase)` per pass, not per operation.
 8. **A late subscriber is not replayed a finish.** Git events are a live signal, not a log: a client that subscribes
    after one was flushed learns the state from the batch. The history of git operations is `root status`'s job.
 
-**Git events are a daemon feature.** `fsmeta serve` announces `0x0105` and never emits `0x0a` (or `0x09`, or the
+**Git events are a daemon feature.** `fsmeta serve` announces `0x0106` and never emits `0x0a` (or `0x09`, or the
 staged-build frames): it has no scheduler and no git handling, so a consumer of `serve` gets batches only — the same
 asymmetry `STATE` already has.
 
@@ -443,6 +446,85 @@ state commit, and deletes are emitted after the walk because the surviving set i
 `fsmeta stage scan` and `diff` use the same state without a daemon. The first implementation scanned before it
 streamed; [`plans/build-artifacts.md`](plans/build-artifacts.md) § 7.6 records that gap and the callback fix.
 
+### APP_BATCHES
+
+A folder scan can only say what a stage's folder contains **after** the build. A compiler knows more: which files it
+wrote, when each was closed, and which outputs belong to which source change. `APP_BATCH_START`, `APP_BATCH_FILE`
+and `APP_BATCH_END` let that knowledge enter the daemon on the connection the builder already holds, so the stage
+batch is built from the app's own output instead of a folder walk. The frames are additive: a builder that never
+sends them gets exactly the `BUILD_*` behavior above.
+
+**`APP_BATCH_START` (kind `0x13`)**
+
+```text
+u64  batch_id           the app's handle; several batches may be open on one connection
+u16  stage              the stage this batch PRODUCES (not the stage the connection consumes)
+u16  flags              reserved, refused when set
+u64  started_ns         the app's clock, diagnostics only
+```
+
+`stage` must be declared in `.fs-meta/build.json`; a root without staged builds has no state for the batch, so the
+frame is `ERROR{protocol}`. A compiler may subscribe at stage 0 (the source stream) and publish to stage 1, and a
+bundler may subscribe at stage 1 and publish to stage 2: the subscription stage is what it **consumes**, the batch
+stage is what it **produces**. The builder flag is not required — app batches are independent of the barrier.
+
+**`APP_BATCH_FILE` (kind `0x14`)**
+
+```text
+u64  batch_id
+u8   change             0 = upsert (the app wrote it), 1 = delete (the app removed it)
+u16  name_len
+     name               workspace-relative, `/`-separated, no LF
+```
+
+The frame is self-delimiting: `length == 11 + name_len`. The daemon does not read the file here; the batch is a unit,
+and `APP_BATCH_END` is when it hashes the set. A repeated name is the last word within its batch.
+
+**`APP_BATCH_END` (kind `0x15`)**
+
+```text
+u64  batch_id
+u8   status             0 = ok, 1 = failed, 2 = cancelled
+```
+
+`ok` applies the batch. `failed`/`cancelled` discards every buffered name and publishes nothing; a broken build must
+not move a stage.
+
+**What an applied batch does.** The names are validated against the declaration and the format. A name below one
+of the batch stage's declared folders is a **stage-owned artifact**: the daemon stats and hashes it with the stage's
+hash mode, merges it into `.fs-meta/stages/<NN>/`, and the next stage receives one
+`STAGE_BATCH_START … STAGE_BATCH_END` with the exact changes, in one new stage generation. A name elsewhere in the
+workspace is a **tracked output** — the docs snippet case, where a generator rewrites a regular Markdown file that is
+also in the root trio. It is hashed and reported in the same stage batch, but it does **not** enter the stage state:
+the root trio owns that name, and a stage state must not describe a tree twice. A name below a *different* stage's
+folders is `ERROR{protocol}`. Both kinds of entry are hashed with the producing stage's hash mode; the stage batch,
+not a later root batch, is the fingerprint's authority when the two modes differ.
+
+Unchanged files (same hash, size and flags) produce no change and no new stage generation. A batch that names no
+files is a boundary-only round and falls back to the ordinary stage scan, which is what a script writing a whole
+folder needs.
+
+**Several batches are the point.** Each open batch keeps its own buffer; ending one applies only its names, so two
+compilers in the same stage never mix their outputs. The stage generation serializes them in end order, and a
+`STAGE_BATCH_END` still carries that batch's exact counts. Batches do not advance the `BUILD_DONE` barrier; a
+builder that also holds a stage still acknowledges it separately.
+
+**Failure and limits.** An unknown batch id, a duplicate open id, a malformed name, or a name in another stage's
+folders is `ERROR{protocol}`. A file that vanished or changed while it was hashed fails the ingest: the daemon logs
+it, counts `app_batch_failures`, publishes no batch, and the connection stays open. A batch that stays open for
+`app_batch_timeout_ms` (default 120 s, `FSMETA_APP_BATCH_TIMEOUT_MS`, `0` disables) is dropped and counted in
+`app_batch_timeouts`; a connection that leaves drops its open batches. One root tracks at most 64 batches, one
+batch at most 65 536 names and 16 MiB of path bytes.
+
+**A tracked output also reaches the root stream.** The daemon does not suppress the root's own batch for a file it
+reports as tracked: the file is a real change to the source tree, and every other subscriber must see it. A tool that
+watches a file it rewrites must therefore be idempotent (or compare the content hash it wrote); the stage batch is
+the "this was generated" signal, not a replacement for the root batch.
+
+**`fsmeta serve` does not implement this section.** The frames are client → server and daemon-only; `serve` is a
+replay-only server and answers anything after `SUBSCRIBE` the same way it always has. `root status --json` reports
+the open count and the published/failed/timed-out counters; they are host state, never trio content.
+
 ### What the wire deliberately does not carry
 
 - **File contents.** A client that needs a file's bytes asks the host OS, not the engine; the engine hashes on request
@@ -538,14 +620,15 @@ greet at once, and no state machine whose order can deadlock.
 The layout above is the format. Three of its values are this implementation's choice, and they are pinned here so a
 client author reads them instead of inferring them from the server's bytes.
 
-**`protocol` is `0x0105`** — major 1, minor 5. A client must use major 1; a different major is
+**`protocol` is `0x0106`** — major 1, minor 6. A client must use major 1; a different major is
 `unsupported-version`. The minor is negotiated by allowance, as above. Minor 1 is the `STATE` frame (§ STATE), minor
-2 is `GIT_EVENT` (§ GIT_EVENT), minor 3 is the staged-build barrier, minor 4 adds the streamed stage batch, and
-minor 5 adds `SUBSCRIBE_V3` with the stage-batch replay cursor (§ BUILD_STAGES); there are no deployed clients, so
-each bump was made once and every implementation was updated together — no capability bit gates either, and a
-`0x0100`–`0x0104` caller is still accepted because the major matches. A minor-2 client that does not know `0x0a` must
-refuse it rather than skip it (an unknown kind closes the connection), which is why the bump is a bump: a reader
-must be able to say "I do not know this frame".
+2 is `GIT_EVENT` (§ GIT_EVENT), minor 3 is the staged-build barrier, minor 4 adds the streamed stage batch, minor 5
+adds `SUBSCRIBE_V3` with the stage-batch replay cursor (§ BUILD_STAGES), and minor 6 adds the app-published
+`APP_BATCH_*` frames (§ APP_BATCHES); there are no deployed clients, so each bump was made once and every
+implementation was updated together — no capability bit gates either, and a `0x0100`–`0x0105` caller is still
+accepted because the major matches. A minor-2 client that does not know `0x0a` must refuse it rather than skip it (an
+unknown kind closes the connection), which is why the bump is a bump: a reader must be able to say "I do not know
+this frame".
 
 **`ERROR` codes** are the `u16 code` at offset 0 of the payload (kind `0x05`). The number is the contract: the UTF-8
 message that follows begins with the code's word and `: `, then detail for a human, so a client branches on the number

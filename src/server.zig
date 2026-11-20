@@ -797,6 +797,7 @@ fn frameErrorWord(err: wire.ReadError) []const u8 {
         error.InvalidState => "invalid-state",
         error.InvalidGitEvent => "invalid-git-event",
         error.InvalidBuild => "invalid-build",
+        error.InvalidAppBatch => "invalid-app-batch",
     };
 }
 

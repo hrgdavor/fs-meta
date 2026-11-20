@@ -82,3 +82,11 @@ both watcher arms register only what they may watch, using a repository with 120
 worktree and a 40-directory nested clone. A per-directory count only exists on inotify/kqueue, so on Windows (one
 recursive registration) the test skips with its reason; Linux CI produces the number
 ([`worktrees.md`](worktrees.md) § 5b).
+
+## 4. Root discovery is client-side (decided 2026-11-19)
+
+fs-meta already supports one root per project or one per subproject, with guarded nesting, and every operation
+names its root. **No `root.which` or path-resolving command is planned**: a client resolves the serving root
+itself from `roots` (live) or `roots.json` (offline), and chooses where its own metadata lives.
+[`doc/root-discovery.md`](../doc/root-discovery.md) is the client contract; the offline `.fs-meta` walk is a
+client choice, not a daemon feature.

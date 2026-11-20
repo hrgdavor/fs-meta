@@ -58,11 +58,15 @@ export const KIND = {
   STAGE_CHANGE_ENTRY: 0x10,
   STAGE_BATCH_END: 0x11,
   SUBSCRIBE_V3: 0x12,
+  APP_BATCH_START: 0x13,
+  APP_BATCH_FILE: 0x14,
+  APP_BATCH_END: 0x15,
 };
 
-/** The protocol this client speaks: major 1, minor 5 (`0x0105`). It subscribes with the original form; the
- *  staged-build frames are for clients that opt into `SUBSCRIBE_V2`/`SUBSCRIBE_V3` (`FORMAT.socket.md` § BUILD_STAGES). */
-export const PROTOCOL = 0x0105;
+/** The protocol this client speaks: major 1, minor 6 (`0x0106`). It subscribes with the original form; the
+ *  staged-build frames are for clients that opt into `SUBSCRIBE_V2`/`SUBSCRIBE_V3` (`FORMAT.socket.md` § BUILD_STAGES),
+ *  and `APP_BATCH_*` lets a builder publish its own output (§ APP_BATCHES). */
+export const PROTOCOL = 0x0106;
 
 /** Every frame's payload is at most 1 MiB (`FORMAT.socket.md` § Framing). */
 export const MAX_FRAME = 1024 * 1024;
@@ -277,6 +281,40 @@ export function buildDonePayload(generation, status = 0) {
   const payload = Buffer.alloc(9);
   payload.writeBigUInt64LE(u64(generation), 0);
   payload.writeUInt8(status, 8);
+  return payload;
+}
+
+/** `APP_BATCH_START` (`FORMAT.socket.md` § APP_BATCHES): the batch id, the output stage, and the app's clock. */
+export function appBatchStartPayload({ batchId, stage, startedNs = 0n } = {}) {
+  if (!Number.isInteger(stage) || stage < 0 || stage > 64) throw new Error(`stage outside 0..64: ${stage}`);
+  const payload = Buffer.alloc(20);
+  payload.writeBigUInt64LE(u64(batchId), 0);
+  payload.writeUInt16LE(stage, 8);
+  payload.writeUInt16LE(0, 10);
+  payload.writeBigUInt64LE(u64(startedNs), 12);
+  return payload;
+}
+
+/** `APP_BATCH_FILE`: one generated file. `change` is `upsert` (default) or `delete`. */
+export function appBatchFilePayload({ batchId, name, change = 'upsert' } = {}) {
+  const kind = change === 'delete' ? 1 : change === 'upsert' ? 0 : NaN;
+  if (!Number.isInteger(kind)) throw new Error(`unknown app batch change ${change}`);
+  const bytes = Buffer.from(name, 'utf8');
+  if (bytes.length === 0 || bytes.length > 0xffff) throw new Error('file name outside 1..65535 UTF-8 bytes');
+  const head = Buffer.alloc(11);
+  head.writeBigUInt64LE(u64(batchId), 0);
+  head.writeUInt8(kind, 8);
+  head.writeUInt16LE(bytes.length, 9);
+  return Buffer.concat([head, bytes]);
+}
+
+/** `APP_BATCH_END`: close the batch; status is `ok`, `failed` or `cancelled`. */
+export function appBatchEndPayload({ batchId, status = 'ok' } = {}) {
+  const code = status === 'ok' ? 0 : status === 'failed' ? 1 : status === 'cancelled' ? 2 : NaN;
+  if (!Number.isInteger(code)) throw new Error(`unknown build status ${status}`);
+  const payload = Buffer.alloc(9);
+  payload.writeBigUInt64LE(u64(batchId), 0);
+  payload.writeUInt8(code, 8);
   return payload;
 }
 
@@ -569,6 +607,28 @@ export class StageClient {
     this.#requireOpen();
     if (status !== 0 && status !== 1 && status !== 2) throw new Error(`unknown build status ${status}`);
     this.socket.write(frame(KIND.BUILD_DONE, buildDonePayload(generation, status)));
+  }
+
+  /**
+   * `APP_BATCH_START`: open an app-published batch for an output stage. Several batches may be open at once;
+   * `batchId` is the app's handle. The batch's stage is not the connection's stage: a compiler can consume
+   * stage 0 and publish its output as stage 1 (`FORMAT.socket.md` § APP_BATCHES).
+   */
+  startAppBatch(batchId, stage, startedNs = 0n) {
+    this.#requireOpen();
+    this.socket.write(frame(KIND.APP_BATCH_START, appBatchStartPayload({ batchId, stage, startedNs })));
+  }
+
+  /** `APP_BATCH_FILE`: name one file the app generated; the daemon hashes it at batch end. */
+  appBatchFile(batchId, name, change = 'upsert') {
+    this.#requireOpen();
+    this.socket.write(frame(KIND.APP_BATCH_FILE, appBatchFilePayload({ batchId, name, change })));
+  }
+
+  /** `APP_BATCH_END`: close the batch; a failed or cancelled batch is discarded without a stage batch. */
+  endAppBatch(batchId, status = 'ok') {
+    this.#requireOpen();
+    this.socket.write(frame(KIND.APP_BATCH_END, appBatchEndPayload({ batchId, status })));
   }
 
   close() {

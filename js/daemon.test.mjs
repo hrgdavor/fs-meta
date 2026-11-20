@@ -37,6 +37,9 @@ import {
   buildDonePayload,
   parseStageBatchStart,
   parseStageBatchEnd,
+  appBatchStartPayload,
+  appBatchFilePayload,
+  appBatchEndPayload,
   StageClient,
 } from './daemon.mjs';
 import { publish, scanTree } from './fsmeta.mjs';
@@ -136,7 +139,8 @@ async function fakeDaemon({ generation = 0n, onSubscribe }) {
         } else if (kind === KIND.SUBSCRIBE_V3) {
           subscribes.push(payload);
           onSubscribe(socket, payload, kind);
-        } else if (kind === KIND.BUILD_STARTED || kind === KIND.BUILD_DONE) {
+        } else if (kind === KIND.BUILD_STARTED || kind === KIND.BUILD_DONE ||
+          kind === KIND.APP_BATCH_START || kind === KIND.APP_BATCH_FILE || kind === KIND.APP_BATCH_END) {
           control.push({ kind, payload });
         }
       }
@@ -338,6 +342,47 @@ describe('frames', () => {
       assert.equal(daemon.control.length, 2);
       assert.equal(daemon.control[0].kind, KIND.BUILD_STARTED);
       assert.equal(daemon.control[1].kind, KIND.BUILD_DONE);
+    } finally {
+      client.close();
+      await daemon.close();
+    }
+  });
+
+  test('APP_BATCH_* payloads round-trip and StageClient sends them', async () => {
+    const start = appBatchStartPayload({ batchId: 7n, stage: 1, startedNs: 99n });
+    assert.equal(start.length, 20);
+    assert.equal(start.readBigUInt64LE(0), 7n);
+    assert.equal(start.readUInt16LE(8), 1);
+    assert.equal(start.readUInt16LE(10), 0);
+    assert.equal(start.readBigUInt64LE(12), 99n);
+
+    const upsert = appBatchFilePayload({ batchId: 7n, name: 'build/classes/A$Inner.class' });
+    assert.equal(upsert.readBigUInt64LE(0), 7n);
+    assert.equal(upsert.readUInt8(8), 0);
+    assert.equal(upsert.readUInt16LE(9), 'build/classes/A$Inner.class'.length);
+    assert.equal(upsert.subarray(11).toString('utf8'), 'build/classes/A$Inner.class');
+
+    const removal = appBatchFilePayload({ batchId: 7n, name: 'build/classes/Old.class', change: 'delete' });
+    assert.equal(removal.readUInt8(8), 1);
+    assert.equal(appBatchEndPayload({ batchId: 7n }).readUInt8(8), 0);
+    assert.equal(appBatchEndPayload({ batchId: 7n, status: 'failed' }).readUInt8(8), 1);
+    assert.throws(() => appBatchFilePayload({ batchId: 7n, name: 'x', change: 'rename' }), /unknown app batch change/);
+
+    const daemon = await fakeDaemon({ generation: 0n, onSubscribe() {} });
+    const client = await StageClient.connect(daemon.path, { stage: 0, fromBatch: 0n });
+    try {
+      client.startAppBatch(7n, 1, 99n);
+      client.appBatchFile(7n, 'build/classes/A.class');
+      client.endAppBatch(7n, 'ok');
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.deepEqual(daemon.control.map(item => item.kind), [
+        KIND.APP_BATCH_START,
+        KIND.APP_BATCH_FILE,
+        KIND.APP_BATCH_END,
+      ]);
+      assert.equal(daemon.control[0].payload.readBigUInt64LE(0), 7n);
+      assert.equal(daemon.control[1].payload.subarray(11).toString('utf8'), 'build/classes/A.class');
+      assert.equal(daemon.control[2].payload.readUInt8(8), 0);
     } finally {
       client.close();
       await daemon.close();

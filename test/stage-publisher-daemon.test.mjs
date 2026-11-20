@@ -72,7 +72,7 @@ function frame(kind, payload) {
 
 function hello() {
   const payload = Buffer.alloc(24);
-  payload.writeUInt16LE(0x0105, 0);
+  payload.writeUInt16LE(0x0106, 0);
   payload.writeUInt16LE(64, 2);
   payload.writeUInt8(1, 5);
   payload.writeBigUInt64LE(0n, 8);
