@@ -25,7 +25,7 @@ jobs:
 
       # build.zig refuses any compiler but 0.17 on purpose: that version moved the whole std.Io surface, so a
       # different minor does not build this code. The other dependencies are fetched from their tags.
-      - uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
 
