@@ -825,7 +825,11 @@ None of them writes the served root's trio, and none touches a file inside a tre
 
 `daemon start` without `--foreground` spawns this same executable with `--foreground`, detached, with no console and
 no inherited streams, and then waits for the control socket to answer: `start` means "it is up", not "a process was
-spawned".
+spawned". The readiness probe first requires `daemon.json` to **change from its pre-spawn content** (the daemon writes
+that file only after `bindControl`). That gate is not cosmetic: a killed daemon can leave a stale `daemon.sock`, and
+on Windows a refused `AF_UNIX` connect is an unmapped NTSTATUS (`error.Unexpected`, `CONNECTION_REFUSED`) rather than
+a catchable error, so connecting before the new child has bound would abort the CLI. A `daemon.json` left by an older
+run cannot satisfy the change check.
 
 ---
 

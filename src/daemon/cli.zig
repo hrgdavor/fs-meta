@@ -209,6 +209,21 @@ fn daemonStart(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, env: 
 
     // Daemonize: spawn this executable again, detached, with no console and no inherited streams. The child
     // is not waited for; the control socket answering *is* the readiness signal.
+    if (@import("reaper.zig").daemonLive(io, arena, layout)) {
+        printError(io, "a daemon is already running on {s}\n", .{layout.base});
+        std.process.exit(control.Exit.refused);
+    }
+    // The child writes `daemon.json` only after `bindControl`. Remember a stale file from a killed daemon before
+    // spawning so the readiness loop can wait for a *new* one: a connect to the old socket is an unmapped NTSTATUS
+    // on Windows (`error.Unexpected`, CONNECTION_REFUSED), not a catchable error.
+    const control_file = try layout.controlFile(arena);
+    const previous_daemon_file = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        control_file,
+        arena,
+        std.Io.Limit.limited(1 << 20),
+    ) catch null;
+
     const executable = try std.process.executablePathAlloc(io, arena);
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ executable, "daemon", "start", "--foreground", "--base", layout.base });
@@ -228,10 +243,20 @@ fn daemonStart(io: std.Io, arena: std.mem.Allocator, layout: paths.Layout, env: 
 
     var attempts: usize = 0;
     while (attempts < 100) : (attempts += 1) {
-        if (try request(io, arena, layout, "{\"v\":1,\"cmd\":\"status\"}")) |reply| {
-            const pid = integerField(result(reply), "pid") orelse 0;
-            print(io, "started (pid {d}) on {s}", .{ pid, layout.base });
-            return;
+        const current_daemon_file = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            control_file,
+            arena,
+            std.Io.Limit.limited(1 << 20),
+        ) catch null;
+        const fresh = current_daemon_file != null and
+            (previous_daemon_file == null or !std.mem.eql(u8, previous_daemon_file.?, current_daemon_file.?));
+        if (fresh) {
+            if (try request(io, arena, layout, "{\"v\":1,\"cmd\":\"status\"}")) |reply| {
+                const pid = integerField(result(reply), "pid") orelse 0;
+                print(io, "started (pid {d}) on {s}", .{ pid, layout.base });
+                return;
+            }
         }
         io.sleep(.fromMilliseconds(50), .real) catch {};
     }

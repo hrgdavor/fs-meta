@@ -89,7 +89,9 @@ pub fn isFree(io: std.Io, allocator: std.mem.Allocator, layout: paths.Layout, id
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.WouldBlock => return false,
+        // Windows reports a held share lock as AccessDenied/PermissionDenied rather than WouldBlock; either way
+        // the answer to "may I take this lock?" is no.
+        error.WouldBlock, error.AccessDenied, error.PermissionDenied => return false,
         error.FileNotFound => return true,
         else => return false,
     };
@@ -172,7 +174,8 @@ pub fn daemonLive(io: std.Io, allocator: std.mem.Allocator, layout: paths.Layout
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.WouldBlock => return true,
+        // Windows reports the daemon's held share lock as AccessDenied/PermissionDenied, not WouldBlock.
+        error.WouldBlock, error.AccessDenied, error.PermissionDenied => return true,
         else => return false,
     };
     file.close(io);

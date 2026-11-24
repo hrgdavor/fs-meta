@@ -21,7 +21,7 @@ subproject: what is here, how to run it, and where it plugs in.
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [`FORMAT.md`](FORMAT.md)                                 | the normative specification of version 1: the trio, the 64-byte entry, the checks, the publish protocol |
 | `src/main.zig` + `build.zig*`                            | the **Zig engine** — the reference implementation, the writer and the watcher: it scans, hashes, publishes, runs the daemon and serves one Unix socket per watched root |
-| `src/main/java/hr/hrg/fsmeta/`                           | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.8`); it validates, decodes and loads the trio and connects to the daemon (including the staged-build frames); it is not a watcher |
+| `src/main/java/hr/hrg/fsmeta/`                           | the **Java client/reader** — a standalone Maven module, `hr.hrg:fs-meta` (`0.3.9`); it validates, decodes and loads the trio and connects to the daemon (including the staged-build frames); it is not a watcher |
 | `js/`                                                    | the **Bun/Node client** — dependency-free ESM, no build step: the trio reader and the daemon client |
 | `conformance/`                                           | the shared vector file every reader asserts, and the generator that produces it                     |
 | [`examples/stage-publisher/`](examples/stage-publisher/) | a runnable scp-like stage client: copy while the stage batch arrives, hook after the commit         |
@@ -127,7 +127,7 @@ bun fs-meta/js/fsmeta-cli.mjs repair                 # re-pair entries and names
 
 # the Java port (same commands; needs the module built and JDK 25)
 bun scripts/mvn-fast.js -pl :fs-meta package
-java -cp fs-meta/target/fs-meta-0.3.8.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
+java -cp fs-meta/target/fs-meta-0.3.9.jar:... hr.hrg.fsmeta.FsMetaCli verify --dir .fs-meta
 
 # both implementations' tests
 bun test fs-meta/js                                  # 26 tests: vectors, round trip, CLI
@@ -330,8 +330,9 @@ has the prerequisites (JDK 25, real Maven 3.9.9, the `central` token and GPG), t
 the npm and Zig release notes.
 
 `hr.hrg:wyhash:1.2.0`, `hr.hrg:gitignore:0.3.5` and the previous `hr.hrg:fs-meta:0.3.7` are on Maven Central; this
-checkout is `0.3.8`, which adds the staged-build client API. `@hrg/fs-meta@0.3.7` is on npm, with the scoped `@hrg/wyhash`
-import and the `files` whitelist; `md-fix-tables` depends on it. No local install is needed for either port.
+checkout is `0.3.9`, which adds the app-published batch API (`APP_BATCH_*`), the retained pass-arena memory fix and
+the Windows daemon start/lock fixes. `@hrg/fs-meta@0.3.7` is on npm, with the scoped `@hrg/wyhash` import and the
+`files` whitelist; `md-fix-tables` depends on it. No local install is needed for either port.
 
 ## Next
 

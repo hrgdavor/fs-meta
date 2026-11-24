@@ -26,7 +26,7 @@ The version is pinned in three places and must agree: `pom.xml`, `package.json` 
 6. **A GPG key and `MAVEN_GPG_PASSPHRASE`.** Signing is off by default (`gpg.skip=true`); a release passes
    `-Dgpg.skip=false`. The profile passes `--pinentry-mode loopback`, so gpg reads `MAVEN_GPG_PASSPHRASE` instead of
    opening a prompt a batch build cannot answer. A passphrase stored in `settings.xml` is not used.
-7. **A release version and a tag.** The POM and `package.json` are `0.3.8`; tag that commit before publishing.
+7. **A release version and a tag.** The POM and `package.json` are `0.3.9`; tag that commit before publishing.
    `v0.3.7` points at the previous published commit `90e97a3`, and `v0.3.6` predates the JavaScript daemon client
    and this publishing setup. Tag the released commit for every future release; do not publish an artifact whose
    tag points at different code.
@@ -103,9 +103,10 @@ publisher does not use `altDeploymentRepository`.
 
 `package.json` is non-private (`private: false`) and declares `publishConfig.access: public`.
 
-**0.3.8 is this checkout** (the staged-build client API and the scoped `@hrg/wyhash` import); **0.3.7 is the
-previous published version**. `@hrg/wyhash` 1.2.0 is on npm. For a release, bump `pom.xml`, `pom-release.xml`,
-`package.json` and `build.zig.zon` together, tag the commit, then:
+**0.3.9 is this checkout** (the app-published batch API, the retained pass-arena memory fix, the Windows daemon
+start/lock fixes and the scoped `@hrg/wyhash` import); **0.3.7 is the previous published version**.
+`@hrg/wyhash` 1.2.0 is on npm. For a release, bump `pom.xml`, `pom-release.xml`, `package.json` and
+`build.zig.zon` together, tag the commit, then:
 
 ```text
 bun test js
